@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}审核 {{ task.title }} · PUKO Growth OS{% endblock %}
+{% block page_title %}人工审核{% endblock %}
+{% block content %}
+<a class="back-link" href="{% url 'dashboard:review-queue' %}">← 返回待审核</a>
+<section class="task-detail-hero"><div><p class="eyebrow">{{ task.product.name }} · Submission #{{ submission.submission_number }}</p><h2>{{ task.title }}</h2><p>{{ task.description|default:"暂无背景说明" }}</p></div><div class="detail-status-stack"><span class="task-state">{{ task.get_current_state_display }}</span><small>状态版本 {{ task.state_version }}</small></div></section>
+<section class="detail-summary-grid">
+    <article><span class="task-label">交付文件</span><p>{{ asset_version.metadata.original_filename|default:asset_version.object_key }}</p></article>
+    <article><span class="task-label">文件类型</span><p>{{ asset_version.mime_type }}</p></article>
+    <article><span class="task-label">SHA-256</span><p>{{ asset_version.content_sha256|truncatechars:22 }}</p></article>
+    <article><span class="task-label">提交说明</span><p>{{ submission.submission_note|default:"未填写" }}</p></article>
+</section>
+<section class="detail-columns">
+    <article class="detail-panel"><p class="eyebrow">Review context</p><h3>你需要核对什么</h3><p class="action-explanation">检查精确封存的内容版本是否符合任务说明、DoD、品牌语气和合规边界。通过只代表可进入门禁，不代表已经发布。</p><dl class="submission-summary"><dt>Asset version</dt><dd>v{{ asset_version.version_number }}</dd><dt>Object key</dt><dd>{{ asset_version.object_key }}</dd><dt>封存时间</dt><dd>{{ submission.sealed_at }}</dd></dl></article>
+    <article class="detail-panel action-panel"><p class="eyebrow">Human decision</p><h3>记录不可变审核结论</h3><form class="task-action-form" action="{% url 'dashboard:review-action' task.id %}" method="post">{% csrf_token %}{{ review_form.command_id }}{{ review_form.expected_state_version }}{{ review_form.non_field_errors }}{% for field in review_form.visible_fields %}<div class="field-row">{{ field.label_tag }}{{ field }}{{ field.errors }}{% if field.help_text %}<small>{{ field.help_text }}</small>{% endif %}</div>{% endfor %}<button class="button button-primary" type="submit">保存审核结论</button></form></article>
+</section>
+{% endblock %}

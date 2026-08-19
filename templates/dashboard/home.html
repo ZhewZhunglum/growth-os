@@ -1,0 +1,73 @@
+{% extends "base.html" %}
+{% block title %}今日任务 · PUKO Growth OS{% endblock %}
+{% block page_title %}今日任务{% endblock %}
+{% block content %}
+<section class="hero-panel">
+    <div><p class="eyebrow">My work · Controlled workflow</p>
+        <h2>先弄清楚为什么做，再开始做。</h2>
+        <p>这里仅显示分配给你或由你创建的任务。进入详情后，可以按当前状态完成准备、分配、开工和交付；审核、门禁与发布仍由后续人工流程负责。</p>
+    </div><div class="status-pill"><span></span> 人工发布模式</div>
+</section>
+<section class="metric-grid" aria-label="任务概览">
+    <article class="metric-card"><span>我的任务</span><strong>{{ task_count }}</strong><small>只统计你有权查看的任务</small></article>
+    <article class="metric-card"><span>正在处理</span><strong>{{ active_task_count }}</strong><small>待开始、进行中或返工</small></article>
+    <article class="metric-card"><span>遇到阻塞</span><strong>{{ blocked_task_count }}</strong><small>需要补充资料或确认规则</small></article>
+</section>
+<section class="section-heading"><div><p class="eyebrow">Assigned or created by me</p><h2>任务清单</h2></div>{% if can_create_task %}<a class="button button-primary" href="{% url 'dashboard:task-create' %}">新建任务</a>{% else %}<span class="section-note">受控操作 · 无审核或发布按钮</span>{% endif %}</section>
+<section class="task-list">
+    {% for task in tasks %}
+    <article class="task-card" data-task-state="{{ task.current_state }}">
+        <header class="task-card-header">
+            <div>
+                <p class="task-meta">{{ task.product.name }} · {{ task.product.market_code }} / {{ task.product.language_code }}</p>
+                <h3><a class="task-title-link" href="{% url 'dashboard:task-detail' task.id %}">{{ task.title }}</a></h3>
+            </div>
+            <span class="task-state task-state-{{ task.current_state|lower }}">{{ task.get_current_state_display }}</span>
+        </header>
+        <div class="task-section task-why">
+            <span class="task-label">为什么做</span>
+            <p>{{ task.description|default:"任务暂时没有填写背景说明，请先向负责人确认后再开始。" }}</p>
+        </div>
+        <div class="task-check-grid">
+            <section>
+                <span class="task-label">开工检查（DoR）</span>
+                {% if task.latest_dor %}
+                <strong class="check-result check-result-{{ task.latest_dor.aggregate_result|lower }}">{{ task.latest_dor.get_aggregate_result_display }}</strong>
+                <small>已检查 {{ task.latest_dor.actual_criterion_count }}/{{ task.latest_dor.expected_criterion_count }} 项</small>
+                {% else %}
+                <strong class="check-result check-result-pending">尚未检查</strong>
+                <small>检查通过前，不代表可以开工</small>
+                {% endif %}
+            </section>
+            <section>
+                <span class="task-label">交付检查（DoD）</span>
+                {% if task.latest_dod %}
+                <strong class="check-result check-result-{{ task.latest_dod.aggregate_result|lower }}">{{ task.latest_dod.get_aggregate_result_display }}</strong>
+                <small>已检查 {{ task.latest_dod.actual_criterion_count }}/{{ task.latest_dod.expected_criterion_count }} 项</small>
+                {% else %}
+                <strong class="check-result check-result-pending">尚未检查</strong>
+                <small>完成内容后再逐项核对</small>
+                {% endif %}
+            </section>
+        </div>
+        <div class="task-detail-grid">
+            <section>
+                <span class="task-label">交付标准（DoD）</span>
+                <ul>{% for item in task.dod_summary %}<li>{{ item }}</li>{% empty %}<li>本任务未配置交付标准</li>{% endfor %}</ul>
+            </section>
+            <section>
+                <span class="task-label">发布门禁摘要</span>
+                <ul>{% for item in task.release_gate_summary %}<li>{{ item }}</li>{% empty %}<li>本任务未配置门禁摘要</li>{% endfor %}</ul>
+                <p class="gate-note">此处仅供查看；实际发布仍需人工审核和最终门禁校验。</p>
+            </section>
+        </div>
+        <footer class="task-card-footer">
+            <span>负责人：{% if task.current_assignee_principal %}{{ task.current_assignee_principal.display_name|default:task.current_assignee_principal.username }}{% else %}尚未分配{% endif %}</span>
+            <span>合同版本 v{{ task.contract_version.version_number }} · <a class="inline-link" href="{% url 'dashboard:task-detail' task.id %}">查看并处理任务 →</a></span>
+        </footer>
+    </article>
+    {% empty %}
+    <article class="empty-state task-empty-state"><span class="empty-number">00</span><div><h3>今天没有分配给你的任务</h3><p>你现在不需要做任何操作。新任务分配后会出现在这里。</p></div></article>
+    {% endfor %}
+</section>
+{% endblock %}

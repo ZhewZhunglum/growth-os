@@ -1,0 +1,16 @@
+[project]
+name = "growth-os"
+version = "0.1.0"
+description = "Internal B2C content operations and release-governance system"
+requires-python = ">=3.12,<3.15"
+
+[tool.django-stubs]
+django_settings_module = "growth_os.settings"
+
+[tool.coverage.run]
+branch = true
+source = ["accounts", "contentops", "core", "dashboard", "products", "releasegate", "workflow"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true

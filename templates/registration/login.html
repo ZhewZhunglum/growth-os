@@ -1,0 +1,23 @@
+{% load static %}
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Sign in · PUKO Growth OS</title><link rel="stylesheet" href="{% static 'css/app.css' %}">
+</head>
+<body class="auth-page">
+    <main class="auth-card">
+        <div class="brand auth-brand"><span class="brand-mark">P</span><span><strong>PUKO</strong><small>Growth OS</small></span></div>
+        <p class="eyebrow">Private company workspace</p><h1>Sign in to continue</h1>
+        <p class="muted">Tasks, approvals and release records stay in one auditable workflow.</p>
+        {% if form.errors %}<p class="form-error">The username or password is incorrect.</p>{% endif %}
+        <form method="post" class="auth-form">
+            {% csrf_token %}<label for="id_username">Username</label>{{ form.username }}
+            <label for="id_password">Password</label>{{ form.password }}
+            {% if next %}<input type="hidden" name="next" value="{{ next }}">{% endif %}
+            <button class="button button-primary" type="submit">Sign in</button>
+        </form>
+    </main>
+</body>
+</html>
+
