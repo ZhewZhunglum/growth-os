@@ -8,6 +8,7 @@ from dashboard.review_views import (
     release_queue,
     review_action,
     review_detail,
+    review_history_detail,
     review_queue,
 )
 from dashboard.views import home, task_action, task_create, task_detail
@@ -22,6 +23,7 @@ urlpatterns = [
     path("review/", review_queue, name="review-queue"),
     path("review/<uuid:task_id>/", review_detail, name="review-detail"),
     path("review/<uuid:task_id>/action/", review_action, name="review-action"),
+    path("review/history/<uuid:review_id>/", review_history_detail, name="review-history-detail"),
     path("release/", release_queue, name="release-queue"),
     path("release/<uuid:task_id>/", release_detail, name="release-detail"),
     path("release/<uuid:task_id>/gate/", release_gate_action, name="release-gate-action"),

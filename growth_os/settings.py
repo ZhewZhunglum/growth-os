@@ -16,6 +16,17 @@ def csv_env(name: str, default: str = "") -> list[str]:
     return [part.strip() for part in os.getenv(name, default).split(",") if part.strip()]
 
 
+def positive_int_env(name: str, default: int) -> int:
+    raw_value = os.getenv(name, str(default)).strip()
+    try:
+        value = int(raw_value)
+    except ValueError as error:
+        raise ImproperlyConfigured(f"{name} must be an integer.") from error
+    if value < 1:
+        raise ImproperlyConfigured(f"{name} must be a positive integer.")
+    return value
+
+
 SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "local-development-only-not-for-deployment")
 if not IS_LOCAL and SECRET_KEY == "local-development-only-not-for-deployment":
     raise ImproperlyConfigured("DJANGO_SECRET_KEY must be supplied outside local development.")
@@ -107,9 +118,20 @@ else:
 
 AUTH_USER_MODEL = "accounts.Principal"
 
+PASSWORD_MIN_LENGTH = positive_int_env("PASSWORD_MIN_LENGTH", 6 if IS_LOCAL else 12)
+required_password_minimum = 6 if IS_LOCAL else 12
+if PASSWORD_MIN_LENGTH < required_password_minimum:
+    raise ImproperlyConfigured(
+        f"PASSWORD_MIN_LENGTH must be at least {required_password_minimum} in {ENVIRONMENT}."
+    )
+
 AUTH_PASSWORD_VALIDATORS = [
+    {"NAME": "accounts.password_validation.NonBlankAndNoControlCharactersValidator"},
     {"NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator"},
-    {"NAME": "django.contrib.auth.password_validation.MinimumLengthValidator"},
+    {
+        "NAME": "django.contrib.auth.password_validation.MinimumLengthValidator",
+        "OPTIONS": {"min_length": PASSWORD_MIN_LENGTH},
+    },
     {"NAME": "django.contrib.auth.password_validation.CommonPasswordValidator"},
     {"NAME": "django.contrib.auth.password_validation.NumericPasswordValidator"},
 ]

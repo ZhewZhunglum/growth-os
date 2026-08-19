@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% load dashboard_display %}
 {% block title %}{{ task.title }} · PUKO Growth OS{% endblock %}
 {% block page_title %}任务详情{% endblock %}
 {% block content %}
@@ -11,7 +12,7 @@
         <p>{{ task.description|default:"任务暂时没有背景说明，请先向负责人确认。" }}</p>
     </div>
     <div class="detail-status-stack">
-        <span class="task-state task-state-{{ task.current_state|lower }}">{{ task.get_current_state_display }}</span>
+        <span class="task-state task-state-{{ task.current_state|lower }}">{{ task.current_state|task_state_zh }}</span>
         <small>状态版本 {{ task.state_version }}</small>
     </div>
 </section>
@@ -19,20 +20,20 @@
 <section class="detail-summary-grid" aria-label="任务上下文">
     <article><span class="task-label">为什么做</span><p>{{ task.description|default:"暂无说明" }}</p></article>
     <article><span class="task-label">当前负责人</span><p>{% if task.current_assignee_principal %}{{ task.current_assignee_principal.display_name|default:task.current_assignee_principal.username }}{% else %}尚未分配{% endif %}</p></article>
-    <article><span class="task-label">DoR 当前结果</span><p>{% if task.latest_dor %}<strong class="check-result-{{ task.latest_dor.aggregate_result|lower }}">{{ task.latest_dor.get_aggregate_result_display }}</strong> · 第 {{ task.latest_dor.attempt_number }} 次{% else %}尚未检查{% endif %}</p></article>
-    <article><span class="task-label">DoD 当前结果</span><p>{% if task.latest_dod %}<strong class="check-result-{{ task.latest_dod.aggregate_result|lower }}">{{ task.latest_dod.get_aggregate_result_display }}</strong> · 第 {{ task.latest_dod.attempt_number }} 次{% else %}尚未检查{% endif %}</p></article>
+    <article><span class="task-label">开工检查当前结果</span><p>{% if task.latest_dor %}<strong class="check-result-{{ task.latest_dor.aggregate_result|lower }}">{{ task.latest_dor.aggregate_result|check_result_zh }}</strong> · 第 {{ task.latest_dor.attempt_number }} 次{% else %}尚未检查{% endif %}</p></article>
+    <article><span class="task-label">交付检查当前结果</span><p>{% if task.latest_dod %}<strong class="check-result-{{ task.latest_dod.aggregate_result|lower }}">{{ task.latest_dod.aggregate_result|check_result_zh }}</strong> · 第 {{ task.latest_dod.attempt_number }} 次{% else %}尚未检查{% endif %}</p></article>
 </section>
 
 <section class="detail-columns">
     <article class="detail-panel">
-        <p class="eyebrow">Contract</p><h3>开始前与交付时要核对什么</h3>
+        <p class="eyebrow">任务合同</p><h3>开始前与交付时要核对什么</h3>
         <div class="criteria-block"><span class="task-label">开工检查（DoR）</span><ul>{% for item in task.dor_summary %}<li>{{ item }}</li>{% empty %}<li>没有配置 DoR</li>{% endfor %}</ul></div>
         <div class="criteria-block"><span class="task-label">交付检查（DoD）</span><ul>{% for item in task.dod_summary %}<li>{{ item }}</li>{% empty %}<li>没有配置 DoD</li>{% endfor %}</ul></div>
         <div class="criteria-block gate-summary"><span class="task-label">门禁摘要（仅供查看）</span><ul>{% for item in task.release_gate_summary %}<li>{{ item }}</li>{% empty %}<li>没有配置门禁摘要</li>{% endfor %}</ul><p>本页不会审核、通过门禁或发布内容。</p></div>
     </article>
 
     <article class="detail-panel action-panel">
-        <p class="eyebrow">Next action</p>
+        <p class="eyebrow">下一步操作</p>
         {% if action_kind == "dor" %}
             <h3>逐项确认：现在是否具备开工条件？</h3>
             <p class="action-explanation">每一项都通过后，任务才会进入“可分配”。任一项阻塞，系统会保留本次检查并停止前进。</p>
@@ -45,10 +46,10 @@
             <h3>资料更新后，返回准备阶段</h3><p class="action-explanation">旧的阻塞记录不会被覆盖。返回 DRAFT 后，请重新逐项填写一份新的 DoR。</p>
             <form action="{% url 'dashboard:task-action' task.id 'resume' %}" method="post">{% csrf_token %}{{ action_form.command_id }}{{ action_form.expected_state_version }}<button class="button button-primary" type="submit">资料已补齐，重新检查</button></form>
         {% elif action_kind == "assign" %}
-            <h3>明确分配一位执行人员</h3><p class="action-explanation">只能选择对本产品拥有有效 EDIT 权限的 Operator。分配完成后，只有当前负责人可以点击开工。</p>
+            <h3>明确分配一位执行人员</h3><p class="action-explanation">只能选择对本产品拥有有效执行权限的团队成员。分配完成后，只有当前负责人可以点击开工。</p>
             <form class="task-action-form" action="{% url 'dashboard:task-action' task.id 'assign' %}" method="post">
                 {% csrf_token %}{{ action_form.command_id }}{{ action_form.expected_state_version }}{{ action_form.non_field_errors }}
-                {% for field in action_form.visible_fields %}<div class="field-row">{{ field.label_tag }}{{ field }}{{ field.errors }}</div>{% endfor %}<button class="button button-primary" type="submit">确认分配</button>
+                {% for field in action_form.visible_fields %}<div class="field-row"><label for="{{ field.id_for_label }}">分配给哪位执行人员</label>{{ field }}{{ field.errors }}</div>{% endfor %}<button class="button button-primary" type="submit">确认分配</button>
             </form>
         {% elif action_kind == "start" %}
             <h3>确认开始执行</h3><p class="action-explanation">点击后任务进入“执行中”，届时才能上传交付文件并填写 DoD。</p>
@@ -57,16 +58,47 @@
             <h3>审核要求修改，恢复制作新版本</h3><p class="action-explanation">旧文件、旧 DoD 和旧 Submission 会原样保留。恢复后请上传一份新的文件版本，并重新逐项填写 DoD。</p>
             <form action="{% url 'dashboard:task-action' task.id 'resume-work' %}" method="post">{% csrf_token %}{{ action_form.command_id }}{{ action_form.expected_state_version }}<button class="button button-primary" type="submit">恢复制作</button></form>
         {% elif action_kind == "upload" %}
-            <h3>上传本次交付，并逐项填写 DoD</h3><p class="action-explanation">系统会计算文件大小和 SHA-256，并封存精确版本。全部通过才会送入人工审核；阻塞项不会伪造成已提交。</p>
+            <h3>上传本次交付，并逐项确认是否完成</h3><p class="action-explanation">系统会计算文件大小和 SHA-256，并封存精确版本。选择“确认完整交付并送审”才会进入人工审核；选择“尚未准备好”会保留本次结果，但不会送审。</p>
             <form class="task-action-form" action="{% url 'dashboard:task-action' task.id 'upload' %}" method="post" enctype="multipart/form-data">
                 {% csrf_token %}{{ action_form.command_id }}{{ action_form.expected_state_version }}{{ action_form.non_field_errors }}
-                {% for field in action_form.visible_fields %}<div class="field-row">{{ field.label_tag }}{{ field }}{{ field.errors }}{% if field.help_text %}<small>{{ field.help_text }}</small>{% endif %}</div>{% endfor %}<button class="button button-primary" type="submit">封存交付并送审</button>
+                {% for field in action_form.visible_fields %}
+                <div class="field-row">
+                    <label for="{{ field.id_for_label }}">{{ field.label|criterion_label_zh }}</label>
+                    {% if field|is_criterion_field %}{% render_delivery_check field %}{% else %}{{ field }}{% endif %}
+                    {{ field.errors }}{% if field.help_text %}<small>{{ field.help_text }}</small>{% endif %}
+                </div>
+                {% endfor %}
+                <button class="button button-primary" type="submit">封存交付并送审</button>
             </form>
         {% elif task.current_state == "UNDER_REVIEW" %}
             <h3>交付已送入人工审核</h3><p class="action-explanation">现在无需在本页操作。等待具备审核权限的人员处理；本页没有审核、门禁或发布按钮。</p>
             {% if submission %}<dl class="submission-summary"><dt>提交批次</dt><dd>#{{ submission.submission_number }}</dd><dt>封存时间</dt><dd>{{ submission.sealed_at }}</dd></dl>{% endif %}
         {% else %}
             <h3>当前没有可执行动作</h3><p class="action-explanation">可能是当前状态暂不需要你操作，或你没有该产品的 EDIT 权限。任务事实仍可在左侧查看。</p>
+        {% endif %}
+
+        {% if withdraw_form %}
+        <div class="secondary-action-block">
+            <h3>刚才提交错了？</h3>
+            <p class="action-explanation">审核人还没有给出结论时，你可以撤回并修改。旧文件不会消失，重新提交时系统会保存为新版本。</p>
+            <form class="task-action-form" action="{% url 'dashboard:task-action' task.id 'withdraw' %}" method="post">
+                {% csrf_token %}{{ withdraw_form.command_id }}{{ withdraw_form.expected_state_version }}{{ withdraw_form.non_field_errors }}
+                {% for field in withdraw_form.visible_fields %}<div class="field-row">{{ field.label_tag }}{{ field }}{{ field.errors }}{% if field.help_text %}<small>{{ field.help_text }}</small>{% endif %}</div>{% endfor %}
+                <button class="button button-secondary" type="submit">撤回并返回修改</button>
+            </form>
+        </div>
+        {% endif %}
+
+        {% if cancel_form %}
+        <div class="secondary-action-block secondary-action-danger">
+            <h3>这份草稿建错了？</h3>
+            <p class="action-explanation">取消后它会从“今日任务”隐藏，但系统仍保留历史，避免误删审计记录。</p>
+            <form class="task-action-form" action="{% url 'dashboard:task-action' task.id 'cancel' %}" method="post">
+                {% csrf_token %}{{ cancel_form.command_id }}{{ cancel_form.expected_state_version }}{{ cancel_form.non_field_errors }}
+                {% for field in cancel_form.visible_fields %}<div class="field-row">{{ field.label_tag }}{{ field }}{{ field.errors }}{% if field.help_text %}<small>{{ field.help_text }}</small>{% endif %}</div>{% endfor %}
+                <button class="button button-danger" type="submit">取消这份草稿</button>
+            </form>
+        </div>
         {% endif %}
     </article>
 </section>

@@ -22,8 +22,10 @@ from dashboard.review_views import (
     release_queue,
     review_action,
     review_detail,
+    review_history_detail,
     review_queue,
 )
+from dashboard.views import home
 from products.models import Product, ProductProfileVersion
 from releasegate.models import (
     AccountEnvironmentBinding,
@@ -52,10 +54,17 @@ def empty_view(_request):
 
 
 dashboard_patterns = [
-    path("", empty_view, name="home"),
+    path("", home, name="home"),
+    path("tasks/new/", empty_view, name="task-create"),
+    path("tasks/<uuid:task_id>/", empty_view, name="task-detail"),
     path("review/", review_queue, name="review-queue"),
     path("review/<uuid:task_id>/", review_detail, name="review-detail"),
     path("review/<uuid:task_id>/action/", review_action, name="review-action"),
+    path(
+        "review/history/<uuid:review_id>/",
+        review_history_detail,
+        name="review-history-detail",
+    ),
     path("release/", release_queue, name="release-queue"),
     path("release/<uuid:task_id>/", release_detail, name="release-detail"),
     path("release/<uuid:task_id>/gate/", release_gate_action, name="release-gate-action"),
@@ -151,6 +160,10 @@ class ReviewReleaseUISliceTests(TestCase):
             created_by_principal=self.owner,
         )
         self.owner_edit = self._grant(self.owner, PermissionGrant.Action.EDIT)
+        self.owner_create = self._grant(self.owner, PermissionGrant.Action.CREATE_TASK)
+        self.owner_assign = self._grant(self.owner, PermissionGrant.Action.ASSIGN_TASK)
+        self.owner_cancel = self._grant(self.owner, PermissionGrant.Action.CANCEL_TASK)
+        self.owner_complete = self._grant(self.owner, PermissionGrant.Action.COMPLETE_TASK)
         self.operator_edit = self._grant(self.operator, PermissionGrant.Action.EDIT)
         self.reviewer_review = self._grant(self.reviewer, PermissionGrant.Action.REVIEW)
         self.reviewer_edit = self._grant(self.reviewer, PermissionGrant.Action.EDIT)
@@ -216,7 +229,11 @@ class ReviewReleaseUISliceTests(TestCase):
 
     def _transition(self, task, target, principal=None, grant=None):
         principal = principal or self.owner
-        grant = grant or self.owner_edit
+        if grant is None:
+            grant = {
+                Task.State.ASSIGNED: self.owner_assign,
+                Task.State.DONE: self.owner_complete,
+            }.get(target, self.owner_edit)
         task.refresh_from_db()
         event = Task.transition(
             task_id=task.pk,
@@ -259,12 +276,17 @@ class ReviewReleaseUISliceTests(TestCase):
             expected_task_version=task.state_version,
             assigned_by_principal=self.owner,
             acting_role=self.owner.role,
-            permission_grant=self.owner_edit,
+            permission_grant=self.owner_assign,
             recorded_by_principal=self.owner,
         )
         task.refresh_from_db()
         self._transition(task, Task.State.ASSIGNED)
-        self._transition(task, Task.State.IN_PROGRESS)
+        self._transition(
+            task,
+            Task.State.IN_PROGRESS,
+            principal=self.operator,
+            grant=self.operator_edit,
+        )
         asset = ContentAsset.create_idempotent(
             task=task,
             asset_key="primary-ui",
@@ -380,6 +402,103 @@ class ReviewReleaseUISliceTests(TestCase):
 
         self.client.force_login(self.outsider)
         self.assertNotContains(self.client.get(reverse("dashboard:review-queue")), self.task.title)
+
+    def test_submitter_cannot_review_own_submission_even_with_both_grants(self):
+        self._grant(self.operator, PermissionGrant.Action.REVIEW)
+        self.client.force_login(self.operator)
+
+        queue = self.client.get(reverse("dashboard:review-queue"))
+        self.assertNotContains(queue, self.task.title)
+        denied = self._review_post()
+
+        self.assertEqual(denied.status_code, 302)
+        self.assertEqual(
+            denied.headers["Location"],
+            reverse("dashboard:review-detail", args=[self.task.pk]),
+        )
+        self.assertFalse(ReviewDecision.objects.filter(submission__task=self.task).exists())
+        self.task.refresh_from_db()
+        self.assertEqual(self.task.current_state, Task.State.UNDER_REVIEW)
+
+    def test_completed_review_history_is_read_only_and_private_to_reviewer(self):
+        self.client.force_login(self.reviewer)
+        response = self._review_post()
+        self.assertRedirects(response, reverse("dashboard:review-queue"))
+        review = ReviewDecision.objects.get(submission__task=self.task)
+
+        queue = self.client.get(reverse("dashboard:review-queue"))
+        self.assertContains(queue, "我已完成的审核")
+        self.assertContains(queue, "Exact content checked by a human reviewer.")
+        self.assertContains(
+            queue,
+            reverse("dashboard:review-history-detail", args=[review.pk]),
+        )
+
+        detail = self.client.get(
+            reverse("dashboard:review-history-detail", args=[review.pk])
+        )
+        self.assertEqual(detail.status_code, 200)
+        self.assertContains(detail, "只读记录")
+        self.assertContains(detail, review.submission.primary_asset_version.content_sha256)
+        self.assertContains(detail, "answer.txt")
+        self.assertNotContains(detail, 'class="task-action-form"')
+
+        self.client.force_login(self.outsider)
+        hidden = self.client.get(
+            reverse("dashboard:review-history-detail", args=[review.pk])
+        )
+        self.assertEqual(hidden.status_code, 404)
+
+    def test_today_action_counts_are_permission_filtered_at_every_stage(self):
+        self.client.force_login(self.outsider)
+        outsider_before = self.client.get(reverse("dashboard:home"))
+        self.assertEqual(outsider_before.context["pending_review_count"], 0)
+        self.assertEqual(outsider_before.context["pending_publish_count"], 0)
+        self.assertEqual(outsider_before.context["pending_complete_count"], 0)
+
+        self.client.force_login(self.reviewer)
+        reviewer_today = self.client.get(reverse("dashboard:home"))
+        self.assertEqual(reviewer_today.context["pending_review_count"], 1)
+        self.assertEqual(reviewer_today.context["pending_publish_count"], 0)
+        self.assertEqual(reviewer_today.context["pending_complete_count"], 0)
+
+        self._approve()
+        self.client.force_login(self.publisher)
+        publisher_today = self.client.get(reverse("dashboard:home"))
+        self.assertEqual(publisher_today.context["pending_review_count"], 0)
+        self.assertEqual(publisher_today.context["pending_publish_count"], 1)
+        self.assertEqual(publisher_today.context["pending_complete_count"], 0)
+
+        _gate_response, _gate_command, publication = self._gate_via_ui()
+        proof = self.client.post(
+            reverse("dashboard:release-proof-action", args=[self.task.pk]),
+            {
+                "command_id": uuid.uuid4(),
+                "publication": publication.pk,
+                "external_publication_id": "today-count-proof",
+                "proof_file": SimpleUploadedFile(
+                    "today-proof.png",
+                    b"\x89PNG\r\n\x1a\ntoday count proof",
+                    content_type="image/png",
+                ),
+            },
+        )
+        self.assertRedirects(
+            proof,
+            reverse("dashboard:release-detail", args=[self.task.pk]),
+        )
+
+        self.client.force_login(self.owner)
+        owner_today = self.client.get(reverse("dashboard:home"))
+        self.assertEqual(owner_today.context["pending_review_count"], 0)
+        self.assertEqual(owner_today.context["pending_publish_count"], 0)
+        self.assertEqual(owner_today.context["pending_complete_count"], 1)
+
+        self.client.force_login(self.outsider)
+        outsider_after = self.client.get(reverse("dashboard:home"))
+        self.assertEqual(outsider_after.context["pending_review_count"], 0)
+        self.assertEqual(outsider_after.context["pending_publish_count"], 0)
+        self.assertEqual(outsider_after.context["pending_complete_count"], 0)
 
     def test_review_requires_independent_edit_grant_and_changes_path_is_explicit(self):
         review_only = Principal.objects.create_user(

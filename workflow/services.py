@@ -46,6 +46,13 @@ def _final_review(submission):
         return None
 
 
+def _is_withdrawn(submission) -> bool:
+    manager = getattr(submission, "withdrawal_events", None)
+    if manager is None:
+        return False
+    return manager.filter(event_type="SUBMISSION_WITHDRAWN").exists()
+
+
 def guard_submission(task, *, submission=None, dod_check_run=None) -> None:
     """Validate the exact immutable facts required to seal/accept a submission."""
 
@@ -83,6 +90,8 @@ def guard_review(task, *, submission) -> None:
     latest = _latest_submission(task)
     if latest is None or latest.pk != submission.pk or submission.task_id != task.pk:
         raise CheckGateRejected("Review requires the task's latest exact sealed submission.")
+    if _is_withdrawn(submission):
+        raise CheckGateRejected("A withdrawn submission cannot receive a review decision.")
 
 
 def guard_release_gate(task, *, submission, review_decision) -> None:
@@ -98,6 +107,8 @@ def guard_release_gate(task, *, submission, review_decision) -> None:
         or review_decision.decision != "APPROVED"
     ):
         raise CheckGateRejected("Release gate requires the exact final APPROVED human review.")
+    if review_decision.reviewer_principal_id == submission.submitted_by_principal_id:
+        raise CheckGateRejected("A self-reviewed submission can never pass the release gate.")
 
 
 def guard_manual_publication(task, *, publication) -> None:
@@ -128,6 +139,8 @@ def guard_transition_prerequisites(task, to_state: str) -> None:
             raise CheckGateRejected("The latest TaskSubmission does not match the preceding task version.")
         if _final_review(submission) is not None:
             raise CheckGateRejected("A review recorded before UNDER_REVIEW is invalid.")
+        if _is_withdrawn(submission):
+            raise CheckGateRejected("A withdrawn submission cannot return to UNDER_REVIEW.")
         return
 
     if to_state in {"APPROVED", "HUMAN_REWORK"}:
@@ -136,10 +149,12 @@ def guard_transition_prerequisites(task, to_state: str) -> None:
         required_decision = "APPROVED" if to_state == "APPROVED" else "CHANGES_REQUESTED"
         if (
             submission is None
+            or _is_withdrawn(submission)
             or review is None
             or review.submission_id != submission.pk
             or review.decision != required_decision
             or review.expected_task_version != task.state_version
+            or review.reviewer_principal_id == submission.submitted_by_principal_id
         ):
             raise CheckGateRejected(
                 f"{to_state} requires the latest submission's exact {required_decision} human review."

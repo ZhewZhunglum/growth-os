@@ -4,22 +4,23 @@
 {% block content %}
 <a class="back-link" href="{% url 'dashboard:home' %}">← 返回今日任务</a>
 <section class="task-detail-hero">
-    <div><p class="eyebrow">Owner / Operations Admin</p><h2>从已封存规则创建一项 DRAFT 任务</h2><p>这里只定义任务名称和为什么做。开工条件、交付标准与发布门禁来自你选择的精确合同版本，创建后不会自动分配、审核或发布。</p></div>
-    <div class="status-pill"><span></span> 中央 EDIT 授权</div>
+    <div><p class="eyebrow">负责人 / 运营主管</p><h2>从已封存规则创建一项草稿任务</h2><p>这里只定义任务名称和为什么做。开工条件、交付标准与发布门禁来自你选择的精确合同版本，创建后不会自动分配、审核或发布。</p></div>
+    <div class="status-pill"><span></span> 受控编辑授权</div>
 </section>
 <section class="detail-columns create-task-layout">
     <article class="detail-panel">
-        <p class="eyebrow">Safety boundary</p><h3>系统会替你检查什么</h3>
-        <ul class="plain-list"><li>产品配置必须已经封存。</li><li>任务合同必须精确属于所选配置版本。</li><li>每次提交都会重新检查产品 EDIT 权限。</li><li>新任务固定从 DRAFT、未分配、状态版本 0 开始。</li><li>重复提交同一命令不会创建第二项任务。</li></ul>
+        <p class="eyebrow">安全边界</p><h3>系统会替你检查什么</h3>
+        <ul class="plain-list"><li>产品配置必须是当前已经封存的版本。</li><li>任务合同必须是该配置的最新精确版本。</li><li>每次提交都会重新检查“创建任务”权限。</li><li>新任务固定从“草稿”、未分配、状态版本 0 开始。</li><li>重复提交同一命令不会创建第二项任务。</li></ul>
     </article>
     <article class="detail-panel action-panel">
-        <p class="eyebrow">Task definition</p><h3>填写任务背景</h3>
+        <p class="eyebrow">任务说明</p><h3>填写任务背景</h3>
         <form class="task-action-form" method="post">
-            {% csrf_token %}{{ form.task_id }}{{ form.task_token }}{{ form.non_field_errors }}
+            {% csrf_token %}{{ form.task_id }}{{ form.command_id }}{{ form.task_token }}{{ form.non_field_errors }}
             {% for field in form.visible_fields %}<div class="field-row">{{ field.label_tag }}{{ field }}{{ field.errors }}{% if field.help_text %}<small>{{ field.help_text }}</small>{% endif %}</div>{% endfor %}
             {% if form.task_id.errors %}<div class="field-row">{{ form.task_id.errors }}</div>{% endif %}
+            {% if form.command_id.errors %}<div class="field-row">{{ form.command_id.errors }}</div>{% endif %}
             {% if form.task_token.errors %}<div class="field-row">{{ form.task_token.errors }}</div>{% endif %}
-            <button class="button button-primary" type="submit">创建 DRAFT 任务</button>
+            <button class="button button-primary" type="submit">创建草稿任务</button>
         </form>
     </article>
 </section>

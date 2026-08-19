@@ -1,24 +1,40 @@
 {% extends "base.html" %}
+{% load dashboard_display %}
 {% block title %}待审核 · PUKO Growth OS{% endblock %}
 {% block page_title %}待审核{% endblock %}
 {% block content %}
 <section class="hero-panel">
     <div>
-        <p class="eyebrow">Human review · No publishing</p>
+        <p class="eyebrow">人工审核 · 不会发布</p>
         <h2>先核对交付，再决定通过还是返工。</h2>
         <p>这里只显示你拥有产品 REVIEW 权限的任务。审核结论和任务状态会分别记录，系统不会在这里执行发布。</p>
     </div>
 </section>
-<section class="section-heading"><div><p class="eyebrow">Under review</p><h2>等待你处理</h2></div><span class="section-note">{{ tasks|length }} 项</span></section>
+<section class="section-heading"><div><p class="eyebrow">正在审核</p><h2>等待你处理</h2></div><span class="section-note">{{ tasks|length }} 项</span></section>
 <section class="task-list">
     {% for task in tasks %}
     <article class="task-card">
-        <header class="task-card-header"><div><p class="task-meta">{{ task.product.name }}</p><h3>{{ task.title }}</h3></div><span class="task-state">{{ task.get_current_state_display }}</span></header>
+        <header class="task-card-header"><div><p class="task-meta">{{ task.product.name }}</p><h3>{{ task.title }}</h3></div><span class="task-state">{{ task.current_state|task_state_zh }}</span></header>
         <div class="task-section"><span class="task-label">为什么做</span><p>{{ task.description|default:"暂无背景说明" }}</p></div>
         <footer class="task-card-footer"><span>提交内容需要人工核对</span><a class="button button-primary" href="{% url 'dashboard:review-detail' task.id %}">打开审核</a></footer>
     </article>
     {% empty %}
     <article class="empty-state task-empty-state"><span class="empty-number">00</span><div><h3>当前没有待审核任务</h3><p>你不需要做任何操作。</p></div></article>
+    {% endfor %}
+</section>
+<section class="section-heading review-history-heading"><div><p class="eyebrow">只读历史</p><h2>我已完成的审核</h2></div><span class="section-note">{{ completed_reviews|length|default:0 }} 项</span></section>
+<section class="task-list review-history-list" aria-label="已完成审核记录">
+    {% for review in completed_reviews %}
+    <article class="task-card review-history-card">
+        <header class="task-card-header">
+            <div><p class="task-meta">{{ review.submission.task.product.name }}</p><h3>{{ review.submission.task.title }}</h3></div>
+            <span class="task-state">{{ review.decision|review_decision_zh }}</span>
+        </header>
+        <div class="task-section"><span class="task-label">审核说明</span><p>{{ review.rationale|default:"未填写审核说明" }}</p></div>
+        <footer class="task-card-footer"><span>审核时间：{{ review.decided_at }}</span><a class="button button-secondary" href="{% url 'dashboard:review-history-detail' review.id %}">查看只读记录</a></footer>
+    </article>
+    {% empty %}
+    <article class="empty-state task-empty-state"><span class="empty-number">00</span><div><h3>还没有已完成的审核记录</h3><p>完成审核后，历史结论会在这里以只读方式显示。</p></div></article>
     {% endfor %}
 </section>
 {% endblock %}

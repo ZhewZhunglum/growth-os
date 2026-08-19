@@ -4,7 +4,10 @@ import os
 from dataclasses import dataclass
 from datetime import timedelta
 
+from django.conf import settings
 from django.contrib.auth.models import Group
+from django.contrib.auth.password_validation import validate_password
+from django.core.exceptions import ValidationError
 from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
 from django.db.models import Q
@@ -52,6 +55,31 @@ class HumanSpec:
     role: str
     display_name: str
     group_name: str
+    fallback_password_env: str | None = None
+
+
+# These are bootstrap templates, not runtime role shortcuts.  Every capability
+# is materialized as an explicit, scoped PermissionGrant; authorization still
+# validates the Principal's persisted acting role and resolves the Grant.
+ROLE_PRODUCT_GRANT_TEMPLATES = {
+    Principal.Role.OWNER: (
+        PermissionGrant.Action.EDIT,
+        PermissionGrant.Action.CREATE_TASK,
+        PermissionGrant.Action.ASSIGN_TASK,
+        PermissionGrant.Action.CANCEL_TASK,
+        PermissionGrant.Action.COMPLETE_TASK,
+        PermissionGrant.Action.REVIEW,
+    ),
+    Principal.Role.OPERATIONS_ADMIN: (
+        PermissionGrant.Action.EDIT,
+        PermissionGrant.Action.CREATE_TASK,
+        PermissionGrant.Action.ASSIGN_TASK,
+        PermissionGrant.Action.CANCEL_TASK,
+        PermissionGrant.Action.COMPLETE_TASK,
+        PermissionGrant.Action.REVIEW,
+    ),
+    Principal.Role.OPERATOR: (PermissionGrant.Action.EDIT,),
+}
 
 
 class Command(BaseCommand):
@@ -59,7 +87,10 @@ class Command(BaseCommand):
 
     def add_arguments(self, parser):
         parser.add_argument("--owner-username", default="owner")
+        parser.add_argument("--admin-username")
         parser.add_argument("--operator-username")
+        # Legacy capability-identity options remain available so existing
+        # local databases and acceptance fixtures can be replayed unchanged.
         parser.add_argument("--reviewer-username")
         parser.add_argument("--publisher-username")
         parser.add_argument("--rule-evaluator-username")
@@ -67,21 +98,34 @@ class Command(BaseCommand):
             "--full-demo",
             action="store_true",
             help=(
-                "Request operator, reviewer, publisher, and rule-evaluator identities. "
+                "Request owner, admin, operator, and a rule evaluator. The operator receives an explicit "
+                "account-scoped Publisher capability. "
                 "New human identities require their distinct BOOTSTRAP_*_PASSWORD environment variables."
+            ),
+        )
+        parser.add_argument(
+            "--strict-separation-demo",
+            action="store_true",
+            help=(
+                "Use the legacy four-human acceptance fixture with separate reviewer and publisher "
+                "capability identities. This preserves stronger duty separation without adding roles."
             ),
         )
 
     def _requested_identities(self, options) -> tuple[list[HumanSpec], str | None]:
         defaults = {
+            "admin_username": "admin",
             "operator_username": "operator",
             "reviewer_username": "reviewer",
             "publisher_username": "publisher",
             "rule_evaluator_username": "rule-evaluator",
         }
-        if options["full_demo"]:
-            for key, value in defaults.items():
-                options[key] = options[key] or value
+        if options["strict_separation_demo"]:
+            for key in ("operator_username", "reviewer_username", "publisher_username", "rule_evaluator_username"):
+                options[key] = options[key] or defaults[key]
+        elif options["full_demo"]:
+            for key in ("admin_username", "operator_username", "rule_evaluator_username"):
+                options[key] = options[key] or defaults[key]
 
         humans = [
             HumanSpec(
@@ -94,18 +138,37 @@ class Command(BaseCommand):
             )
         ]
         optional = (
+            ("admin", "admin_username", "BOOTSTRAP_ADMIN_PASSWORD", Principal.Role.OPERATIONS_ADMIN,
+             "PUKO Operations Admin", "Operations Admin", "BOOTSTRAP_REVIEWER_PASSWORD"),
             ("operator", "operator_username", "BOOTSTRAP_OPERATOR_PASSWORD", Principal.Role.OPERATOR,
-             "PUKO Operator", "Operator"),
+             "PUKO Operator", "Operator", None),
             ("reviewer", "reviewer_username", "BOOTSTRAP_REVIEWER_PASSWORD", Principal.Role.OPERATIONS_ADMIN,
-             "PUKO Reviewer", "Operations Admin"),
+             "PUKO Review-capable Operations Admin", "Operations Admin", None),
             ("publisher", "publisher_username", "BOOTSTRAP_PUBLISHER_PASSWORD", Principal.Role.OPERATOR,
-             "PUKO Publisher", "Operator"),
+             "PUKO Publishing Operator", "Operator", None),
         )
-        for key, option, password_env, role, display_name, group_name in optional:
+        for key, option, password_env, role, display_name, group_name, fallback_password_env in optional:
             username = options.get(option)
             if username:
-                humans.append(HumanSpec(key, username, password_env, role, display_name, group_name))
+                humans.append(
+                    HumanSpec(
+                        key,
+                        username,
+                        password_env,
+                        role,
+                        display_name,
+                        group_name,
+                        fallback_password_env,
+                    )
+                )
         return humans, options.get("rule_evaluator_username")
+
+    @staticmethod
+    def _password_from_environment(spec: HumanSpec) -> tuple[str, str] | None:
+        for name in (spec.password_env, spec.fallback_password_env):
+            if name and os.getenv(name):
+                return name, os.environ[name]
+        return None
 
     def _preflight_identities(self, humans: list[HumanSpec], rule_evaluator_username: str | None) -> None:
         usernames = [spec.username for spec in humans]
@@ -120,6 +183,11 @@ class Command(BaseCommand):
             if principal is not None:
                 if principal.principal_type != Principal.PrincipalType.HUMAN_USER or not principal.can_authenticate:
                     raise CommandError(f"Existing {spec.key} account '{spec.username}' is not an active human Principal.")
+                if principal.auth_provider == "internal" and not principal.has_usable_password():
+                    raise CommandError(
+                        f"Existing internal {spec.key} account '{spec.username}' has no usable password; "
+                        "bootstrap will not reset credentials implicitly."
+                    )
                 if spec.key == "owner" and principal.is_superuser:
                     continue
                 if principal.role != spec.role:
@@ -127,13 +195,30 @@ class Command(BaseCommand):
                         f"Existing {spec.key} account '{spec.username}' has role {principal.role}, expected {spec.role}."
                     )
                 continue
-            password = os.getenv(spec.password_env)
-            if not password:
+            password_entry = self._password_from_environment(spec)
+            if password_entry is None:
+                accepted_names = " or ".join(
+                    name for name in (spec.password_env, spec.fallback_password_env) if name
+                )
                 raise CommandError(
-                    f"New {spec.key} account '{spec.username}' requires {spec.password_env}; "
+                    f"New {spec.key} account '{spec.username}' requires {accepted_names}; "
                     "no human account was created."
                 )
-            new_passwords.append((spec.password_env, password))
+            password_env, password = password_entry
+            candidate = Principal(
+                username=spec.username,
+                display_name=spec.display_name,
+                principal_type=Principal.PrincipalType.HUMAN_USER,
+                role=spec.role,
+            )
+            try:
+                validate_password(password, user=candidate)
+            except ValidationError as error:
+                raise CommandError(
+                    f"{password_env} does not satisfy the configured password policy: "
+                    f"{' '.join(error.messages)}"
+                ) from error
+            new_passwords.append((password_env, password))
 
         password_values = [value for _, value in new_passwords]
         if len(password_values) != len(set(password_values)):
@@ -157,7 +242,10 @@ class Command(BaseCommand):
     def _ensure_human(self, spec: HumanSpec) -> Principal:
         principal = Principal.objects.filter(username=spec.username).first()
         if principal is None:
-            password = os.environ[spec.password_env]
+            password_entry = self._password_from_environment(spec)
+            if password_entry is None:
+                raise CommandError(f"Password environment disappeared before creating '{spec.username}'.")
+            _, password = password_entry
             if spec.key == "owner":
                 principal = Principal.objects.create_superuser(
                     username=spec.username,
@@ -362,6 +450,13 @@ class Command(BaseCommand):
         account_ref: str = "",
     ) -> PermissionGrant:
         now = timezone.now()
+        if action == PermissionGrant.Action.PUBLISH and scope_kind != PermissionGrant.ScopeKind.ACCOUNT:
+            raise CommandError("Bootstrap PUBLISH capability must use an explicit ACCOUNT scope.")
+        required_risk = (
+            PermissionGrant.RiskLevel.HIGH
+            if action == PermissionGrant.Action.PUBLISH
+            else PermissionGrant.RiskLevel.MEDIUM
+        )
         scope_filter = {
             PermissionGrant.ScopeKind.PRODUCT: Q(product=product),
             PermissionGrant.ScopeKind.ACCOUNT: Q(account_ref=account_ref),
@@ -375,6 +470,11 @@ class Command(BaseCommand):
             grant_status=PermissionGrant.GrantStatus.ACTIVE,
             valid_from__lte=now,
         ).filter(Q(valid_until__isnull=True) | Q(valid_until__gt=now)).order_by("created_at", "id").first()
+        if grant is not None and grant.risk_level != required_risk:
+            raise CommandError(
+                f"Existing {principal.username}/{action} Grant has risk {grant.risk_level}; "
+                f"expected {required_risk}. Revoke it explicitly before bootstrapping a replacement."
+            )
         if grant is None:
             grant = PermissionGrant.objects.create(
                 principal=principal,
@@ -383,11 +483,7 @@ class Command(BaseCommand):
                 account_ref=account_ref if scope_kind == PermissionGrant.ScopeKind.ACCOUNT else "",
                 action=action,
                 effect=PermissionGrant.Effect.ALLOW,
-                risk_level=(
-                    PermissionGrant.RiskLevel.HIGH
-                    if action == PermissionGrant.Action.PUBLISH
-                    else PermissionGrant.RiskLevel.MEDIUM
-                ),
+                risk_level=required_risk,
                 valid_from=now - timedelta(minutes=1),
                 valid_until=now + timedelta(days=30),
                 granted_by_principal=owner,
@@ -410,6 +506,12 @@ class Command(BaseCommand):
 
     @transaction.atomic
     def handle(self, *args, **options):
+        if not settings.IS_LOCAL:
+            raise CommandError(
+                "bootstrap_dogfood is a local-only fixture command and is disabled outside local development. "
+                "Create Staging/Production identities through the approved deployment provisioning path."
+            )
+
         humans, rule_evaluator_username = self._requested_identities(options)
         self._preflight_identities(humans, rule_evaluator_username)
 
@@ -432,41 +534,61 @@ class Command(BaseCommand):
         if not created and (product.market_code != "US" or product.language_code != "en"):
             raise CommandError("Existing PUKO Product is not the frozen US/en Dogfood product.")
         profile = self._ensure_profile(product, owner)
-        if product.current_profile_version_id != profile.id:
+        if product.current_profile_version_id is None:
             product.current_profile_version = profile
             product.updated_by_principal = owner
             product.full_clean()
             product.save(update_fields=["current_profile_version", "updated_by_principal", "updated_at"])
+        elif product.current_profile_version_id != profile.id:
+            current_profile = product.current_profile_version
+            current_state = "sealed" if current_profile.is_sealed else "draft"
+            self.stdout.write(
+                self.style.WARNING(
+                    f"Preserved existing current Product profile v{current_profile.version_number} "
+                    f"({current_state}); bootstrap seed profile v{profile.version_number} was not restored as current."
+                )
+            )
 
         policy_version = self._ensure_policy(owner)
         contract = self._ensure_contract(profile, policy_version, owner)
         channel, environment, binding, capability = self._ensure_release_context(owner)
 
-        self._ensure_grant(
-            principal=owner,
-            action=PermissionGrant.Action.EDIT,
-            owner=owner,
-            scope_kind=PermissionGrant.ScopeKind.PRODUCT,
-            product=product,
-        )
-        if operator := principals.get("operator"):
-            self._ensure_grant(
-                principal=operator, action=PermissionGrant.Action.EDIT, owner=owner,
-                scope_kind=PermissionGrant.ScopeKind.PRODUCT, product=product,
-            )
-        if reviewer := principals.get("reviewer"):
-            self._ensure_grant(
-                principal=reviewer, action=PermissionGrant.Action.REVIEW, owner=owner,
-                scope_kind=PermissionGrant.ScopeKind.PRODUCT, product=product,
-            )
-            # Operations Admin records the immutable review with REVIEW and
-            # projects its outcome onto the Task with a separate explicit EDIT
-            # grant.  Review authority is never inferred from assignment.
-            self._ensure_grant(
-                principal=reviewer, action=PermissionGrant.Action.EDIT, owner=owner,
-                scope_kind=PermissionGrant.ScopeKind.PRODUCT, product=product,
-            )
-        if publisher := principals.get("publisher"):
+        # Only the three canonical staff identities receive role-template
+        # grants. Legacy reviewer/publisher identities remain narrow
+        # capability fixtures; replaying an old database must not silently
+        # expand their authority merely because they carry an existing role.
+        for key in ("owner", "admin", "operator"):
+            principal = principals.get(key)
+            if principal is None:
+                continue
+            for action in ROLE_PRODUCT_GRANT_TEMPLATES[principal.role]:
+                self._ensure_grant(
+                    principal=principal,
+                    action=action,
+                    owner=owner,
+                    scope_kind=PermissionGrant.ScopeKind.PRODUCT,
+                    product=product,
+                )
+
+        reviewer = principals.get("reviewer")
+        if reviewer is not None:
+            for action in (PermissionGrant.Action.REVIEW, PermissionGrant.Action.EDIT):
+                self._ensure_grant(
+                    principal=reviewer,
+                    action=action,
+                    owner=owner,
+                    scope_kind=PermissionGrant.ScopeKind.PRODUCT,
+                    product=product,
+                )
+
+        # Publisher is an independently scoped high-risk capability, never a
+        # fourth role and never inferred from the Operator template.  The
+        # streamlined three-human demo assigns it to the designated Operator;
+        # the strict/legacy fixture retains its separate Publisher identity.
+        publisher = principals.get("publisher")
+        if publisher is None and options["full_demo"] and not options["strict_separation_demo"]:
+            publisher = principals.get("operator")
+        if publisher is not None:
             self._ensure_grant(
                 principal=publisher, action=PermissionGrant.Action.PUBLISH, owner=owner,
                 scope_kind=PermissionGrant.ScopeKind.ACCOUNT, product=product,
@@ -479,12 +601,15 @@ class Command(BaseCommand):
             )
 
         participant_names = ", ".join(sorted(principals.keys() | ({"rule-evaluator"} if rule_evaluator else set())))
+        current_profile = product.current_profile_version
         self.stdout.write(
             self.style.SUCCESS(
-                f"Dogfood base ready: {product.product_code}, profile v{profile.version_number}, "
+                f"Dogfood base ready: {product.product_code}, seed profile v{profile.version_number}, "
+                f"current profile v{current_profile.version_number}, "
                 f"policy v{policy_version.version_number}, contract v{contract.version_number}, "
                 f"account {channel.account_code}, environment {environment.environment_code}, "
                 f"binding v{binding.binding_version}, capability {capability.state}; principals: {participant_names}. "
+                "Staff roles: Owner, Operations Admin, Operator. Reviewer and Publisher are scoped capabilities. "
                 "No Task was created."
             )
         )

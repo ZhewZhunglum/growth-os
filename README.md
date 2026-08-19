@@ -54,26 +54,41 @@ already exist, supply its password through `BOOTSTRAP_OWNER_PASSWORD` in the
 command process environment; passwords are never accepted as command-line
 arguments or embedded in the seed.
 
-Optional demo identities are requested with `--operator-username`,
-`--reviewer-username`, `--publisher-username`, and
-`--rule-evaluator-username`, or together with `--full-demo`. A new human
-identity requires its own `BOOTSTRAP_OPERATOR_PASSWORD`,
-`BOOTSTRAP_REVIEWER_PASSWORD`, or `BOOTSTRAP_PUBLISHER_PASSWORD`; existing
-matching accounts are reused without resetting their passwords. Missing or
-reused password values fail the transaction without creating partial staff.
-The rule evaluator is a service Principal with an unusable interactive
-password.
+The normal `--full-demo` setup creates three human identities—`owner`, `admin`
+and `operator`—plus a non-login rule-evaluator service identity. Reviewer and
+Publisher are capabilities, not additional staff roles: Admin receives an
+explicit product-scoped REVIEW grant, while Operator receives an explicit
+account-scoped HIGH-risk PUBLISH grant. A fresh database therefore needs three
+distinct temporary values in `BOOTSTRAP_OWNER_PASSWORD`,
+`BOOTSTRAP_ADMIN_PASSWORD`, and `BOOTSTRAP_OPERATOR_PASSWORD`. Existing matching
+accounts are reused without resetting their passwords. Missing or reused
+password values fail the transaction without creating partial staff.
 
-For the complete local role set, provide four distinct passwords through the
+For the normal local role set, provide the three distinct passwords through the
 temporary process environment and run:
 
 ```powershell
 .\.venv\Scripts\python.exe manage.py bootstrap_dogfood --full-demo
 ```
 
-Clear the four `BOOTSTRAP_*_PASSWORD` environment variables immediately after
+Clear the three `BOOTSTRAP_*_PASSWORD` environment variables immediately after
 the command. Never put their values in source, `.env.example`, chat, screenshots,
 logs, or shell scripts.
+
+The legacy `--reviewer-username` and `--publisher-username` options remain for
+replaying existing local databases. Use `--strict-separation-demo` only when a
+test explicitly needs separate reviewer and publisher identities. It does not
+add new role types and it never rewrites existing publication history.
+
+Local development accepts passwords of at least 6 characters **only when a
+password is newly set or changed in the local environment**. This does not make
+an existing 6-character local password invalid at sign-in, so a local database
+must never be promoted, copied, or restored into Staging or Production.
+`bootstrap_dogfood` is a local-only fixture command and fails closed outside the
+local environment. Staging and Production enforce at least 12 characters for
+new or changed passwords and refuse to start if `PASSWORD_MIN_LENGTH` is below
+12; their databases and human identities must be provisioned separately through
+the approved deployment process.
 
 ## Docker/PostgreSQL start
 
