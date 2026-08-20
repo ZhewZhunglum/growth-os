@@ -90,6 +90,45 @@ new or changed passwords and refuse to start if `PASSWORD_MIN_LENGTH` is below
 12; their databases and human identities must be provisioned separately through
 the approved deployment process.
 
+### Staging staff provisioning
+
+`python manage.py provision_staging_staff` is the controlled Staging-only path
+for the three human acceptance-test accounts. It fails closed in Local and
+Production, never creates a Django staff/superuser, never seeds Product data,
+and refuses a partial Owner/Admin/Operator set. The existing ACTIVE Product must
+already point to a sealed profile with a sealed task contract.
+
+The command defaults to a rollback-only dry run. On a fresh Staging database,
+temporarily inject three distinct passwords through the deployment platform's
+approved Secret mechanism as `STAGING_OWNER_PASSWORD`,
+`STAGING_ADMIN_PASSWORD`, and `STAGING_OPERATOR_PASSWORD`, then run:
+
+```text
+python manage.py provision_staging_staff --product-code PUKO
+python manage.py provision_staging_staff --product-code PUKO --apply
+```
+
+The first command validates the complete plan and commits zero writes. The
+second atomically creates the three Principals and their 30-day exact grants.
+Owner and Admin receive product-scoped task-management and REVIEW grants;
+Operator receives product-scoped EDIT. To give that Operator the separately
+controlled manual-publish capability, pass an existing account only after its
+ACTIVE Staging binding and current OPEN capability have been established:
+
+```text
+python manage.py provision_staging_staff --product-code PUKO --publish-account-code puko-us
+python manage.py provision_staging_staff --product-code PUKO --publish-account-code puko-us --apply
+```
+
+This adds only an account-scoped HIGH-risk PUBLISH grant. Replaying the command
+with all three matching accounts verifies/reuses them without reading or
+resetting passwords. For an existing three-account set, every base Product
+grant must already be complete and exact; the command refuses to silently add
+missing ordinary authority. Only an explicit `--publish-account-code` may add
+the separate PUBLISH grant. Password values must never be placed in `.env`, Compose,
+Git, chat, screenshots, logs, shell history, or command arguments. Remove the
+three temporary Secret injections immediately after the applied command.
+
 ## Docker/PostgreSQL start
 
 1. Copy `.env.example` to `.env` and replace every placeholder locally.
