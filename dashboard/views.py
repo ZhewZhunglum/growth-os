@@ -28,6 +28,7 @@ from dashboard.forms import (
     WithdrawSubmissionForm,
     criterion_label,
 )
+from dashboard.storage_cleanup import StoredObjectWrite
 from products.models import ProductProfileVersion
 from releasegate.models import Publication
 from workflow.models import Task, TaskAssignment, TaskCheckRun, TaskStateEvent
@@ -474,19 +475,6 @@ def _hash_upload(uploaded) -> tuple[str, int]:
     return digest.hexdigest(), byte_size
 
 
-def _delete_uploads(names: set[str]) -> None:
-    for name in names:
-        if not name:
-            continue
-        try:
-            if default_storage.exists(name):
-                default_storage.delete(name)
-        except Exception:
-            # Database facts have already rolled back. Storage cleanup can be
-            # retried operationally without fabricating a successful command.
-            pass
-
-
 def _criterion_results(form: UploadDoDForm) -> dict[str, str]:
     return {
         criterion["key"]: form.cleaned_data[f"{form.field_prefix}{criterion['key']}"]
@@ -584,14 +572,27 @@ def _upload_and_submit(task: Task, user: Principal, grant, form: UploadDoDForm) 
     root_command = form.cleaned_data["command_id"]
     original_name = Path(uploaded.name or "deliverable.bin").name
     safe_name = default_storage.get_valid_name(original_name) or "deliverable.bin"
-    requested_name = f"task-deliveries/{task.pk}/{root_command.hex}/{safe_name}"
-    cleanup_names = {requested_name}
-    committed = False
+    # Content addressing prevents two different payloads using the same
+    # command ID from ever targeting the same immutable object key. This stays
+    # safe even when COS bucket versioning makes its overwrite guard inactive.
+    requested_name = (
+        f"task-deliveries/{task.pk}/{root_command.hex}/{content_sha256}/{safe_name}"
+    )
+    stored_write = None
     try:
         stored_name = default_storage.save(requested_name, uploaded)
-        cleanup_names.add(stored_name)
+        stored_write = StoredObjectWrite(
+            storage=default_storage,
+            stored_name=stored_name,
+            is_referenced=lambda name: ContentAssetVersion.objects.filter(
+                object_key=name
+            ).exists(),
+        )
         result = ""
-        with transaction.atomic():
+        # ``durable=True`` makes this the outer commit boundary in production,
+        # so a successful return cannot later leave an orphan after an unseen
+        # outer rollback. Django's TestCase wrapper is explicitly supported.
+        with transaction.atomic(durable=True):
             asset = task.content_assets.filter(asset_key="primary-deliverable").first()
             if asset is None:
                 asset = ContentAsset.create_idempotent(
@@ -672,11 +673,11 @@ def _upload_and_submit(task: Task, user: Principal, grant, form: UploadDoDForm) 
                     recorded_by_principal=user,
                 )
             result = run.aggregate_result
-        committed = True
+            stored_write.retain_on_commit()
         return result
     except Exception:
-        if not committed:
-            _delete_uploads(cleanup_names)
+        if stored_write is not None:
+            stored_write.cleanup_after_rollback()
         raise
 
 

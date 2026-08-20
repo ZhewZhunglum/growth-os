@@ -31,6 +31,7 @@
             <dt>文件存储标识</dt><dd class="hash-value">{{ asset_version.object_key }}</dd>
             <dt>封存时间</dt><dd>{{ submission.sealed_at }}</dd>
         </dl>
+        {% if can_view_asset %}<a class="button" href="{% url 'dashboard:asset-version-file' asset_version.id %}" target="_blank" rel="noopener">打开当时审核的文件</a>{% else %}<p class="read-only-note">当前审核权限已失效，因此只能查看历史摘要，不能再下载文件。</p>{% endif %}
     </article>
     <article class="detail-panel read-only-panel">
         <p class="eyebrow">不可变人工结论</p><h3>{{ review.decision|review_decision_zh }}</h3>

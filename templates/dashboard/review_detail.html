@@ -6,7 +6,7 @@
 <a class="back-link" href="{% url 'dashboard:review-queue' %}">← 返回待审核</a>
 <section class="task-detail-hero"><div><p class="eyebrow">{{ task.product.name }} · 第 {{ submission.submission_number }} 次提交</p><h2>{{ task.title }}</h2><p>{{ task.description|default:"暂无背景说明" }}</p></div><div class="detail-status-stack"><span class="task-state">{{ task.current_state|task_state_zh }}</span><small>状态版本 {{ task.state_version }}</small></div></section>
 <section class="detail-summary-grid">
-    <article><span class="task-label">交付文件</span><p>{{ asset_version.metadata.original_filename|default:asset_version.object_key }}</p></article>
+    <article><span class="task-label">交付文件</span><p>{{ asset_version.metadata.original_filename|default:asset_version.object_key }}</p><a class="button" href="{% url 'dashboard:asset-version-file' asset_version.id %}" target="_blank" rel="noopener">打开这份交付文件</a></article>
     <article><span class="task-label">文件类型</span><p>{{ asset_version.mime_type }}</p></article>
     <article><span class="task-label">SHA-256</span><p>{{ asset_version.content_sha256|truncatechars:22 }}</p></article>
     <article><span class="task-label">提交说明</span><p>{{ submission.submission_note|default:"未填写" }}</p></article>

@@ -1,0 +1,192 @@
+# Staging-only topology. Do not reuse this file as a Production overlay.
+name: ${COMPOSE_PROJECT_NAME:-growth-os-staging}
+
+x-app-environment: &app-environment
+  GROWTH_OS_ENV: ${DEPLOYMENT_STAGE:?Set DEPLOYMENT_STAGE to staging}
+  GROWTH_OS_DEPLOYMENT_STAGE: staging-candidate
+  GROWTH_OS_RELEASE_SHA: ${GIT_COMMIT_SHA:?Set the exact 40-character Git commit SHA}
+  PASSWORD_MIN_LENGTH: "12"
+  DJANGO_ALLOWED_HOSTS: ${STAGING_HOSTNAME:?Set the Staging hostname}
+  DJANGO_CSRF_TRUSTED_ORIGINS: https://${STAGING_HOSTNAME:?Set the Staging hostname}
+  TRUST_PROXY_SSL_HEADER: "1"
+  DATABASE_ENGINE: postgresql
+  POSTGRES_DB: ${POSTGRES_DB:?Set the Staging database name}
+  POSTGRES_USER: ${POSTGRES_USER:?Set the Staging database user}
+  POSTGRES_HOST: db
+  POSTGRES_PORT: "5432"
+  POSTGRES_SSLMODE: disable
+  POSTGRES_CONN_MAX_AGE: "60"
+  DJANGO_SECRET_KEY_FILE: /run/secrets/django_secret_key
+  POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+  MEDIA_STORAGE_BACKEND: ${MEDIA_STORAGE_BACKEND:?Set the versioned media storage backend}
+  TENCENT_COS_BUCKET: ${TENCENT_COS_BUCKET:?Set the non-secret COS bucket identifier}
+  TENCENT_COS_REGION: ${TENCENT_COS_REGION:?Set the non-secret COS region}
+  TENCENT_COS_SECRET_ID_FILE: /run/secrets/tencent_cos_secret_id
+  TENCENT_COS_SECRET_KEY_FILE: /run/secrets/tencent_cos_secret_key
+
+x-app-secrets: &app-secrets
+  - source: django_secret_key
+    target: django_secret_key
+    uid: ${GROWTHOS_UID:?Set the approved application image growthos UID}
+    gid: ${GROWTHOS_GID:?Set the approved application image growthos GID}
+    mode: 0400
+  # File-backed Compose Secrets retain host ownership on Docker Compose. Keep
+  # a growthos-owned copy separate from the postgres-owned database Secret.
+  - source: app_postgres_password
+    target: postgres_password
+    uid: ${GROWTHOS_UID:?Set the approved application image growthos UID}
+    gid: ${GROWTHOS_GID:?Set the approved application image growthos GID}
+    mode: 0400
+  - source: tencent_cos_secret_id
+    target: tencent_cos_secret_id
+    uid: ${GROWTHOS_UID:?Set the approved application image growthos UID}
+    gid: ${GROWTHOS_GID:?Set the approved application image growthos GID}
+    mode: 0400
+  - source: tencent_cos_secret_key
+    target: tencent_cos_secret_key
+    uid: ${GROWTHOS_UID:?Set the approved application image growthos UID}
+    gid: ${GROWTHOS_GID:?Set the approved application image growthos GID}
+    mode: 0400
+
+services:
+  db:
+    image: ${POSTGRES_IMAGE:?Set POSTGRES_IMAGE to an approved immutable image digest}
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?Set the Staging database name}
+      POSTGRES_USER: ${POSTGRES_USER:?Set the Staging database user}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - source: postgres_password
+        target: postgres_password
+        uid: ${POSTGRES_UID:?Set the approved PostgreSQL image postgres UID}
+        gid: ${POSTGRES_GID:?Set the approved PostgreSQL image postgres GID}
+        mode: 0400
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  migrate:
+    image: ${STAGING_IMAGE_REPOSITORY:?Set the approved application image repository}@${STAGING_IMAGE_DIGEST:?Set the approved sha256 application image digest}
+    profiles: ["tools"]
+    environment: *app-environment
+    secrets: *app-secrets
+    entrypoint: ["python", "manage.py"]
+    command: ["migrate", "--noinput"]
+    depends_on:
+      db:
+        condition: service_healthy
+    init: true
+    security_opt:
+      - no-new-privileges:true
+
+  web:
+    image: ${STAGING_IMAGE_REPOSITORY:?Set the approved application image repository}@${STAGING_IMAGE_DIGEST:?Set the approved sha256 application image digest}
+    restart: unless-stopped
+    environment: *app-environment
+    secrets: *app-secrets
+    # Clear the image's local bootstrap entrypoint: Staging migrations are the
+    # explicit one-off `migrate` service above, never a web-start side effect.
+    entrypoint: []
+    command:
+      - sh
+      - -c
+      - >-
+        python manage.py collectstatic --noinput &&
+        exec gunicorn growth_os.wsgi:application
+        --bind 0.0.0.0:8000 --workers 2 --timeout 120
+        --access-logfile - --error-logfile -
+    ports:
+      # Avoid the old candidate's loopback port during the edge cutover.
+      - "127.0.0.1:18000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    # Keep this explicit rather than relying on an inherited image directive;
+    # Nginx's service_healthy dependency must be visible in the topology.
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8000/health/', timeout=3)
+      interval: 10s
+      timeout: 5s
+      start_period: 20s
+      retries: 12
+    init: true
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  nginx:
+    image: ${NGINX_IMAGE:?Set NGINX_IMAGE to an approved immutable image digest}
+    restart: unless-stopped
+    environment:
+      STAGING_HOSTNAME: ${STAGING_HOSTNAME:?Set the Staging hostname}
+      NGINX_ENVSUBST_FILTER: ^STAGING_HOSTNAME$
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      # Replace the stock image's welcome site; only the versioned virtual host
+      # below may receive public traffic.
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./nginx/growth-os.conf.template:/etc/nginx/templates/growth-os.conf.template:ro
+    secrets:
+      - source: tls_fullchain
+        target: tls_fullchain.pem
+        uid: "0"
+        gid: "0"
+        mode: 0400
+      - source: tls_privkey
+        target: tls_privkey.pem
+        uid: "0"
+        gid: "0"
+        mode: 0400
+    depends_on:
+      web:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+volumes:
+  postgres_data:
+
+secrets:
+  django_secret_key:
+    file: ${SECRETS_DIR:?Set the host Secret directory}/django_secret_key
+  postgres_password:
+    file: ${SECRETS_DIR:?Set the host Secret directory}/postgres_password
+  app_postgres_password:
+    file: ${SECRETS_DIR:?Set the host Secret directory}/app_postgres_password
+  tencent_cos_secret_id:
+    file: ${SECRETS_DIR:?Set the host Secret directory}/tencent_cos_secret_id
+  tencent_cos_secret_key:
+    file: ${SECRETS_DIR:?Set the host Secret directory}/tencent_cos_secret_key
+  tls_fullchain:
+    file: ${SECRETS_DIR:?Set the host Secret directory}/tls_fullchain.pem
+  tls_privkey:
+    file: ${SECRETS_DIR:?Set the host Secret directory}/tls_privkey.pem

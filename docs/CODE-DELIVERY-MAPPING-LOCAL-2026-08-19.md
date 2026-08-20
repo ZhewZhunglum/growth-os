@@ -26,7 +26,11 @@ This document fills the frozen `docs/spec/v1-freeze-2026-08-18/05-CODE-DELIVERY-
 - Migration command: set `DATABASE_ENGINE=sqlite`, then `.venv\Scripts\python.exe manage.py migrate --noinput`. Test database migrations ran as part of the local suite.
 - Seed command: `.venv\Scripts\python.exe manage.py bootstrap_dogfood`; a new Owner requires `BOOTSTRAP_OWNER_PASSWORD` in the process environment. `--full-demo` additionally requires separate environment passwords for the three normal human identities (Owner, Operations Admin, Operator). The command creates no Task and is disabled outside Local. The Local database must never be promoted to Staging/Production; those environments require separate identity provisioning and passwords of at least 12 characters.
 - Start command: `.venv\Scripts\python.exe manage.py runserver` for local SQLite, or `docker compose up --build` for the declared Compose/PostgreSQL topology.
-- Health-check command and expected response: `Invoke-RestMethod http://127.0.0.1:8000/health/`; expected JSON is `{"status":"ok","database":"ok"}` from `core/views.py`.
+- Health-check command: `Invoke-RestMethod http://127.0.0.1:8000/health/`.
+  The response contains `status`, `database`, and a non-sensitive `deployment`
+  object with the controlled stage plus full Git revision (or the honest local
+  default `unknown`). See `core/views.py`; never add environment dumps, secrets,
+  connection details, or business data to this endpoint.
 - Test command: set `DATABASE_ENGINE=sqlite`, then `.venv\Scripts\python.exe manage.py test --verbosity 1`.
 - Container image tag and digest: **NOT BUILT / NOT RECORDED**.
 

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import hashlib
 import shutil
 import tempfile
 import uuid
 from datetime import timedelta
 from pathlib import Path
+from unittest.mock import patch
 
+from django.core.exceptions import ValidationError
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.http import HttpResponse
 from django.test import TestCase, override_settings
@@ -15,6 +18,8 @@ from django.utils import timezone
 from accounts.models import PermissionGrant, Principal
 from contentops.models import ContentAsset, ContentAssetVersion, ReviewDecision, TaskSubmission
 from dashboard.review_views import (
+    asset_version_file,
+    publication_proof_file,
     release_detail,
     release_done_action,
     release_gate_action,
@@ -64,6 +69,12 @@ dashboard_patterns = [
         "review/history/<uuid:review_id>/",
         review_history_detail,
         name="review-history-detail",
+    ),
+    path("files/assets/<uuid:asset_version_id>/", asset_version_file, name="asset-version-file"),
+    path(
+        "files/publication-events/<uuid:publication_event_id>/proof/",
+        publication_proof_file,
+        name="publication-proof-file",
     ),
     path("release/", release_queue, name="release-queue"),
     path("release/<uuid:task_id>/", release_detail, name="release-detail"),
@@ -213,6 +224,7 @@ class ReviewReleaseUISliceTests(TestCase):
             created_by_principal=self.owner,
             recorded_by_principal=self.owner,
         )
+        self.asset_payload = b"exact immutable content reviewed by a human\n"
         self.task = self._under_review_task()
 
     def _grant(self, principal, action):
@@ -302,8 +314,8 @@ class ReviewReleaseUISliceTests(TestCase):
             content_asset=asset,
             object_key=f"ui/{task.pk}/answer.txt",
             mime_type="text/plain",
-            byte_size=24,
-            content_sha256="a" * 64,
+            byte_size=len(self.asset_payload),
+            content_sha256=hashlib.sha256(self.asset_payload).hexdigest(),
             metadata={"original_filename": "answer.txt"},
             command_id=uuid.uuid4(),
             actor_principal=self.operator,
@@ -448,6 +460,61 @@ class ReviewReleaseUISliceTests(TestCase):
             reverse("dashboard:review-history-detail", args=[review.pk])
         )
         self.assertEqual(hidden.status_code, 404)
+
+    def test_exact_asset_file_is_streamed_only_after_read_authorization(self):
+        asset_version = self.task.submissions.get().primary_asset_version
+        asset_path = Path(self.media_root) / asset_version.object_key
+        asset_path.parent.mkdir(parents=True, exist_ok=True)
+        exact_bytes = self.asset_payload
+        asset_path.write_bytes(exact_bytes)
+        file_url = reverse("dashboard:asset-version-file", args=[asset_version.pk])
+
+        self.client.force_login(self.reviewer)
+        allowed = self.client.get(file_url)
+        self.assertEqual(allowed.status_code, 200)
+        self.assertEqual(b"".join(allowed.streaming_content), exact_bytes)
+        self.assertEqual(allowed.headers["Content-Type"], "text/plain")
+        self.assertIn("inline", allowed.headers["Content-Disposition"])
+        self.assertEqual(allowed.headers["Cache-Control"], "private, no-store")
+        self.assertEqual(allowed.headers["X-Content-Type-Options"], "nosniff")
+        self.assertEqual(
+            allowed.headers["Cross-Origin-Resource-Policy"], "same-origin"
+        )
+
+        self.client.force_login(self.outsider)
+        denied = self.client.get(file_url)
+        self.assertEqual(denied.status_code, 404)
+
+    def test_historical_reviewer_requires_a_current_review_grant_for_file_bytes(self):
+        asset_version = self.task.submissions.get().primary_asset_version
+        asset_path = Path(self.media_root) / asset_version.object_key
+        asset_path.parent.mkdir(parents=True, exist_ok=True)
+        asset_path.write_bytes(self.asset_payload)
+        self.client.force_login(self.reviewer)
+        self._review_post()
+        file_url = reverse("dashboard:asset-version-file", args=[asset_version.pk])
+        allowed = self.client.get(file_url)
+        self.assertEqual(allowed.status_code, 200)
+        self.assertEqual(b"".join(allowed.streaming_content), self.asset_payload)
+        self.reviewer_review.grant_status = PermissionGrant.GrantStatus.REVOKED
+        self.reviewer_review.save(update_fields=["grant_status"])
+
+        response = self.client.get(file_url)
+        self.assertEqual(response.status_code, 404)
+
+    def test_asset_download_fails_closed_when_stored_bytes_do_not_match_manifest(self):
+        asset_version = self.task.submissions.get().primary_asset_version
+        asset_path = Path(self.media_root) / asset_version.object_key
+        asset_path.parent.mkdir(parents=True, exist_ok=True)
+        asset_path.write_bytes(b"x" * asset_version.byte_size)
+        self.client.force_login(self.reviewer)
+
+        response = self.client.get(
+            reverse("dashboard:asset-version-file", args=[asset_version.pk])
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertNotIn(b"x" * asset_version.byte_size, response.content)
 
     def test_today_action_counts_are_permission_filtered_at_every_stage(self):
         self.client.force_login(self.outsider)
@@ -603,11 +670,71 @@ class ReviewReleaseUISliceTests(TestCase):
         self.task.refresh_from_db()
         self.assertEqual(self.task.current_state, Task.State.DONE)
 
-    def test_failed_proof_authorization_deletes_uploaded_file_and_writes_no_event(self):
+    def test_publication_proof_is_private_to_requester_and_completion_authority(self):
         self._approve()
         _response, _command, publication = self._gate_via_ui()
-        self.publisher_grant.grant_status = PermissionGrant.GrantStatus.REVOKED
-        self.publisher_grant.save()
+        proof_bytes = b"\x89PNG\r\n\x1a\nprivate proof bytes"
+        proof_response = self.client.post(
+            reverse("dashboard:release-proof-action", args=[self.task.pk]),
+            {
+                "command_id": uuid.uuid4(),
+                "publication": publication.pk,
+                "external_publication_id": "private-proof",
+                "proof_file": SimpleUploadedFile(
+                    "proof.png", proof_bytes, content_type="image/png"
+                ),
+            },
+        )
+        self.assertRedirects(
+            proof_response,
+            reverse("dashboard:release-detail", args=[self.task.pk]),
+        )
+        proof_event = publication.events.get(
+            event_type=PublicationEvent.EventType.MANUAL_PUBLISHED_RECORDED
+        )
+        proof_url = reverse("dashboard:publication-proof-file", args=[proof_event.pk])
+
+        requester_response = self.client.get(proof_url)
+        self.assertEqual(requester_response.status_code, 200)
+        self.assertEqual(b"".join(requester_response.streaming_content), proof_bytes)
+        self.assertEqual(requester_response.headers["Content-Type"], "image/png")
+        self.assertEqual(requester_response.headers["Cache-Control"], "private, no-store")
+        self.assertEqual(
+            requester_response.headers["Cross-Origin-Resource-Policy"], "same-origin"
+        )
+
+        self.client.force_login(self.owner)
+        owner_response = self.client.get(proof_url)
+        self.assertEqual(owner_response.status_code, 200)
+        self.assertEqual(b"".join(owner_response.streaming_content), proof_bytes)
+
+        self.publisher_grant.valid_until = timezone.now() - timedelta(seconds=1)
+        self.publisher_grant.save(update_fields=["valid_until", "updated_at"])
+        self.client.force_login(self.publisher)
+        self.assertEqual(self.client.get(proof_url).status_code, 404)
+
+        self.client.force_login(self.outsider)
+        self.assertEqual(self.client.get(proof_url).status_code, 404)
+
+        non_proof_event = publication.events.exclude(pk=proof_event.pk).first()
+        self.assertIsNotNone(non_proof_event)
+        self.assertEqual(
+            self.client.get(
+                reverse("dashboard:publication-proof-file", args=[non_proof_event.pk])
+            ).status_code,
+            404,
+        )
+
+        proof_path = Path(self.media_root) / proof_event.proof_reference
+        proof_path.write_bytes(b"\x89PNG\r\n\x1a\ntampered proof data")
+        self.client.force_login(self.owner)
+        self.assertEqual(self.client.get(proof_url).status_code, 400)
+
+    def test_expired_publish_grant_after_ready_deletes_uploaded_file_and_writes_no_event(self):
+        self._approve()
+        _response, _command, publication = self._gate_via_ui()
+        self.publisher_grant.valid_until = timezone.now() - timedelta(seconds=1)
+        self.publisher_grant.save(update_fields=["valid_until", "updated_at"])
         before_events = PublicationEvent.objects.count()
         response = self.client.post(
             reverse("dashboard:release-proof-action", args=[self.task.pk]),
@@ -625,6 +752,52 @@ class ReviewReleaseUISliceTests(TestCase):
         self.assertEqual([item for item in Path(self.media_root).rglob("*") if item.is_file()], [])
         publication.refresh_from_db()
         self.assertEqual(publication.status, Publication.Status.READY_FOR_MANUAL_PUBLISH)
+
+    def test_failed_proof_collision_deletes_only_the_actual_renamed_object(self):
+        self._approve()
+        _response, _command, publication = self._gate_via_ui()
+        root_command = uuid.uuid4()
+        proof_payload = b"\x89PNG\r\n\x1a\nrenamed proof bytes"
+        requested_name = (
+            f"publication-proofs/{publication.pk}/{root_command.hex}/"
+            f"{hashlib.sha256(proof_payload).hexdigest()}/proof.png"
+        )
+        requested_path = Path(self.media_root) / requested_name
+        requested_path.parent.mkdir(parents=True, exist_ok=True)
+        concurrent_payload = b"another successful proof already owns this name"
+        requested_path.write_bytes(concurrent_payload)
+
+        with patch(
+            "dashboard.review_views.record_manual_publication_proof",
+            side_effect=ValidationError("Simulated proof failure after renamed save."),
+        ):
+            response = self.client.post(
+                reverse("dashboard:release-proof-action", args=[self.task.pk]),
+                {
+                    "command_id": root_command,
+                    "publication": publication.pk,
+                    "external_publication_id": "renamed-proof-must-roll-back",
+                    "proof_file": SimpleUploadedFile(
+                        "proof.png",
+                        proof_payload,
+                        content_type="image/png",
+                    ),
+                },
+            )
+
+        self.assertRedirects(
+            response,
+            reverse("dashboard:release-detail", args=[self.task.pk]),
+            fetch_redirect_response=False,
+        )
+        self.assertEqual(requested_path.read_bytes(), concurrent_payload)
+        remaining_files = [
+            path.relative_to(self.media_root)
+            for path in Path(self.media_root).rglob("*")
+            if path.is_file()
+        ]
+        self.assertEqual(remaining_files, [Path(requested_name)])
+        self.assertFalse(PublicationEvent.objects.filter(command_id=root_command).exists())
 
     def test_release_queue_and_detail_hide_unauthorized_user(self):
         self._approve()

@@ -643,6 +643,28 @@ class ReleaseGateDomainTests(TestCase):
         self.assertEqual(RuleEvaluationResult.objects.count(), 0)
         self.assertEqual(ReleaseGateRecord.objects.count(), 0)
 
+    def test_v1_service_expired_publish_grant_before_gate_leaves_zero_half_facts(self):
+        self.publish_grant.valid_until = timezone.now() - timedelta(seconds=1)
+        self.publish_grant.save(update_fields=["valid_until", "updated_at"])
+        before_publications = Publication.objects.count()
+        before_events = PublicationEvent.objects.count()
+
+        with self.assertRaises(ValidationError):
+            orchestrate_v1_release_gate(
+                task=self.task,
+                submission=self.submission,
+                publisher_principal=self.publisher,
+                channel_account=self.channel_account,
+                runtime_environment=self.environment,
+                command_id=uuid.uuid4(),
+            )
+
+        self.assertEqual(Publication.objects.count(), before_publications)
+        self.assertEqual(PublicationEvent.objects.count(), before_events)
+        self.assertEqual(RuleEvaluationRun.objects.count(), 0)
+        self.assertEqual(RuleEvaluationResult.objects.count(), 0)
+        self.assertEqual(ReleaseGateRecord.objects.count(), 0)
+
     def test_v1_service_unauthorized_publisher_and_invalid_proof_leave_no_partial_fact(self):
         unauthorized = Principal.objects.create_user(username="unauthorized-publisher")
         original_publication_count = Publication.objects.count()

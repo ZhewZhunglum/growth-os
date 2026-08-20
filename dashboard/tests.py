@@ -497,6 +497,50 @@ class ControlledTaskUiTests(TestCase):
         self.assertEqual(self.task.state_events.count(), 3)
         self.assertContains(response, "Simulated domain failure")
 
+    def test_failed_upload_collision_deletes_only_the_actual_renamed_object(self):
+        self._assign_and_start()
+        root_command = uuid.uuid4()
+        payload = b"This request receives a collision-renamed storage object."
+        concurrent_payload = b"A different successful request already owns this exact name."
+        with tempfile.TemporaryDirectory() as media_root, override_settings(MEDIA_ROOT=media_root):
+            requested_name = (
+                f"task-deliveries/{self.task.pk}/{root_command.hex}/"
+                f"{hashlib.sha256(payload).hexdigest()}/answer.txt"
+            )
+            requested_path = Path(media_root) / requested_name
+            requested_path.parent.mkdir(parents=True, exist_ok=True)
+            requested_path.write_bytes(concurrent_payload)
+
+            with patch(
+                "dashboard.views.TaskSubmission.seal",
+                side_effect=ValidationError("Simulated failure after renamed save."),
+            ):
+                response = self.client.post(
+                    reverse("dashboard:task-action", args=[self.task.pk, "upload"]),
+                    self._command_data(
+                        self.task,
+                        command_id=root_command,
+                        deliverable=SimpleUploadedFile(
+                            "answer.txt", payload, content_type="text/plain"
+                        ),
+                        submission_note="Must roll back without deleting the collision owner.",
+                        criterion__plain_language=TaskCheckRun.Result.PASS,
+                    ),
+                    follow=True,
+                )
+
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(requested_path.read_bytes(), concurrent_payload)
+            remaining_files = [
+                path.relative_to(media_root)
+                for path in Path(media_root).rglob("*")
+                if path.is_file()
+            ]
+            self.assertEqual(remaining_files, [Path(requested_name)])
+
+        self.assertFalse(ContentAssetVersion.objects.filter(content_asset__task=self.task).exists())
+        self.assertContains(response, "Simulated failure after renamed save")
+
     def test_exact_upload_command_replay_is_idempotent_and_conflicting_payload_is_rejected(self):
         self._assign_and_start()
         root_command = uuid.uuid4()
