@@ -22,6 +22,7 @@ TASK_CREATE_TOKEN_SALT = "growth-os.dashboard.task-create.v1"
 
 class TaskCreateForm(forms.Form):
     task_id = forms.UUIDField(widget=forms.HiddenInput)
+    command_id = forms.UUIDField(widget=forms.HiddenInput)
     task_token = forms.CharField(widget=forms.HiddenInput)
     product_profile_version = forms.ModelChoiceField(
         queryset=ProductProfileVersion.objects.none(),
@@ -46,11 +47,13 @@ class TaskCreateForm(forms.Form):
         initial = kwargs.setdefault("initial", {})
         if not args and not kwargs.get("data"):
             generated_id = uuid7()
+            command_id = uuid.uuid4()
             initial.setdefault("task_id", generated_id)
+            initial.setdefault("command_id", command_id)
             initial.setdefault(
                 "task_token",
                 signing.dumps(
-                    {"task_id": str(generated_id)},
+                    {"task_id": str(generated_id), "command_id": str(command_id)},
                     salt=TASK_CREATE_TOKEN_SALT,
                     compress=True,
                 ),
@@ -81,15 +84,20 @@ class TaskCreateForm(forms.Form):
     def clean(self):
         cleaned = super().clean()
         task_id = cleaned.get("task_id")
+        command_id = cleaned.get("command_id")
         token = cleaned.get("task_token")
-        if task_id and token:
+        if task_id and command_id and token:
             try:
                 signed = signing.loads(token, salt=TASK_CREATE_TOKEN_SALT)
             except signing.BadSignature:
                 self.add_error("task_token", "任务创建令牌无效，请刷新页面后重试。")
             else:
-                if not isinstance(signed, dict) or signed.get("task_id") != str(task_id):
-                    self.add_error("task_id", "任务 ID 与服务器创建令牌不匹配。")
+                if (
+                    not isinstance(signed, dict)
+                    or signed.get("task_id") != str(task_id)
+                    or signed.get("command_id") != str(command_id)
+                ):
+                    self.add_error("task_id", "任务 ID 或命令 ID 与服务器创建令牌不匹配。")
         profile = cleaned.get("product_profile_version")
         contract = cleaned.get("contract_version")
         if profile and not profile.is_sealed:
@@ -153,7 +161,7 @@ class DoRForm(CriteriaCommandForm):
 class AssignmentForm(CommandForm):
     assignee = forms.ModelChoiceField(
         queryset=Principal.objects.none(),
-        label="分配给哪位 Operator",
+        label="分配给哪位执行负责人",
         empty_label="请选择一位可执行人员",
     )
 
@@ -168,6 +176,26 @@ class StartWorkForm(CommandForm):
 
 class ResumeDraftForm(CommandForm):
     pass
+
+
+class CancelTaskForm(CommandForm):
+    reason = forms.CharField(
+        label="取消原因",
+        max_length=500,
+        widget=forms.Textarea(attrs={"rows": 2}),
+        help_text="任务不会被删除；系统会保留审计记录，并从 Today 主列表隐藏。",
+    )
+    confirm = forms.BooleanField(label="确认取消这份草稿")
+
+
+class WithdrawSubmissionForm(CommandForm):
+    reason = forms.CharField(
+        label="撤回原因",
+        max_length=500,
+        widget=forms.Textarea(attrs={"rows": 2}),
+        help_text="仅在审核人尚未作出结论时可撤回；旧版本仍会保留。",
+    )
+    confirm = forms.BooleanField(label="确认撤回并重新修改")
 
 
 class UploadDoDForm(CriteriaCommandForm):

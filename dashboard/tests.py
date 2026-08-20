@@ -15,7 +15,14 @@ from django.utils import timezone
 from accounts.models import PermissionGrant, Principal
 from contentops.models import ContentAsset, ContentAssetVersion, ReviewDecision, TaskSubmission
 from products.models import Product, ProductProfileVersion
-from workflow.models import ActingRole, Task, TaskAssignment, TaskCheckRun, TaskContractVersion
+from workflow.models import (
+    ActingRole,
+    Task,
+    TaskAssignment,
+    TaskCheckRun,
+    TaskContractVersion,
+    TaskStateEvent,
+)
 
 
 class DashboardTests(TestCase):
@@ -24,6 +31,7 @@ class DashboardTests(TestCase):
         self.other_user = Principal.objects.create_user(username="another", password="local-test-only")
 
     def make_task(self, *, owner, title="Write a clear Quora answer", assignee=None):
+        assignee = assignee or owner
         product = Product.objects.create(
             product_code=f"P-{Product.objects.count() + 1}",
             name="PUKO Magnesium",
@@ -65,15 +73,22 @@ class DashboardTests(TestCase):
             created_by_principal=owner,
             updated_by_principal=owner,
         )
-        grant = PermissionGrant.objects.create(
-            principal=owner,
-            scope_kind=PermissionGrant.ScopeKind.PRODUCT,
-            product=product,
-            action=PermissionGrant.Action.EDIT,
-            effect=PermissionGrant.Effect.ALLOW,
-            valid_from=timezone.now() - timedelta(minutes=1),
-            valid_until=timezone.now() + timedelta(hours=1),
-            granted_by_principal=owner,
+        def grant(principal, action):
+            return PermissionGrant.objects.create(
+                principal=principal,
+                scope_kind=PermissionGrant.ScopeKind.PRODUCT,
+                product=product,
+                action=action,
+                effect=PermissionGrant.Effect.ALLOW,
+                valid_from=timezone.now() - timedelta(minutes=1),
+                valid_until=timezone.now() + timedelta(hours=1),
+                granted_by_principal=owner,
+            )
+
+        owner_edit = grant(owner, PermissionGrant.Action.EDIT)
+        owner_assign = grant(owner, PermissionGrant.Action.ASSIGN_TASK)
+        assignee_edit = owner_edit if assignee.pk == owner.pk else grant(
+            assignee, PermissionGrant.Action.EDIT
         )
         TaskCheckRun.record_completed(
             task=task,
@@ -86,7 +101,7 @@ class DashboardTests(TestCase):
             command_id=uuid.uuid4(),
             evaluator_principal=owner,
             acting_role=ActingRole.OPERATOR,
-            permission_grant=grant,
+            permission_grant=owner_edit,
             recorded_by_principal=owner,
         )
         Task.transition(
@@ -96,18 +111,18 @@ class DashboardTests(TestCase):
             expected_state_version=0,
             actor_principal=owner,
             acting_role=ActingRole.OPERATOR,
-            permission_grant=grant,
+            permission_grant=owner_edit,
             recorded_by_principal=owner,
         )
         task.refresh_from_db()
         TaskAssignment.record(
             task=task,
-            assignee_principal=assignee or owner,
+            assignee_principal=assignee,
             command_id=uuid.uuid4(),
             expected_task_version=task.state_version,
             assigned_by_principal=owner,
             acting_role=ActingRole.OPERATOR,
-            permission_grant=grant,
+            permission_grant=owner_assign,
             recorded_by_principal=owner,
         )
         Task.transition(
@@ -117,7 +132,7 @@ class DashboardTests(TestCase):
             expected_state_version=task.state_version,
             actor_principal=owner,
             acting_role=ActingRole.OPERATOR,
-            permission_grant=grant,
+            permission_grant=owner_assign,
             recorded_by_principal=owner,
         )
         task.refresh_from_db()
@@ -126,10 +141,10 @@ class DashboardTests(TestCase):
             to_state=Task.State.IN_PROGRESS,
             command_id=uuid.uuid4(),
             expected_state_version=task.state_version,
-            actor_principal=owner,
-            acting_role=ActingRole.OPERATOR,
-            permission_grant=grant,
-            recorded_by_principal=owner,
+            actor_principal=assignee,
+            acting_role=assignee.role,
+            permission_grant=assignee_edit,
+            recorded_by_principal=assignee,
         )
         task.refresh_from_db()
         return task
@@ -165,7 +180,7 @@ class DashboardTests(TestCase):
         response = self.client.get(reverse("dashboard:home"))
 
         self.assertContains(response, "Write a clear Quora answer")
-        self.assertContains(response, "In progress")
+        self.assertContains(response, "执行中")
         self.assertContains(response, "为什么做")
         self.assertContains(response, "尚未检查", count=1)
         self.assertContains(response, "Use plain, natural language")
@@ -227,6 +242,10 @@ class ControlledTaskUiTests(TestCase):
         )
         self.task = self._new_task(self.owner)
         self.owner_grant = self._grant_edit(self.owner)
+        self.owner_create_grant = self._grant(self.owner, PermissionGrant.Action.CREATE_TASK)
+        self.owner_assign_grant = self._grant(self.owner, PermissionGrant.Action.ASSIGN_TASK)
+        self.owner_cancel_grant = self._grant(self.owner, PermissionGrant.Action.CANCEL_TASK)
+        self.owner_complete_grant = self._grant(self.owner, PermissionGrant.Action.COMPLETE_TASK)
         self.operator_grant = self._grant_edit(self.operator)
 
     def _new_task(self, creator):
@@ -306,6 +325,30 @@ class ControlledTaskUiTests(TestCase):
         self.client.force_login(self.outsider)
         hidden = self.client.get(reverse("dashboard:task-detail", args=[self.task.pk]))
         self.assertEqual(hidden.status_code, 404)
+
+    def test_draft_cancel_hides_task_from_today_but_preserves_audited_record(self):
+        self.client.force_login(self.owner)
+        response = self.client.post(
+            reverse("dashboard:task-action", args=[self.task.pk, "cancel"]),
+            self._command_data(
+                self.task,
+                reason="Wrong product context selected during dogfood.",
+                confirm="on",
+            ),
+        )
+
+        self.assertRedirects(response, reverse("dashboard:home"))
+        self.task.refresh_from_db()
+        self.assertEqual(self.task.current_state, Task.State.CANCELLED)
+        self.assertTrue(Task.objects.filter(pk=self.task.pk).exists())
+        event = self.task.state_events.get(to_state=Task.State.CANCELLED)
+        self.assertEqual(event.from_state, Task.State.DRAFT)
+        self.assertEqual(event.permission_grant_id, self.owner_cancel_grant.pk)
+        self.assertEqual(event.reason, "Wrong product context selected during dogfood.")
+
+        today = self.client.get(reverse("dashboard:home"))
+        self.assertNotIn(self.task.pk, {task.pk for task in today.context["tasks"]})
+        self.assertNotContains(today, self.task.title)
 
     def test_creator_without_edit_permission_cannot_record_dor(self):
         unauthorized_task = self._new_task(self.outsider)
@@ -603,6 +646,79 @@ class ControlledTaskUiTests(TestCase):
         self.assertEqual(ContentAssetVersion.objects.filter(content_asset__task=self.task).count(), 2)
         self.assertEqual(self.task.check_runs.filter(check_kind=TaskCheckRun.Kind.DOD).count(), 2)
 
+    def test_operator_can_withdraw_unreviewed_submission_and_resubmit_as_v2(self):
+        self._assign_and_start()
+        first_payload = b"First delivery withdrawn before review.\n"
+        second_payload = b"Corrected delivery after withdrawal.\n"
+
+        with tempfile.TemporaryDirectory() as media_root, override_settings(MEDIA_ROOT=media_root):
+            first_response = self.client.post(
+                reverse("dashboard:task-action", args=[self.task.pk, "upload"]),
+                self._command_data(
+                    self.task,
+                    deliverable=SimpleUploadedFile(
+                        "answer-v1.txt", first_payload, content_type="text/plain"
+                    ),
+                    submission_note="Submitted with the wrong final wording.",
+                    criterion__plain_language=TaskCheckRun.Result.PASS,
+                ),
+            )
+            self.assertEqual(first_response.status_code, 302)
+            self.task.refresh_from_db()
+            self.assertEqual(self.task.current_state, Task.State.UNDER_REVIEW)
+            first_submission = self.task.submissions.get()
+
+            withdraw_response = self.client.post(
+                reverse("dashboard:task-action", args=[self.task.pk, "withdraw"]),
+                self._command_data(
+                    self.task,
+                    reason="I noticed the final sentence was incorrect.",
+                    confirm="on",
+                ),
+            )
+            self.assertRedirects(
+                withdraw_response,
+                reverse("dashboard:task-detail", args=[self.task.pk]),
+            )
+            self.task.refresh_from_db()
+            self.assertEqual(self.task.current_state, Task.State.IN_PROGRESS)
+            withdrawal = self.task.state_events.get(
+                event_type=TaskStateEvent.EventType.SUBMISSION_WITHDRAWN
+            )
+            self.assertEqual(withdrawal.submission_id, first_submission.pk)
+            self.assertEqual(withdrawal.permission_grant_id, self.operator_grant.pk)
+            self.assertFalse(ReviewDecision.objects.filter(submission=first_submission).exists())
+
+            second_response = self.client.post(
+                reverse("dashboard:task-action", args=[self.task.pk, "upload"]),
+                self._command_data(
+                    self.task,
+                    deliverable=SimpleUploadedFile(
+                        "answer-v2.txt", second_payload, content_type="text/plain"
+                    ),
+                    submission_note="Corrected before reviewer decision.",
+                    criterion__plain_language=TaskCheckRun.Result.PASS,
+                ),
+                follow=True,
+            )
+            self.assertEqual(second_response.status_code, 200)
+            self.assertEqual(
+                len([path for path in Path(media_root).rglob("*") if path.is_file()]),
+                2,
+            )
+
+        self.task.refresh_from_db()
+        self.assertEqual(self.task.current_state, Task.State.UNDER_REVIEW)
+        submissions = list(self.task.submissions.order_by("submission_number"))
+        self.assertEqual(len(submissions), 2)
+        self.assertEqual(submissions[1].supersedes_submission_id, first_submission.pk)
+        self.assertIsNone(submissions[1].triggering_review_id)
+        self.assertEqual(submissions[1].primary_asset_version.version_number, 2)
+        self.assertEqual(
+            submissions[1].primary_asset_version.content_sha256,
+            hashlib.sha256(second_payload).hexdigest(),
+        )
+
     def _new_task_form_data(self, *, title="Draft a new evidence-led answer", description="Explain why this task matters."):
         self.client.force_login(self.owner)
         response = self.client.get(reverse("dashboard:task-create"))
@@ -610,6 +726,7 @@ class ControlledTaskUiTests(TestCase):
         form = response.context["form"]
         return {
             "task_id": str(form["task_id"].value()),
+            "command_id": str(form["command_id"].value()),
             "task_token": form["task_token"].value(),
             "product_profile_version": str(self.profile.pk),
             "contract_version": str(self.contract.pk),
@@ -635,6 +752,10 @@ class ControlledTaskUiTests(TestCase):
         self.assertEqual(created.state_version, 0)
         self.assertIsNone(created.current_assignee_principal_id)
         self.assertEqual(created.created_by_principal_id, self.owner.pk)
+        self.assertEqual(created.creation_command_id, uuid.UUID(data["command_id"]))
+        self.assertEqual(created.created_under_grant_id, self.owner_create_grant.pk)
+        self.assertEqual(created.created_by_acting_role, self.owner.role)
+        self.assertEqual(len(created.creation_payload_hash), 64)
         self.assertEqual(created.updated_by_principal_id, self.owner.pk)
         self.assertRedirects(response, reverse("dashboard:task-detail", args=[created.pk]))
 
@@ -645,14 +766,14 @@ class ControlledTaskUiTests(TestCase):
         response = self.client.get(reverse("dashboard:task-create"))
         self.assertEqual(response.status_code, 403)
 
-    def test_revoked_edit_grant_fails_closed_at_post_time(self):
+    def test_revoked_create_task_grant_fails_closed_at_post_time(self):
         data = self._new_task_form_data()
         generated_id = uuid.UUID(data["task_id"])
-        self.owner_grant.grant_status = PermissionGrant.GrantStatus.REVOKED
-        self.owner_grant.revoked_at = timezone.now()
-        self.owner_grant.revoked_by_principal = self.owner
-        self.owner_grant.revocation_reason = "Test revocation before submit."
-        self.owner_grant.save(
+        self.owner_create_grant.grant_status = PermissionGrant.GrantStatus.REVOKED
+        self.owner_create_grant.revoked_at = timezone.now()
+        self.owner_create_grant.revoked_by_principal = self.owner
+        self.owner_create_grant.revocation_reason = "Test revocation before submit."
+        self.owner_create_grant.save(
             update_fields=[
                 "grant_status",
                 "revoked_at",
@@ -719,6 +840,7 @@ class ControlledTaskUiTests(TestCase):
         form = page.context["form"]
         base = {
             "task_id": str(form["task_id"].value()),
+            "command_id": str(form["command_id"].value()),
             "task_token": form["task_token"].value(),
             "title": "Historical inputs must be rejected",
             "description": "Fail closed.",

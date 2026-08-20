@@ -8,7 +8,7 @@ from django.contrib import messages
 from django.contrib.auth.decorators import login_required
 from django.core.exceptions import ObjectDoesNotExist, PermissionDenied, ValidationError
 from django.core.files.storage import default_storage
-from django.db import IntegrityError, transaction
+from django.db import transaction
 from django.db.models import F, Prefetch, Q
 from django.http import Http404, HttpRequest, HttpResponse
 from django.shortcuts import get_object_or_404, redirect, render
@@ -19,15 +19,18 @@ from accounts.models import PermissionGrant, Principal
 from contentops.models import ContentAsset, ContentAssetVersion, ReviewDecision, TaskSubmission
 from dashboard.forms import (
     AssignmentForm,
+    CancelTaskForm,
     DoRForm,
     ResumeDraftForm,
     StartWorkForm,
     TaskCreateForm,
     UploadDoDForm,
+    WithdrawSubmissionForm,
     criterion_label,
 )
 from products.models import ProductProfileVersion
-from workflow.models import Task, TaskAssignment, TaskCheckRun
+from releasegate.models import Publication
+from workflow.models import Task, TaskAssignment, TaskCheckRun, TaskStateEvent
 
 
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024
@@ -86,16 +89,11 @@ def _task_for_user(user: Principal, task_id) -> Task:
     raise Http404("Task not found.")
 
 
-def _has_task_creator_role(user: Principal) -> bool:
-    return bool(
+def _editable_profiles(user: Principal):
+    if not (
         user.can_authenticate
         and user.principal_type == Principal.PrincipalType.HUMAN_USER
-        and user.role in {Principal.Role.OWNER, Principal.Role.OPERATIONS_ADMIN}
-    )
-
-
-def _editable_profiles(user: Principal):
-    if not _has_task_creator_role(user):
+    ):
         return ProductProfileVersion.objects.none()
     profile_ids = [
         profile.pk
@@ -108,7 +106,7 @@ def _editable_profiles(user: Principal):
         if resolve_authorization(
             principal=user,
             acting_role=user.role,
-            action=PermissionGrant.Action.EDIT,
+            action=PermissionGrant.Action.CREATE_TASK,
             scope_kind=PermissionGrant.ScopeKind.PRODUCT,
             product=profile.product,
         ).allowed
@@ -118,11 +116,11 @@ def _editable_profiles(user: Principal):
     )
 
 
-def _require_profile_edit(user: Principal, profile: ProductProfileVersion):
+def _require_profile_create(user: Principal, profile: ProductProfileVersion):
     return require_authorization(
         principal=user,
         acting_role=user.role,
-        action=PermissionGrant.Action.EDIT,
+        action=PermissionGrant.Action.CREATE_TASK,
         scope_kind=PermissionGrant.ScopeKind.PRODUCT,
         product=profile.product,
     )
@@ -130,7 +128,6 @@ def _require_profile_edit(user: Principal, profile: ProductProfileVersion):
 
 def _eligible_operators(task: Task):
     candidates = Principal.objects.filter(
-        role=Principal.Role.OPERATOR,
         principal_type=Principal.PrincipalType.HUMAN_USER,
         principal_status=Principal.PrincipalStatus.ACTIVE,
         is_active=True,
@@ -172,25 +169,34 @@ def _decorate_task(task: Task) -> None:
 
 
 def _action_form(task: Task, user: Principal):
-    if not _authorization(user, task, PermissionGrant.Action.EDIT).allowed:
-        return "", None
     common = {"state_version": task.state_version}
-    if task.current_state == Task.State.DRAFT:
+    can_edit = _authorization(user, task, PermissionGrant.Action.EDIT).allowed
+    if task.current_state == Task.State.DRAFT and can_edit:
         return "dor", DoRForm(criteria=task.contract_version.dor_criteria, **common)
-    if task.current_state == Task.State.BLOCKED and task.blocked_from_state == Task.State.DRAFT:
+    if task.current_state == Task.State.BLOCKED and task.blocked_from_state == Task.State.DRAFT and can_edit:
         return "resume", ResumeDraftForm(**common)
-    if task.current_state == Task.State.READY:
+    if task.current_state == Task.State.READY and _authorization(
+        user, task, PermissionGrant.Action.ASSIGN_TASK
+    ).allowed:
         return "assign", AssignmentForm(operators=_eligible_operators(task), **common)
-    if task.current_state == Task.State.ASSIGNED and task.current_assignee_principal_id == user.pk:
+    if task.current_state == Task.State.ASSIGNED and task.current_assignee_principal_id == user.pk and can_edit:
         return "start", StartWorkForm(**common)
-    if task.current_state == Task.State.HUMAN_REWORK and task.current_assignee_principal_id == user.pk:
+    if task.current_state == Task.State.HUMAN_REWORK and task.current_assignee_principal_id == user.pk and can_edit:
         return "resume-work", StartWorkForm(**common)
-    if task.current_state == Task.State.IN_PROGRESS and task.current_assignee_principal_id == user.pk:
+    if task.current_state == Task.State.IN_PROGRESS and task.current_assignee_principal_id == user.pk and can_edit:
         return "upload", UploadDoDForm(criteria=task.contract_version.dod_criteria, **common)
     return "", None
 
 
-def _detail_context(task: Task, user: Principal, *, action_kind=None, action_form=None) -> dict:
+def _detail_context(
+    task: Task,
+    user: Principal,
+    *,
+    action_kind=None,
+    action_form=None,
+    cancel_form=None,
+    withdraw_form=None,
+) -> dict:
     _decorate_task(task)
     if action_kind is None:
         action_kind, action_form = _action_form(task, user)
@@ -199,6 +205,19 @@ def _detail_context(task: Task, user: Principal, *, action_kind=None, action_for
         "action_kind": action_kind,
         "action_form": action_form,
         "submission": task.submissions.order_by("-submission_number").first(),
+        "cancel_form": cancel_form if cancel_form is not None else (
+            CancelTaskForm(state_version=task.state_version)
+            if task.current_state == Task.State.DRAFT
+            and _authorization(user, task, PermissionGrant.Action.CANCEL_TASK).allowed
+            else None
+        ),
+        "withdraw_form": withdraw_form if withdraw_form is not None else (
+            WithdrawSubmissionForm(state_version=task.state_version)
+            if task.current_state == Task.State.UNDER_REVIEW
+            and task.current_assignee_principal_id == user.pk
+            and _authorization(user, task, PermissionGrant.Action.EDIT).allowed
+            else None
+        ),
     }
 
 
@@ -208,6 +227,7 @@ def home(request: HttpRequest) -> HttpResponse:
         Task.objects.filter(
             Q(current_assignee_principal=request.user) | Q(created_by_principal=request.user)
         )
+        .exclude(current_state=Task.State.CANCELLED)
         .select_related("product", "contract_version", "current_assignee_principal")
         .prefetch_related(
             Prefetch(
@@ -237,6 +257,40 @@ def home(request: HttpRequest) -> HttpResponse:
         Task.State.HUMAN_REWORK,
     }
     can_create_task = _editable_profiles(request.user).exists()
+    # These are permission-filtered work queues, not extra employee roles.
+    # Import locally to keep the task workspace independent from the review/
+    # release view module during app startup.
+    from dashboard.review_views import (
+        _allowed_accounts,
+        _can_complete,
+        _can_review_submission,
+    )
+    pending_review_count = 0
+    for review_task in Task.objects.filter(current_state=Task.State.UNDER_REVIEW).select_related(
+        "product"
+    ):
+        review_submission = review_task.submissions.order_by("-submission_number").first()
+        if review_submission is not None and _can_review_submission(
+            request.user, review_task, review_submission
+        ):
+            pending_review_count += 1
+
+    pending_publish_count = 0
+    pending_complete_count = 0
+    for release_task in Task.objects.filter(current_state=Task.State.APPROVED).select_related(
+        "product"
+    ):
+        latest_submission = release_task.submissions.order_by("-submission_number").first()
+        has_manual_publication_proof = bool(
+            latest_submission
+            and latest_submission.publications.filter(
+                status=Publication.Status.MANUAL_PUBLISHED_RECORDED
+            ).exists()
+        )
+        if _allowed_accounts(request.user, release_task).exists() and not has_manual_publication_proof:
+            pending_publish_count += 1
+        if _can_complete(request.user, release_task):
+            pending_complete_count += 1
     return render(
         request,
         "dashboard/home.html",
@@ -246,64 +300,25 @@ def home(request: HttpRequest) -> HttpResponse:
             "active_task_count": sum(task.current_state in active_states for task in tasks),
             "blocked_task_count": sum(task.current_state == Task.State.BLOCKED for task in tasks),
             "can_create_task": can_create_task,
+            "pending_review_count": pending_review_count,
+            "pending_publish_count": pending_publish_count,
+            "pending_complete_count": pending_complete_count,
         },
     )
 
 
-def _create_task_idempotent(*, user: Principal, form: TaskCreateForm) -> tuple[Task, bool]:
-    profile = form.cleaned_data["product_profile_version"]
-    contract = form.cleaned_data["contract_version"]
-    task_id = form.cleaned_data["task_id"]
-    title = form.cleaned_data["title"]
-    description = form.cleaned_data["description"]
-    def resolve_existing(existing: Task) -> tuple[Task, bool]:
-        is_same_payload = all(
-            (
-                existing.product_id == profile.product_id,
-                existing.product_profile_version_id == profile.pk,
-                existing.contract_version_id == contract.pk,
-                existing.title == title,
-                existing.description == description,
-                existing.created_by_principal_id == user.pk,
-            )
-        )
-        if not is_same_payload:
-            raise ValidationError(
-                "该任务 ID 已用于另一份创建内容；请刷新页面生成新的任务 ID。"
-            )
-        return existing, False
-
-    with transaction.atomic():
-        existing = Task.objects.select_for_update().filter(pk=task_id).first()
-        if existing is not None:
-            return resolve_existing(existing)
-        task = Task(
-            id=task_id,
-            product=profile.product,
-            product_profile_version=profile,
-            contract_version=contract,
-            title=title,
-            description=description,
-            created_by_principal=user,
-            updated_by_principal=user,
-        )
-        try:
-            # A savepoint keeps the outer transaction usable if another
-            # request inserts this UUIDv7 after our missing-row lookup.
-            with transaction.atomic():
-                task.save(force_insert=True)
-        except IntegrityError:
-            winner = Task.objects.select_for_update().filter(pk=task_id).first()
-            if winner is None:
-                raise
-            return resolve_existing(winner)
-        return task, True
+def _require_task_action(user: Principal, task: Task, action: str):
+    return require_authorization(
+        principal=user,
+        acting_role=user.role,
+        action=action,
+        scope_kind=PermissionGrant.ScopeKind.PRODUCT,
+        product=task.product,
+    )
 
 
 @login_required
 def task_create(request: HttpRequest) -> HttpResponse:
-    if not _has_task_creator_role(request.user):
-        raise PermissionDenied("ONLY_ACTIVE_OWNER_OR_ADMIN_CAN_CREATE_TASK")
     profiles = _editable_profiles(request.user)
     if not profiles.exists():
         raise PermissionDenied("NO_EDITABLE_SEALED_PRODUCT_PROFILE")
@@ -323,15 +338,20 @@ def task_create(request: HttpRequest) -> HttpResponse:
             # Recheck the exact product on every POST. A stale form must fail
             # closed after revocation, and another editable product cannot be
             # used to smuggle an unauthorized profile through ModelChoiceField.
-            _require_profile_edit(request.user, selected_profile)
+            _require_profile_create(request.user, selected_profile)
         form = TaskCreateForm(request.POST, profiles=profiles)
         if form.is_valid():
-            # The selected profile was restricted by the form queryset, but we
-            # resolve again so the persisted task always follows the current
-            # central authorization decision.
-            _require_profile_edit(request.user, form.cleaned_data["product_profile_version"])
             try:
-                task, created = _create_task_idempotent(user=request.user, form=form)
+                task, created = Task.create_draft(
+                    task_id=form.cleaned_data["task_id"],
+                    command_id=form.cleaned_data["command_id"],
+                    product_profile_version_id=form.cleaned_data["product_profile_version"].pk,
+                    contract_version_id=form.cleaned_data["contract_version"].pk,
+                    title=form.cleaned_data["title"],
+                    description=form.cleaned_data["description"],
+                    actor_principal=request.user,
+                    acting_role=request.user.role,
+                )
             except ValidationError as error:
                 messages.error(request, _validation_text(error))
                 return render(request, "dashboard/task_create.html", {"form": form}, status=409)
@@ -549,9 +569,17 @@ def _upload_and_submit(task: Task, user: Principal, grant, form: UploadDoDForm) 
         try:
             triggering_review = supersedes_submission.final_review
         except ObjectDoesNotExist:
-            raise ValidationError("返工上传要求上一份交付已有明确的修改审核结论。") from None
-        if triggering_review.decision != ReviewDecision.Decision.CHANGES_REQUESTED:
-            raise ValidationError("只有明确要求修改的审核结论才能创建返工版本。")
+            was_withdrawn = supersedes_submission.withdrawal_events.filter(
+                event_type=TaskStateEvent.EventType.SUBMISSION_WITHDRAWN,
+                task_id=task.pk,
+            ).exists()
+            if not was_withdrawn:
+                raise ValidationError(
+                    "重新提交前，上一份交付必须已被审核要求修改，或由执行负责人正式撤回。"
+                ) from None
+        else:
+            if triggering_review.decision != ReviewDecision.Decision.CHANGES_REQUESTED:
+                raise ValidationError("只有明确要求修改的审核结论才能创建返工版本。")
 
     root_command = form.cleaned_data["command_id"]
     original_name = Path(uploaded.name or "deliverable.bin").name
@@ -656,7 +684,12 @@ def _upload_and_submit(task: Task, user: Principal, grant, form: UploadDoDForm) 
 @require_POST
 def task_action(request: HttpRequest, task_id, action: str) -> HttpResponse:
     task = _task_for_user(request.user, task_id)
-    grant = _require_edit(request.user, task)
+    if action == "assign":
+        grant = _require_task_action(request.user, task, PermissionGrant.Action.ASSIGN_TASK)
+    elif action == "cancel":
+        grant = _require_task_action(request.user, task, PermissionGrant.Action.CANCEL_TASK)
+    else:
+        grant = _require_edit(request.user, task)
     form = None
     try:
         if action == "dor":
@@ -730,6 +763,52 @@ def task_action(request: HttpRequest, task_id, action: str) -> HttpResponse:
                 request,
                 "交付已封存并送入人工审核。" if result == TaskCheckRun.Result.PASS else "文件和本次 DoD 已保留，但仍有阻塞项，尚未送审。",
             )
+        elif action == "cancel":
+            form = CancelTaskForm(request.POST, state_version=task.state_version)
+            if not form.is_valid():
+                return render(
+                    request,
+                    "dashboard/task_detail.html",
+                    _detail_context(task, request.user, cancel_form=form),
+                    status=400,
+                )
+            Task.transition(
+                task_id=task.pk,
+                to_state=Task.State.CANCELLED,
+                command_id=form.cleaned_data["command_id"],
+                expected_state_version=form.cleaned_data["expected_state_version"],
+                actor_principal=request.user,
+                acting_role=request.user.role,
+                permission_grant=grant,
+                recorded_by_principal=request.user,
+                reason=form.cleaned_data["reason"],
+            )
+            messages.success(request, "草稿已取消并从 Today 隐藏；历史记录仍然保留。")
+            return redirect("dashboard:home")
+        elif action == "withdraw":
+            form = WithdrawSubmissionForm(request.POST, state_version=task.state_version)
+            if not form.is_valid():
+                return render(
+                    request,
+                    "dashboard/task_detail.html",
+                    _detail_context(task, request.user, withdraw_form=form),
+                    status=400,
+                )
+            submission = task.submissions.order_by("-submission_number").first()
+            if submission is None:
+                raise ValidationError("没有可撤回的已封存交付版本。")
+            Task.withdraw_submission(
+                task_id=task.pk,
+                submission_id=submission.pk,
+                command_id=form.cleaned_data["command_id"],
+                expected_state_version=form.cleaned_data["expected_state_version"],
+                actor_principal=request.user,
+                acting_role=request.user.role,
+                permission_grant=grant,
+                recorded_by_principal=request.user,
+                reason=form.cleaned_data["reason"],
+            )
+            messages.success(request, "交付已撤回。旧版本仍保留，请修改后重新提交新版本。")
         else:
             raise Http404("Unknown task action.")
     except ValidationError as error:

@@ -90,9 +90,7 @@ def _allowed_environments(accounts):
 
 
 def _can_complete(user: Principal, task: Task) -> bool:
-    if user.role not in {Principal.Role.OWNER, Principal.Role.OPERATIONS_ADMIN}:
-        return False
-    if not _product_decision(user, task, PermissionGrant.Action.EDIT).allowed:
+    if not _product_decision(user, task, PermissionGrant.Action.COMPLETE_TASK).allowed:
         return False
     submission = task.submissions.order_by("-submission_number").first()
     if submission is None:
@@ -112,6 +110,15 @@ def _latest_submission(task: Task) -> TaskSubmission:
     if submission is None:
         raise Http404("Task has no sealed submission.")
     return submission
+
+
+def _can_review_submission(user: Principal, task: Task, submission: TaskSubmission) -> bool:
+    """Return whether the user may independently review this exact submission."""
+
+    return bool(
+        submission.submitted_by_principal_id != user.pk
+        and _product_decision(user, task, PermissionGrant.Action.REVIEW).allowed
+    )
 
 
 def _review_context(task: Task, *, form=None):
@@ -165,14 +172,29 @@ def _release_context(task: Task, user: Principal, *, gate_form=None, proof_form=
 
 @login_required
 def review_queue(request: HttpRequest) -> HttpResponse:
-    tasks = [
-        task
-        for task in Task.objects.filter(current_state=Task.State.UNDER_REVIEW)
+    tasks = []
+    for task in (
+        Task.objects.filter(current_state=Task.State.UNDER_REVIEW)
         .select_related("product", "contract_version", "current_assignee_principal")
+        .prefetch_related("submissions")
         .order_by("updated_at", "title")
-        if _product_decision(request.user, task, PermissionGrant.Action.REVIEW).allowed
-    ]
-    return render(request, "dashboard/review_queue.html", {"tasks": tasks})
+    ):
+        submission = task.submissions.order_by("-submission_number").first()
+        if submission is not None and _can_review_submission(request.user, task, submission):
+            tasks.append(task)
+    completed_reviews = (
+        ReviewDecision.objects.filter(reviewer_principal=request.user)
+        .select_related(
+            "submission__task__product",
+            "submission__primary_asset_version__content_asset",
+        )
+        .order_by("-decided_at", "-id")
+    )
+    return render(
+        request,
+        "dashboard/review_queue.html",
+        {"tasks": tasks, "completed_reviews": completed_reviews},
+    )
 
 
 @login_required
@@ -183,7 +205,34 @@ def review_detail(request: HttpRequest, task_id) -> HttpResponse:
         current_state=Task.State.UNDER_REVIEW,
     )
     _require_product_grant(request.user, task, PermissionGrant.Action.REVIEW)
+    submission = _latest_submission(task)
+    if submission.submitted_by_principal_id == request.user.pk:
+        raise PermissionDenied("SUBMITTER_CANNOT_REVIEW_OWN_SUBMISSION")
     return render(request, "dashboard/review_detail.html", _review_context(task))
+
+
+@login_required
+def review_history_detail(request: HttpRequest, review_id) -> HttpResponse:
+    review = get_object_or_404(
+        ReviewDecision.objects.select_related(
+            "reviewer_principal",
+            "submission__task__product",
+            "submission__task__contract_version",
+            "submission__primary_asset_version__content_asset",
+        ),
+        pk=review_id,
+        reviewer_principal=request.user,
+    )
+    return render(
+        request,
+        "dashboard/review_history_detail.html",
+        {
+            "review": review,
+            "submission": review.submission,
+            "task": review.submission.task,
+            "asset_version": review.submission.primary_asset_version,
+        },
+    )
 
 
 @login_required
@@ -444,9 +493,9 @@ def release_proof_action(request: HttpRequest, task_id) -> HttpResponse:
 @require_POST
 def release_done_action(request: HttpRequest, task_id) -> HttpResponse:
     task = get_object_or_404(Task.objects.select_related("product"), pk=task_id)
-    if request.user.role not in {Principal.Role.OWNER, Principal.Role.OPERATIONS_ADMIN}:
-        raise PermissionDenied("ONLY_OWNER_OR_ADMIN_CAN_COMPLETE")
-    edit_grant = _require_product_grant(request.user, task, PermissionGrant.Action.EDIT)
+    complete_grant = _require_product_grant(
+        request.user, task, PermissionGrant.Action.COMPLETE_TASK
+    )
     form = CompleteTaskForm(request.POST, state_version=task.state_version)
     if not form.is_valid():
         return render(
@@ -463,7 +512,7 @@ def release_done_action(request: HttpRequest, task_id) -> HttpResponse:
             expected_state_version=form.cleaned_data["expected_state_version"],
             actor_principal=request.user,
             acting_role=request.user.role,
-            permission_grant=edit_grant,
+            permission_grant=complete_grant,
             recorded_by_principal=request.user,
             reason="Owner/Admin confirmed immutable manual publication proof.",
         )

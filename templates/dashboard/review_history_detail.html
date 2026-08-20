@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% load dashboard_display %}
+{% block title %}审核记录 {{ task.title }} · PUKO Growth OS{% endblock %}
+{% block page_title %}已完成审核记录{% endblock %}
+{% block content %}
+<a class="back-link" href="{% url 'dashboard:review-queue' %}">← 返回内容审核</a>
+<section class="task-detail-hero">
+    <div>
+        <p class="eyebrow">只读记录 · 第 {{ submission.submission_number }} 次提交</p>
+        <h2>{{ task.title }}</h2>
+        <p>{{ task.description|default:"暂无背景说明" }}</p>
+    </div>
+    <div class="detail-status-stack">
+        <span class="task-state">{{ review.decision|review_decision_zh }}</span>
+        <small>本页不能修改审核事实</small>
+    </div>
+</section>
+<section class="detail-summary-grid" aria-label="审核事实">
+    <article><span class="task-label">产品</span><p>{{ task.product.name }}</p></article>
+    <article><span class="task-label">审核人员</span><p>{{ review.reviewer_principal.display_name|default:review.reviewer_principal.username }}</p></article>
+    <article><span class="task-label">审核时间</span><p>{{ review.decided_at }}</p></article>
+    <article><span class="task-label">审核结论</span><p>{{ review.decision|review_decision_zh }}</p></article>
+</section>
+<section class="detail-columns">
+    <article class="detail-panel">
+        <p class="eyebrow">精确交付版本</p><h3>{{ asset_version.metadata.original_filename|default:asset_version.object_key }}</h3>
+        <dl class="submission-summary">
+            <dt>资产版本</dt><dd>v{{ asset_version.version_number }}</dd>
+            <dt>文件类型</dt><dd>{{ asset_version.mime_type }}</dd>
+            <dt>SHA-256</dt><dd class="hash-value">{{ asset_version.content_sha256 }}</dd>
+            <dt>文件存储标识</dt><dd class="hash-value">{{ asset_version.object_key }}</dd>
+            <dt>封存时间</dt><dd>{{ submission.sealed_at }}</dd>
+        </dl>
+    </article>
+    <article class="detail-panel read-only-panel">
+        <p class="eyebrow">不可变人工结论</p><h3>{{ review.decision|review_decision_zh }}</h3>
+        <span class="task-label">审核说明</span>
+        <p class="review-rationale">{{ review.rationale|default:"未填写审核说明"|linebreaksbr }}</p>
+        <p class="read-only-note">该结论、提交批次和精确文件版本仅供查看，不能在本页修改或重新提交。</p>
+    </article>
+</section>
+{% endblock %}

@@ -60,15 +60,17 @@ Invoke-RestMethod http://127.0.0.1:8000/health/
 
 ## 第三阶段：准备本地 Dogfood 账号
 
-需要四个不同的人类测试身份和一个不可登录的系统身份：
+标准本地 Dogfood 需要三个不同的人类测试身份和一个不可登录的系统身份：
 
 - Owner
+- Operations Admin（持有 Reviewer 能力）
 - Operator
-- Reviewer / Operations Admin
-- Publisher
+- Publisher 是授予指定 Operator 的账号级高风险能力，不是第四种角色
 - Rule Evaluator（服务身份，不允许网页登录）
 
-使用 `python manage.py bootstrap_dogfood --full-demo` 初始化。四个人类账号必须使用不同密码；密码只通过本机临时环境变量或批准的 Secret 工具注入，不写入源码、命令历史、聊天、截图或日志。执行完成后清除临时环境变量。
+使用 `python manage.py bootstrap_dogfood --full-demo` 初始化。三个人类账号必须使用不同密码；密码只通过本机临时环境变量或批准的 Secret 工具注入，不写入源码、命令历史、聊天、截图或日志。执行完成后清除临时环境变量。Reviewer 与 Publisher 是独立的受控能力，运行时仍检查精确 PermissionGrant，而不是只看角色名称。
+
+该命令仅供 Local 测试，任何非 Local 环境都会 fail closed。Local 的 6 位下限只约束本地新设或修改的测试密码，既有短密码不会在登录时自动失效。因此严禁把本地数据库复制、恢复或直接晋升到 Staging/Production。Staging 与 Production 必须使用独立数据库和身份初始化流程，将 `PASSWORD_MIN_LENGTH` 明确设为至少 12，并重新创建或轮换全部人类账号凭据。
 
 初始化命令会建立 PUKO 产品、封存 Profile、最新合同、强制 Policy、测试账号/环境/Capability 和最小权限，但不会自动创建 Task，也不会发布外部内容。初始 Grant 默认有效 30 天，测试前需确认仍在有效期内。
 

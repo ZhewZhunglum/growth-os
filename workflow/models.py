@@ -6,8 +6,8 @@ import uuid
 from typing import Any
 
 from django.conf import settings
-from django.core.exceptions import ValidationError
-from django.db import models, transaction
+from django.core.exceptions import PermissionDenied, ValidationError
+from django.db import IntegrityError, models, transaction
 from django.db.models import Q
 from django.utils import timezone
 
@@ -223,9 +223,39 @@ class Task(TimeStampedModel):
     created_by_principal = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="tasks_created"
     )
+    creation_command_id = models.UUIDField(null=True, blank=True, unique=True)
+    creation_payload_hash = models.CharField(max_length=64, blank=True)
+    created_by_acting_role = models.CharField(max_length=24, choices=ActingRole.choices, blank=True)
+    created_under_grant = models.ForeignKey(
+        "accounts.PermissionGrant",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="tasks_created",
+    )
     updated_by_principal = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="tasks_updated"
     )
+
+    class Meta:
+        constraints = [
+            models.CheckConstraint(
+                condition=(
+                    Q(
+                        creation_command_id__isnull=True,
+                        creation_payload_hash="",
+                        created_by_acting_role="",
+                        created_under_grant__isnull=True,
+                    )
+                    | (
+                        Q(creation_command_id__isnull=False, created_under_grant__isnull=False)
+                        & ~Q(creation_payload_hash="")
+                        & ~Q(created_by_acting_role="")
+                    )
+                ),
+                name="workflow_task_creation_audit_complete",
+            )
+        ]
 
     def clean(self):
         super().clean()
@@ -246,6 +276,137 @@ class Task(TimeStampedModel):
     def save(self, *args, **kwargs):
         self.full_clean()
         return super().save(*args, **kwargs)
+
+    @classmethod
+    def create_draft(
+        cls,
+        *,
+        task_id: uuid.UUID,
+        command_id: uuid.UUID,
+        product_profile_version_id,
+        contract_version_id,
+        title: str,
+        description: str,
+        actor_principal,
+        acting_role: str,
+    ) -> tuple[Task, bool]:
+        """Create one audited DRAFT through the sole interactive runtime command.
+
+        Direct ORM creation remains available for migrations and historical test
+        fixtures.  Interactive callers must use this command so authorization,
+        exact configuration binding, and idempotency are checked in one
+        transaction.
+        """
+
+        payload = {
+            "task_id": str(task_id),
+            "product_profile_version_id": str(product_profile_version_id),
+            "contract_version_id": str(contract_version_id),
+            "title": title,
+            "description": description,
+            "actor_principal_id": str(getattr(actor_principal, "pk", "")),
+            "acting_role": acting_role,
+        }
+        digest = payload_sha256(payload)
+
+        def resolve_existing(existing: Task) -> tuple[Task, bool]:
+            if existing.creation_command_id != command_id or existing.creation_payload_hash != digest:
+                raise CommandReplayConflict(
+                    "该任务 ID 已用于另一份创建内容；请刷新页面生成新的任务 ID。"
+                )
+            return existing, False
+
+        from accounts.authorization import resolve_authorization
+        from accounts.models import PermissionGrant, Principal
+        from products.models import Product, ProductProfileVersion
+
+        with transaction.atomic():
+            existing = cls.objects.select_for_update().filter(creation_command_id=command_id).first()
+            if existing is not None:
+                return resolve_existing(existing)
+            existing = cls.objects.select_for_update().filter(pk=task_id).first()
+            if existing is not None:
+                return resolve_existing(existing)
+
+            principal = Principal.objects.select_for_update().filter(pk=getattr(actor_principal, "pk", None)).first()
+            if (
+                principal is None
+                or principal.principal_type != Principal.PrincipalType.HUMAN_USER
+                or not principal.can_authenticate
+            ):
+                raise PermissionDenied("ACTIVE_HUMAN_PRINCIPAL_REQUIRED")
+            if acting_role not in ActingRole.values or acting_role == ActingRole.SYSTEM or principal.role != acting_role:
+                raise PermissionDenied("ACTING_ROLE_MISMATCH")
+
+            profile_ref = ProductProfileVersion.objects.filter(pk=product_profile_version_id).values(
+                "product_id"
+            ).first()
+            if profile_ref is None:
+                raise ValidationError("The selected ProductProfileVersion does not exist.")
+            product = Product.objects.select_for_update().get(pk=profile_ref["product_id"])
+            profile = ProductProfileVersion.objects.select_for_update().get(pk=product_profile_version_id)
+            contract = TaskContractVersion.objects.select_for_update().filter(pk=contract_version_id).first()
+
+            if product.product_status != Product.ProductStatus.ACTIVE:
+                raise ValidationError("Tasks may only be created for an active Product.")
+            if product.current_profile_version_id != profile.pk or not profile.is_sealed:
+                raise ValidationError("Task creation requires the current sealed ProductProfileVersion.")
+            if contract is None or contract.product_profile_version_id != profile.pk or not contract.sealed_at:
+                raise ValidationError("Task creation requires a sealed contract for the exact profile.")
+            latest_contract_id = (
+                TaskContractVersion.objects.filter(product_profile_version=profile)
+                .order_by("-version_number", "-created_at", "-id")
+                .values_list("pk", flat=True)
+                .first()
+            )
+            if latest_contract_id != contract.pk:
+                raise ValidationError("Task creation requires the latest contract for the exact profile.")
+
+            decision = resolve_authorization(
+                principal=principal,
+                acting_role=acting_role,
+                action=PermissionGrant.Action.CREATE_TASK,
+                scope_kind=PermissionGrant.ScopeKind.PRODUCT,
+                product=product,
+            )
+            if not decision.allowed or decision.grant is None:
+                raise PermissionDenied(decision.reason)
+            locked_grant = PermissionGrant.objects.select_for_update().get(pk=decision.grant.pk)
+            current = resolve_authorization(
+                principal=principal,
+                acting_role=acting_role,
+                action=PermissionGrant.Action.CREATE_TASK,
+                scope_kind=PermissionGrant.ScopeKind.PRODUCT,
+                product=product,
+            )
+            if not current.allowed or current.grant is None or current.grant.pk != locked_grant.pk:
+                raise PermissionDenied(current.reason if not current.allowed else "GRANT_CHANGED_DURING_COMMAND")
+
+            task = cls(
+                id=task_id,
+                product=product,
+                product_profile_version=profile,
+                contract_version=contract,
+                title=title,
+                description=description,
+                created_by_principal=principal,
+                creation_command_id=command_id,
+                creation_payload_hash=digest,
+                created_by_acting_role=acting_role,
+                created_under_grant=locked_grant,
+                updated_by_principal=principal,
+            )
+            try:
+                with transaction.atomic():
+                    task.save(force_insert=True)
+            except IntegrityError:
+                winner = cls.objects.select_for_update().filter(creation_command_id=command_id).first()
+                if winner is None:
+                    winner = cls.objects.select_for_update().filter(pk=task_id).first()
+                if winner is None:
+                    raise
+                return resolve_existing(winner)
+            return task, True
 
     def _latest_complete_passing_check(self, kind: str) -> bool:
         run = self.check_runs.filter(check_kind=kind, status=TaskCheckRun.Status.COMPLETED).order_by("-attempt_number").first()
@@ -281,7 +442,10 @@ class Task(TimeStampedModel):
             digest = payload_sha256(payload)
             existing = TaskStateEvent.objects.filter(command_id=command_id).first()
             if existing:
-                if existing.payload_hash != digest:
+                if (
+                    existing.event_type != TaskStateEvent.EventType.STATE_TRANSITION
+                    or existing.payload_hash != digest
+                ):
                     raise CommandReplayConflict("command_id was already used with a different payload.")
                 return existing
             if task.state_version != expected_state_version:
@@ -296,11 +460,21 @@ class Task(TimeStampedModel):
                 )
             if to_state not in cls.TRANSITIONS.get(task.current_state, set()):
                 raise IllegalTaskTransition(f"{task.current_state} cannot transition to {to_state}.")
+            # Projecting a newly-created assignment from READY is the
+            # privileged assignment action.  Returning a BLOCKED task to its
+            # recorded ASSIGNED state is only an unblock operation and must
+            # not require a second assignment grant.
+            required_action = {
+                cls.State.CANCELLED: "CANCEL_TASK",
+                cls.State.DONE: "COMPLETE_TASK",
+            }.get(to_state, "EDIT")
+            if task.current_state == cls.State.READY and to_state == cls.State.ASSIGNED:
+                required_action = "ASSIGN_TASK"
             validate_current_grant(
                 permission_grant,
                 principal=actor_principal,
                 acting_role=acting_role,
-                action="EDIT",
+                action=required_action,
                 product_id=task.product_id,
             )
             if to_state == cls.State.READY and not task._latest_complete_passing_check(TaskCheckRun.Kind.DOR):
@@ -313,11 +487,17 @@ class Task(TimeStampedModel):
                     or latest_assignment.assignee_principal_id != task.current_assignee_principal_id
                 ):
                     raise CheckGateRejected("ASSIGNED requires an explicit current TaskAssignment fact.")
+            if (
+                to_state == cls.State.IN_PROGRESS
+                and task.current_assignee_principal_id != actor_principal.pk
+            ):
+                raise ValidationError("Only the task's current assignee may start or resume work.")
             guard_transition_prerequisites(task, to_state)
             previous = task.state_events.order_by("-event_sequence").first()
             next_version = task.state_version + 1
             event = TaskStateEvent.objects.create(
                 task=task,
+                event_type=TaskStateEvent.EventType.STATE_TRANSITION,
                 from_state=task.current_state,
                 to_state=to_state,
                 command_id=command_id,
@@ -341,6 +521,111 @@ class Task(TimeStampedModel):
             task.state_version = next_version
             task.updated_by_principal = recorded_by_principal
             task.save(update_fields=["current_state", "state_version", "blocked_from_state", "updated_by_principal", "updated_at"])
+            return event
+
+    @classmethod
+    def withdraw_submission(
+        cls,
+        *,
+        task_id,
+        submission_id,
+        command_id: uuid.UUID,
+        expected_state_version: int,
+        actor_principal,
+        acting_role: str,
+        permission_grant,
+        recorded_by_principal,
+        reason: str = "",
+    ) -> TaskStateEvent:
+        """Withdraw the latest unreviewed submission through one serialized command.
+
+        The task row is deliberately locked before the submission row.  Human review
+        uses the same order, so a withdrawal and a final decision cannot both win.
+        """
+
+        from contentops.models import ReviewDecision, TaskSubmission
+
+        with transaction.atomic():
+            task = cls.objects.select_for_update().get(pk=task_id)
+            submission = TaskSubmission.objects.select_for_update().get(pk=submission_id)
+            payload = {
+                "task_id": str(task.pk),
+                "submission_id": str(submission.pk),
+                "expected_state_version": expected_state_version,
+                "actor_principal_id": str(actor_principal.pk),
+                "acting_role": acting_role,
+                "permission_grant_id": str(permission_grant.pk),
+                "reason": reason,
+            }
+            digest = payload_sha256(payload)
+            existing = TaskStateEvent.objects.filter(command_id=command_id).first()
+            if existing:
+                if (
+                    existing.event_type != TaskStateEvent.EventType.SUBMISSION_WITHDRAWN
+                    or existing.submission_id != submission.pk
+                    or existing.payload_hash != digest
+                ):
+                    raise CommandReplayConflict("command_id was already used with a different payload.")
+                return existing
+
+            if task.state_version != expected_state_version:
+                raise OptimisticConcurrencyConflict("Task version is stale; reread before withdrawing.")
+            if task.current_state != cls.State.UNDER_REVIEW:
+                raise IllegalTaskTransition("Only an UNDER_REVIEW task may withdraw its submission.")
+            if submission.task_id != task.pk:
+                raise CheckGateRejected("The submission belongs to another task.")
+            if task.current_assignee_principal_id != actor_principal.pk:
+                raise ValidationError("Only the task's current assignee may withdraw the submission.")
+            validate_current_grant(
+                permission_grant,
+                principal=actor_principal,
+                acting_role=acting_role,
+                action="EDIT",
+                product_id=task.product_id,
+            )
+            latest = TaskSubmission.objects.filter(task=task).order_by("-submission_number").first()
+            if latest is None or latest.pk != submission.pk:
+                raise CheckGateRejected("Only the latest exact submission may be withdrawn.")
+            if ReviewDecision.objects.filter(submission=submission).exists():
+                raise CheckGateRejected("A submission with a final review decision cannot be withdrawn.")
+            if TaskStateEvent.objects.filter(
+                event_type=TaskStateEvent.EventType.SUBMISSION_WITHDRAWN,
+                submission=submission,
+            ).exists():
+                raise CheckGateRejected("This submission has already been withdrawn.")
+
+            previous = task.state_events.order_by("-event_sequence").first()
+            next_version = task.state_version + 1
+            event = TaskStateEvent.objects.create(
+                task=task,
+                event_type=TaskStateEvent.EventType.SUBMISSION_WITHDRAWN,
+                submission=submission,
+                from_state=cls.State.UNDER_REVIEW,
+                to_state=cls.State.IN_PROGRESS,
+                command_id=command_id,
+                payload_hash=digest,
+                expected_state_version=expected_state_version,
+                resulting_state_version=next_version,
+                event_sequence=next_version,
+                previous_event=previous,
+                reason=reason,
+                actor_principal=actor_principal,
+                acting_role=acting_role,
+                permission_grant=permission_grant,
+                recorded_by_principal=recorded_by_principal,
+                event_at=timezone.now(),
+            )
+            task.current_state = cls.State.IN_PROGRESS
+            task.state_version = next_version
+            task.updated_by_principal = recorded_by_principal
+            task.save(
+                update_fields=[
+                    "current_state",
+                    "state_version",
+                    "updated_by_principal",
+                    "updated_at",
+                ]
+            )
             return event
 
 
@@ -399,25 +684,47 @@ class TaskAssignment(AppendOnlyFact):
             locked_task = Task.objects.select_for_update().get(pk=task.pk)
             if locked_task.state_version != expected_task_version:
                 raise OptimisticConcurrencyConflict("Task version is stale; reread before assigning.")
-            if locked_task.current_state not in {
-                Task.State.READY,
-                Task.State.ASSIGNED,
-                Task.State.IN_PROGRESS,
-                Task.State.HUMAN_REWORK,
-            }:
-                raise IllegalTaskTransition("This task state does not allow assignment.")
+            if locked_task.current_state != Task.State.READY:
+                raise IllegalTaskTransition("V1 only allows the first assignment while a task is READY.")
             validate_current_grant(
                 permission_grant,
                 principal=assigned_by_principal,
                 acting_role=acting_role,
-                action="EDIT",
+                action="ASSIGN_TASK",
                 product_id=locked_task.product_id,
             )
             latest = cls.objects.filter(task=locked_task).order_by("-assignment_number").first()
+            if latest is not None or locked_task.current_assignee_principal_id is not None:
+                raise CheckGateRejected("V1 does not allow reassignment; cancel and create a new task instead.")
+
+            from accounts.authorization import resolve_authorization
+            from accounts.models import Principal
+
+            persisted_assignee = type(assignee_principal).objects.filter(
+                pk=assignee_principal.pk
+            ).first()
+            if (
+                persisted_assignee is None
+                or persisted_assignee.principal_type != Principal.PrincipalType.HUMAN_USER
+                or not persisted_assignee.can_authenticate
+            ):
+                raise ValidationError("The assignee must be an active human Principal.")
+            assignee_decision = resolve_authorization(
+                principal=persisted_assignee,
+                acting_role=persisted_assignee.role,
+                action="EDIT",
+                scope_kind="PRODUCT",
+                product=locked_task.product_id,
+            )
+            if not assignee_decision.allowed:
+                raise ValidationError(
+                    f"The assignee is not currently allowed to execute this product task: "
+                    f"{assignee_decision.reason}."
+                )
             assignment = cls.objects.create(
                 task=locked_task,
-                assignee_principal=assignee_principal,
-                assignment_number=1 if latest is None else latest.assignment_number + 1,
+                assignee_principal=persisted_assignee,
+                assignment_number=1,
                 command_id=command_id,
                 payload_hash=digest,
                 expected_task_version=expected_task_version,
@@ -428,7 +735,7 @@ class TaskAssignment(AppendOnlyFact):
                 assigned_at=timezone.now(),
             )
             Task.objects.filter(pk=locked_task.pk).update(
-                current_assignee_principal=assignee_principal,
+                current_assignee_principal=persisted_assignee,
                 updated_by_principal=recorded_by_principal,
                 updated_at=timezone.now(),
             )
@@ -436,7 +743,23 @@ class TaskAssignment(AppendOnlyFact):
 
 
 class TaskStateEvent(AppendOnlyFact):
+    class EventType(models.TextChoices):
+        STATE_TRANSITION = "STATE_TRANSITION", "State transition"
+        SUBMISSION_WITHDRAWN = "SUBMISSION_WITHDRAWN", "Submission withdrawn"
+
     task = models.ForeignKey(Task, on_delete=models.PROTECT, related_name="state_events")
+    event_type = models.CharField(
+        max_length=32,
+        choices=EventType.choices,
+        default=EventType.STATE_TRANSITION,
+    )
+    submission = models.ForeignKey(
+        "contentops.TaskSubmission",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="withdrawal_events",
+    )
     from_state = models.CharField(max_length=24, choices=Task.State.choices)
     to_state = models.CharField(max_length=24, choices=Task.State.choices)
     command_id = models.UUIDField(unique=True)
@@ -468,10 +791,40 @@ class TaskStateEvent(AppendOnlyFact):
                 condition=Q(resulting_state_version=models.F("expected_state_version") + 1),
                 name="workflow_event_advances_one_version",
             ),
+            models.CheckConstraint(
+                condition=(
+                    Q(event_type="STATE_TRANSITION", submission__isnull=True)
+                    | Q(
+                        event_type="SUBMISSION_WITHDRAWN",
+                        submission__isnull=False,
+                        from_state=Task.State.UNDER_REVIEW,
+                        to_state=Task.State.IN_PROGRESS,
+                    )
+                ),
+                name="workflow_event_type_payload_shape",
+            ),
+            models.UniqueConstraint(
+                fields=["submission"],
+                condition=Q(event_type="SUBMISSION_WITHDRAWN"),
+                name="workflow_one_withdrawal_per_submission",
+            ),
         ]
 
     def clean(self):
         super().clean()
+        if self.event_type == self.EventType.STATE_TRANSITION:
+            if self.submission_id is not None:
+                raise ValidationError("A normal state transition cannot reference a submission.")
+        elif self.event_type == self.EventType.SUBMISSION_WITHDRAWN:
+            if self.submission_id is None:
+                raise ValidationError("A withdrawal event must reference the exact submission.")
+            if (
+                self.from_state != Task.State.UNDER_REVIEW
+                or self.to_state != Task.State.IN_PROGRESS
+            ):
+                raise ValidationError("A withdrawal event must move UNDER_REVIEW to IN_PROGRESS.")
+            if self.task_id and self.submission.task_id != self.task_id:
+                raise ValidationError("The withdrawn submission belongs to another task.")
         if self.event_sequence != self.resulting_state_version:
             raise ValidationError("Task event sequence must equal the resulting Task state version.")
         if self.event_sequence == 1:
@@ -588,6 +941,11 @@ class TaskCheckRun(AppendOnlyFact):
         with transaction.atomic():
             locked_task = Task.objects.select_for_update().get(pk=task.pk)
             guard_check_run(locked_task, check_kind)
+            if (
+                check_kind == cls.Kind.DOD
+                and locked_task.current_assignee_principal_id != evaluator_principal.pk
+            ):
+                raise ValidationError("Only the task's current assignee may record its DoD result.")
             latest = cls.objects.filter(task=locked_task, check_kind=check_kind).order_by("-attempt_number").first()
             attempt = 1 if latest is None else latest.attempt_number + 1
             run = cls.objects.create(

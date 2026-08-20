@@ -146,6 +146,24 @@ class FrozenV1AcceptanceTests(TestCase):
             PermissionGrant.ScopeKind.PRODUCT,
             product=self.product,
         )
+        self.owner_assign = self._grant(
+            self.owner,
+            PermissionGrant.Action.ASSIGN_TASK,
+            PermissionGrant.ScopeKind.PRODUCT,
+            product=self.product,
+        )
+        self.owner_cancel = self._grant(
+            self.owner,
+            PermissionGrant.Action.CANCEL_TASK,
+            PermissionGrant.ScopeKind.PRODUCT,
+            product=self.product,
+        )
+        self.owner_complete = self._grant(
+            self.owner,
+            PermissionGrant.Action.COMPLETE_TASK,
+            PermissionGrant.ScopeKind.PRODUCT,
+            product=self.product,
+        )
         self.operator_edit = self._grant(
             self.operator,
             PermissionGrant.Action.EDIT,
@@ -232,15 +250,30 @@ class FrozenV1AcceptanceTests(TestCase):
 
     def _transition(self, task: Task, to_state: str, *, command_id=None, expected_version=None):
         task.refresh_from_db()
+        grant = {
+            Task.State.ASSIGNED: (
+                self.owner_edit
+                if task.current_state == Task.State.BLOCKED
+                else self.owner_assign
+            ),
+            Task.State.CANCELLED: self.owner_cancel,
+            Task.State.DONE: self.owner_complete,
+        }.get(to_state, self.owner_edit)
+        actor = self.operator if to_state == Task.State.IN_PROGRESS else self.owner
+        acting_role = (
+            ActingRole.OPERATOR if to_state == Task.State.IN_PROGRESS else ActingRole.OWNER
+        )
+        if to_state == Task.State.IN_PROGRESS:
+            grant = self.operator_edit
         event = Task.transition(
             task_id=task.pk,
             to_state=to_state,
             command_id=command_id or uuid.uuid4(),
             expected_state_version=task.state_version if expected_version is None else expected_version,
-            actor_principal=self.owner,
-            acting_role=ActingRole.OWNER,
-            permission_grant=self.owner_edit,
-            recorded_by_principal=self.owner,
+            actor_principal=actor,
+            acting_role=acting_role,
+            permission_grant=grant,
+            recorded_by_principal=actor,
         )
         task.refresh_from_db()
         return event
@@ -277,7 +310,7 @@ class FrozenV1AcceptanceTests(TestCase):
             expected_task_version=task.state_version,
             assigned_by_principal=self.owner,
             acting_role=ActingRole.OWNER,
-            permission_grant=self.owner_edit,
+            permission_grant=self.owner_assign,
             recorded_by_principal=self.owner,
         )
         task.refresh_from_db()
@@ -684,7 +717,7 @@ class FrozenV1AcceptanceTests(TestCase):
             expected_task_version=task.state_version,
             assigned_by_principal=self.owner,
             acting_role=ActingRole.OWNER,
-            permission_grant=self.owner_edit,
+            permission_grant=self.owner_assign,
             recorded_by_principal=self.owner,
         )
         task.refresh_from_db()

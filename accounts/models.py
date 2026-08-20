@@ -95,6 +95,10 @@ class PermissionGrant(TimeStampedModel):
     class Action(models.TextChoices):
         VIEW = "VIEW", "View"
         EDIT = "EDIT", "Edit"
+        CREATE_TASK = "CREATE_TASK", "Create task"
+        ASSIGN_TASK = "ASSIGN_TASK", "Assign task"
+        CANCEL_TASK = "CANCEL_TASK", "Cancel task"
+        COMPLETE_TASK = "COMPLETE_TASK", "Complete task"
         REVIEW = "REVIEW", "Review"
         APPROVE = "APPROVE", "Approve"
         PUBLISH = "PUBLISH", "Publish"

@@ -68,6 +68,7 @@ class ReleaseGateDomainTests(TestCase):
         )
         self.profile.seal(self.owner)
         self.edit_grant = self._grant(self.owner, "EDIT")
+        self.assign_grant = self._grant(self.owner, "ASSIGN_TASK")
         self.review_grant = self._grant(self.reviewer, "APPROVE")
         self.publish_grant = self._grant(self.publisher, "PUBLISH")
         self.rule_evaluation_grant = self._grant(self.rule_evaluator, "REVIEW")
@@ -119,13 +120,13 @@ class ReleaseGateDomainTests(TestCase):
         TaskAssignment.record(
             task=self.task, assignee_principal=self.owner, command_id=uuid.uuid4(),
             expected_task_version=self.task.state_version, assigned_by_principal=self.owner,
-            acting_role=ActingRole.OWNER, permission_grant=self.edit_grant,
+            acting_role=ActingRole.OWNER, permission_grant=self.assign_grant,
             recorded_by_principal=self.owner,
         )
         Task.transition(
             task_id=self.task.pk, to_state=Task.State.ASSIGNED, command_id=uuid.uuid4(),
             expected_state_version=self.task.state_version, actor_principal=self.owner,
-            acting_role=ActingRole.OWNER, permission_grant=self.edit_grant,
+            acting_role=ActingRole.OWNER, permission_grant=self.assign_grant,
             recorded_by_principal=self.owner,
         )
         self.task.refresh_from_db()

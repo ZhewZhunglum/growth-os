@@ -386,6 +386,10 @@ class TaskSubmission(AppendOnlyFact):
                 ),
                 name="contentops_submission_rework_reference",
             ),
+            models.CheckConstraint(
+                condition=~Q(id=models.F("supersedes_submission_id")),
+                name="contentops_submission_cannot_supersede_self",
+            ),
         ]
 
     def _normalized_asset_manifest(self) -> list[dict[str, str]]:
@@ -460,11 +464,16 @@ class TaskSubmission(AppendOnlyFact):
             return
         if not self.supersedes_submission_id:
             raise ValidationError({"supersedes_submission": "Rework must identify the superseded submission."})
+        if self.pk and self.supersedes_submission_id == self.pk:
+            raise ValidationError({"supersedes_submission": "A submission cannot supersede itself."})
         previous = self.supersedes_submission
         if previous.task_id != self.task_id:
             raise ValidationError({"supersedes_submission": "The superseded submission belongs to another task."})
         if self.submission_number != previous.submission_number + 1:
             raise ValidationError({"submission_number": "Rework must be the next submission in sequence."})
+        latest = type(self).objects.filter(task_id=self.task_id).order_by("-submission_number").first()
+        if self._state.adding and latest is not None and latest.pk != previous.pk:
+            raise ValidationError({"supersedes_submission": "Rework must extend the current submission chain tip."})
         if self.dod_check_run_id == previous.dod_check_run_id:
             raise ValidationError({"dod_check_run": "Rework requires a new DoD check run."})
         old_primary = previous.primary_asset_version
@@ -478,11 +487,24 @@ class TaskSubmission(AppendOnlyFact):
         try:
             final_review = previous.final_review
         except ReviewDecision.DoesNotExist:
-            raise ValidationError({"supersedes_submission": "Rework requires a final review of the old submission."})
-        if final_review.decision != ReviewDecision.Decision.CHANGES_REQUESTED:
-            raise ValidationError({"supersedes_submission": "Only CHANGES_REQUESTED may trigger human rework."})
-        if self.triggering_review_id and self.triggering_review_id != final_review.pk:
-            raise ValidationError({"triggering_review": "The triggering review must be the old submission's final review."})
+            final_review = None
+        withdrawal = previous.withdrawal_events.filter(event_type="SUBMISSION_WITHDRAWN").first()
+        if final_review is not None:
+            if final_review.decision != ReviewDecision.Decision.CHANGES_REQUESTED:
+                raise ValidationError({"supersedes_submission": "Only CHANGES_REQUESTED may trigger human rework."})
+            if self.triggering_review_id != final_review.pk:
+                raise ValidationError({"triggering_review": "Human rework must bind the exact final review."})
+            if withdrawal is not None:
+                raise ValidationError("A submission cannot be both reviewed and withdrawn.")
+        elif withdrawal is not None:
+            if withdrawal.task_id != self.task_id or withdrawal.submission_id != previous.pk:
+                raise ValidationError({"supersedes_submission": "Withdrawal fact does not match this task chain."})
+            if self.triggering_review_id is not None:
+                raise ValidationError({"triggering_review": "Withdrawal rework cannot bind a review decision."})
+        else:
+            raise ValidationError(
+                {"supersedes_submission": "Rework requires exact CHANGES_REQUESTED or withdrawal evidence."}
+            )
 
     def clean(self):
         super().clean()
@@ -584,12 +606,15 @@ class TaskSubmission(AppendOnlyFact):
 
         with transaction.atomic():
             locked_task = type(task).objects.select_for_update().get(pk=task.pk)
+            if locked_task.current_assignee_principal_id != actor_principal.pk:
+                raise ValidationError("Only the task's current assignee may submit deliverables.")
             if supersedes_submission:
-                cls.objects.select_for_update().get(pk=supersedes_submission.pk)
+                supersedes_submission = cls.objects.select_for_update().get(pk=supersedes_submission.pk)
             submission = provisional
             # Validate the optimistic version against the row protected by the
             # same transaction, not against a potentially stale caller object.
             submission.task = locked_task
+            submission.supersedes_submission = supersedes_submission
             guard_submission(locked_task, dod_check_run=dod_check_run)
             submission.save()
             for version in asset_versions:
@@ -653,6 +678,10 @@ class TaskSubmissionAssetLink(AppendOnlyFact):
 
 
 class ReviewDecision(AppendOnlyFact):
+    class PayloadSchemaVersion(models.IntegerChoices):
+        V1 = 1, "Legacy review command"
+        V2 = 2, "Reviewer-bound review command"
+
     class Decision(models.TextChoices):
         APPROVED = "APPROVED", "Approved"
         CHANGES_REQUESTED = "CHANGES_REQUESTED", "Changes requested"
@@ -665,6 +694,10 @@ class ReviewDecision(AppendOnlyFact):
     decision_sha256 = models.CharField(max_length=64, validators=[validate_sha256], blank=True)
     command_id = models.UUIDField(unique=True)
     payload_hash = models.CharField(max_length=64, validators=[validate_sha256], blank=True)
+    payload_schema_version = models.PositiveSmallIntegerField(
+        choices=PayloadSchemaVersion.choices,
+        default=PayloadSchemaVersion.V2,
+    )
     expected_task_version = models.PositiveIntegerField()
     reviewer_principal = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="review_decisions_made"
@@ -681,13 +714,32 @@ class ReviewDecision(AppendOnlyFact):
     class Meta:
         ordering = ["decided_at", "id"]
 
-    def command_payload(self) -> dict[str, Any]:
-        return {
+    def command_payload(self, *, schema_version: int | None = None) -> dict[str, Any]:
+        """Return the exact payload shape used by the stored hash.
+
+        V1 decisions predate reviewer binding in the command hash.  Their
+        stored hashes are historical facts and must continue to validate and
+        replay without being rewritten.  All new decisions are V2.
+        """
+
+        version = self.payload_schema_version if schema_version is None else schema_version
+        legacy_payload = {
             "submission_id": str(self.submission_id),
             "decision": self.decision,
             "rationale": self.rationale,
             "criteria_results": self.criteria_results,
             "expected_task_version": self.expected_task_version,
+        }
+        if version == self.PayloadSchemaVersion.V1:
+            return legacy_payload
+        if version != self.PayloadSchemaVersion.V2:
+            raise ValidationError({"payload_schema_version": "Unsupported review payload schema version."})
+        return {
+            **legacy_payload,
+            "payload_schema_version": self.PayloadSchemaVersion.V2,
+            "reviewer_principal_id": str(self.reviewer_principal_id),
+            "reviewer_acting_role": self.reviewer_acting_role,
+            "reviewer_grant_id": str(self.reviewer_grant_id),
         }
 
     def clean(self):
@@ -705,6 +757,12 @@ class ReviewDecision(AppendOnlyFact):
             raise ValidationError({"expected_task_version": "Task version is stale; reread before reviewing."})
         if self.reviewer_principal_id and self.reviewer_principal.principal_type != "HUMAN_USER":
             raise ValidationError({"reviewer_principal": "V1 requires a human final reviewer."})
+        if (
+            self.submission_id
+            and self.reviewer_principal_id
+            and self.reviewer_principal_id == self.submission.submitted_by_principal_id
+        ):
+            raise ValidationError({"reviewer_principal": "A submitter cannot review their own submission."})
         if self.reviewer_grant_id and self.reviewer_principal_id and self.submission_id:
             _validate_grant(
                 grant=self.reviewer_grant,
@@ -713,6 +771,11 @@ class ReviewDecision(AppendOnlyFact):
                 allowed_actions={"REVIEW", "APPROVE"},
                 product_id=self.submission.task.product_id,
             )
+
+    def save(self, *args, **kwargs):
+        if not getattr(self, "_record_final_authorized", False):
+            raise ValidationError("ReviewDecision must be written through record_final().")
+        return super().save(*args, **kwargs)
 
     @classmethod
     def record_final(
@@ -736,6 +799,7 @@ class ReviewDecision(AppendOnlyFact):
             rationale=rationale,
             criteria_results=criteria_results,
             command_id=command_id,
+            payload_schema_version=cls.PayloadSchemaVersion.V2,
             expected_task_version=expected_task_version,
             reviewer_principal=reviewer_principal,
             reviewer_acting_role=acting_role,
@@ -745,19 +809,46 @@ class ReviewDecision(AppendOnlyFact):
         )
         provisional.payload_hash = canonical_sha256(provisional.command_payload())
         provisional.decision_sha256 = provisional.payload_hash
-        existing_command = cls.objects.filter(command_id=command_id).first()
-        if existing_command:
-            if existing_command.payload_hash != provisional.payload_hash:
-                raise ValidationError("The command_id was already used with a different payload.")
-            return existing_command
+        if reviewer_principal.pk == submission.submitted_by_principal_id:
+            raise ValidationError({"reviewer_principal": "A submitter cannot review their own submission."})
+
         with transaction.atomic():
+            from workflow.models import Task, TaskStateEvent
+
+            # Withdrawal uses this same Task -> Submission order.  The first
+            # transaction to acquire the task lock wins; the other must reread.
+            locked_task = Task.objects.select_for_update().get(pk=submission.task_id)
             locked_submission = TaskSubmission.objects.select_for_update().get(pk=submission.pk)
-            locked_task = type(submission.task).objects.select_for_update().get(pk=locked_submission.task_id)
             locked_submission.task = locked_task
             provisional.submission = locked_submission
+
+            existing_command = cls.objects.filter(command_id=command_id).first()
+            if existing_command:
+                replay_hash = canonical_sha256(
+                    provisional.command_payload(schema_version=existing_command.payload_schema_version)
+                )
+                if (
+                    existing_command.payload_hash != replay_hash
+                    or existing_command.decision_sha256 != existing_command.payload_hash
+                    or existing_command.submission_id != locked_submission.pk
+                    or existing_command.reviewer_principal_id != reviewer_principal.pk
+                    or existing_command.reviewer_acting_role != acting_role
+                    or existing_command.reviewer_grant_id != permission_grant.pk
+                ):
+                    raise ValidationError("The command_id was already used with a different review command.")
+                return existing_command
+
             guard_review(locked_task, submission=locked_submission)
+            if locked_submission.submitted_by_principal_id == reviewer_principal.pk:
+                raise ValidationError({"reviewer_principal": "A submitter cannot review their own submission."})
+            if TaskStateEvent.objects.filter(
+                event_type=TaskStateEvent.EventType.SUBMISSION_WITHDRAWN,
+                submission=locked_submission,
+            ).exists():
+                raise ValidationError("A withdrawn submission cannot receive a review decision.")
             if cls.objects.filter(submission=locked_submission).exists():
                 raise ValidationError("This submission already has its one final review decision.")
+            provisional._record_final_authorized = True
             provisional.save()
             return provisional
 
