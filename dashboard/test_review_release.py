@@ -5,7 +5,9 @@ import tempfile
 import uuid
 from datetime import timedelta
 from pathlib import Path
+from unittest.mock import patch
 
+from django.core.exceptions import ValidationError
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.http import HttpResponse
 from django.test import TestCase, override_settings
@@ -625,6 +627,46 @@ class ReviewReleaseUISliceTests(TestCase):
         self.assertEqual([item for item in Path(self.media_root).rglob("*") if item.is_file()], [])
         publication.refresh_from_db()
         self.assertEqual(publication.status, Publication.Status.READY_FOR_MANUAL_PUBLISH)
+
+    def test_failed_proof_collision_deletes_only_the_actual_renamed_object(self):
+        self._approve()
+        _response, _command, publication = self._gate_via_ui()
+        root_command = uuid.uuid4()
+        requested_name = (
+            f"publication-proofs/{publication.pk}/{root_command.hex}/proof.png"
+        )
+        requested_path = Path(self.media_root) / requested_name
+        requested_path.parent.mkdir(parents=True, exist_ok=True)
+        concurrent_payload = b"another successful proof already owns this name"
+        requested_path.write_bytes(concurrent_payload)
+
+        with patch(
+            "dashboard.review_views.record_manual_publication_proof",
+            side_effect=ValidationError("Simulated proof failure after renamed save."),
+        ):
+            response = self.client.post(
+                reverse("dashboard:release-proof-action", args=[self.task.pk]),
+                {
+                    "command_id": root_command,
+                    "publication": publication.pk,
+                    "external_publication_id": "renamed-proof-must-roll-back",
+                    "proof_file": SimpleUploadedFile(
+                        "proof.png",
+                        b"\x89PNG\r\n\x1a\nrenamed proof bytes",
+                        content_type="image/png",
+                    ),
+                },
+            )
+
+        self.assertRedirects(response, reverse("dashboard:release-detail", args=[self.task.pk]))
+        self.assertEqual(requested_path.read_bytes(), concurrent_payload)
+        remaining_files = [
+            path.relative_to(self.media_root)
+            for path in Path(self.media_root).rglob("*")
+            if path.is_file()
+        ]
+        self.assertEqual(remaining_files, [Path(requested_name)])
+        self.assertFalse(PublicationEvent.objects.filter(command_id=root_command).exists())
 
     def test_release_queue_and_detail_hide_unauthorized_user(self):
         self._approve()

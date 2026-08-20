@@ -22,6 +22,7 @@ from dashboard.review_forms import (
     ReleaseGateForm,
     ReviewDecisionForm,
 )
+from dashboard.storage_cleanup import StoredObjectWrite
 from releasegate.models import ChannelAccount, Publication, PublicationEvent, RuntimeEnvironment
 from releasegate.services import orchestrate_v1_release_gate, record_manual_publication_proof
 from workflow.models import Task
@@ -396,14 +397,6 @@ def _valid_proof_signature(uploaded, mime_type: str) -> bool:
     return False
 
 
-def _delete_proof(name: str) -> None:
-    try:
-        if name and default_storage.exists(name):
-            default_storage.delete(name)
-    except Exception:
-        pass
-
-
 @login_required
 @require_POST
 def release_proof_action(request: HttpRequest, task_id) -> HttpResponse:
@@ -468,20 +461,30 @@ def release_proof_action(request: HttpRequest, task_id) -> HttpResponse:
             original_name = Path(uploaded.name or "proof.bin").name
             safe_name = default_storage.get_valid_name(original_name) or "proof.bin"
             requested_name = f"publication-proofs/{publication.pk}/{root.hex}/{safe_name}"
-            stored_name = ""
+            stored_write = None
             try:
                 stored_name = default_storage.save(requested_name, uploaded)
-                record_manual_publication_proof(
-                    publication=publication,
-                    publisher_principal=request.user,
-                    command_id=root,
-                    external_url=form.cleaned_data["external_url"],
-                    external_publication_id=form.cleaned_data["external_publication_id"],
-                    proof_reference=stored_name,
-                    proof_sha256=proof_sha256,
+                stored_write = StoredObjectWrite(
+                    storage=default_storage,
+                    stored_name=stored_name,
+                    is_referenced=lambda name: PublicationEvent.objects.filter(
+                        proof_reference=name
+                    ).exists(),
                 )
+                with transaction.atomic(durable=True):
+                    record_manual_publication_proof(
+                        publication=publication,
+                        publisher_principal=request.user,
+                        command_id=root,
+                        external_url=form.cleaned_data["external_url"],
+                        external_publication_id=form.cleaned_data["external_publication_id"],
+                        proof_reference=stored_name,
+                        proof_sha256=proof_sha256,
+                    )
+                    stored_write.retain_on_commit()
             except Exception:
-                _delete_proof(stored_name)
+                if stored_write is not None:
+                    stored_write.cleanup_after_rollback()
                 raise
         messages.success(request, "人工发布证明已保存；系统没有执行任何外部发布动作。")
     except ValidationError as error:
