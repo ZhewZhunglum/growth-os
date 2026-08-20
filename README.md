@@ -99,9 +99,13 @@ and refuses a partial Owner/Admin/Operator set. The existing ACTIVE Product must
 already point to a sealed profile with a sealed task contract.
 
 The command defaults to a rollback-only dry run. On a fresh Staging database,
-temporarily inject three distinct passwords through the deployment platform's
-approved Secret mechanism as `STAGING_OWNER_PASSWORD`,
-`STAGING_ADMIN_PASSWORD`, and `STAGING_OPERATOR_PASSWORD`, then run:
+mount three distinct temporary password files through the deployment
+platform's approved Secret mechanism and point
+`STAGING_OWNER_PASSWORD_FILE`, `STAGING_ADMIN_PASSWORD_FILE`, and
+`STAGING_OPERATOR_PASSWORD_FILE` at those read-only files. Direct password
+environment values are rejected. Follow the ownership, mode, dry-run, apply,
+and deletion sequence in `docs/STAGING-RUNBOOK.md`, then run the command there.
+Its two logical invocations are:
 
 ```text
 python manage.py provision_staging_staff --product-code PUKO
@@ -145,14 +149,20 @@ Open `http://127.0.0.1:8000/`, or change `WEB_PORT` locally if that port is in u
 
 The container waits for PostgreSQL with a bounded retry, then runs migrations,
 collects static files and finally starts Gunicorn. WhiteNoise serves versioned
-static assets from the container; user-uploaded media uses the `media_data`
+static assets from the container; Local user-uploaded media uses the `media_data`
 volume. This Compose topology is a single-web-instance bootstrap environment.
 Before adding multiple web replicas, migrations must move into a one-off release
 job so several instances cannot race the same schema change.
 
-The current frozen source uses the local/media volume storage backend. A Tencent
-Cloud object-storage adapter and its credential injection are not implemented yet;
-they are a Staging prerequisite.
+Local deliberately keeps Django's filesystem storage. Staging and Production
+instead fail closed unless `MEDIA_STORAGE_BACKEND=cos` selects the private
+Tencent COS adapter and supplies an explicit BucketName-APPID, region, and
+read-only `TENCENT_COS_SECRET_ID_FILE` / `TENCENT_COS_SECRET_KEY_FILE` mounts.
+The adapter uploads over HTTPS with a private object ACL, returns the actual COS
+object key chosen by `storage.save()`, and refuses to construct public media
+URLs. Database rows continue to store only that object key. Deployment must
+still verify the bucket ACL and bucket policy are private; source configuration
+alone is not evidence that the live bucket is private.
 
 ## Staging / production boundary
 
@@ -162,7 +172,8 @@ Before a staging or production start:
 - set `GROWTH_OS_ENV=staging` for Staging and `GROWTH_OS_ENV=production`
   for Production; both non-Local profiles force HTTPS and Secure cookies,
   while long-lived HSTS remains Production-only;
-- provide a new high-entropy `DJANGO_SECRET_KEY`;
+- provide a new high-entropy Django secret through the read-only
+  `DJANGO_SECRET_KEY_FILE` mount;
 - set exact `DJANGO_ALLOWED_HOSTS` and HTTPS origins in
   `DJANGO_CSRF_TRUSTED_ORIGINS`;
 - set `TRUST_PROXY_SSL_HEADER=1` only when a trusted reverse proxy terminates
@@ -171,7 +182,8 @@ Before a staging or production start:
   80/443, HTTPS certificates and public HTTP-to-HTTPS redirects;
 - use `POSTGRES_SSLMODE=require` for a managed TLS database. The bundled
   Compose database explicitly uses `disable` because it is private to the
-  Compose network and has no TLS listener;
+  Compose network and has no TLS listener; provide its password through the
+  read-only `POSTGRES_PASSWORD_FILE` mount;
 - configure backups and prove restore time before launch. The named Docker
   volume is persistence, not a backup.
 
@@ -233,3 +245,7 @@ managed database or volume backup plan, monitoring destination and rollback
 procedure. The frozen production objectives are **RPO no greater than 1 hour**
 and **RTO no greater than 4 hours**. They are acceptance limits, not averages,
 and must be demonstrated in a restore rehearsal before Production launch.
+
+The versioned Staging topology, immutable-SHA deploy/verification commands,
+certificate reload hook, staff-provisioning pattern, rollback boundary and
+isolated recovery procedure are documented in [`docs/STAGING-RUNBOOK.md`](docs/STAGING-RUNBOOK.md).

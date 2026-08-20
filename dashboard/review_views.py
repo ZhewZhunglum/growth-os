@@ -1,21 +1,22 @@
 from __future__ import annotations
 
 import hashlib
+import tempfile
 import uuid
 from pathlib import Path
 
 from django.contrib import messages
 from django.contrib.auth.decorators import login_required
-from django.core.exceptions import PermissionDenied, ValidationError
+from django.core.exceptions import PermissionDenied, SuspiciousOperation, ValidationError
 from django.core.files.storage import default_storage
 from django.db import transaction
-from django.http import Http404, HttpRequest, HttpResponse
+from django.http import FileResponse, Http404, HttpRequest, HttpResponse
 from django.shortcuts import get_object_or_404, redirect, render
-from django.views.decorators.http import require_POST
+from django.views.decorators.http import require_GET, require_POST
 
 from accounts.authorization import require_authorization, resolve_authorization
 from accounts.models import PermissionGrant, Principal
-from contentops.models import ReviewDecision, TaskSubmission
+from contentops.models import ContentAssetVersion, ReviewDecision, TaskSubmission
 from dashboard.review_forms import (
     CompleteTaskForm,
     PublicationProofForm,
@@ -30,6 +31,19 @@ from workflow.models import Task
 
 MAX_PROOF_BYTES = 25 * 1024 * 1024
 ALLOWED_PROOF_TYPES = {"application/pdf", "image/jpeg", "image/png", "image/webp"}
+SAFE_INLINE_ASSET_TYPES = ALLOWED_PROOF_TYPES | {"text/plain"}
+
+
+def _proof_mime_from_header(header: bytes) -> str | None:
+    if header.startswith(b"%PDF-"):
+        return "application/pdf"
+    if header.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if header.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if len(header) >= 12 and header[:4] == b"RIFF" and header[8:12] == b"WEBP":
+        return "image/webp"
+    return None
 
 
 def _subcommand(root: uuid.UUID, label: str) -> uuid.UUID:
@@ -122,6 +136,208 @@ def _can_review_submission(user: Principal, task: Task, submission: TaskSubmissi
     )
 
 
+def _can_view_asset_version(
+    user: Principal,
+    task: Task,
+    submission: TaskSubmission,
+) -> bool:
+    """Authorize a read of the exact immutable primary asset version."""
+
+    if submission.primary_asset_version_id is None:
+        return False
+    if ReviewDecision.objects.filter(
+        submission=submission,
+        reviewer_principal=user,
+    ).exists() and _product_decision(
+        user, task, PermissionGrant.Action.REVIEW
+    ).allowed:
+        return True
+    latest_submission = task.submissions.order_by("-submission_number").first()
+    if latest_submission is None or latest_submission.pk != submission.pk:
+        return False
+    if task.current_state == Task.State.UNDER_REVIEW and _can_review_submission(
+        user, task, submission
+    ):
+        return True
+    if user.pk in {
+        task.created_by_principal_id,
+        task.current_assignee_principal_id,
+    } and _product_decision(user, task, PermissionGrant.Action.EDIT).allowed:
+        return True
+    if task.current_state in {
+        Task.State.APPROVED,
+        Task.State.DONE,
+    } and _product_decision(
+        user, task, PermissionGrant.Action.COMPLETE_TASK
+    ).allowed:
+        return True
+    if task.current_state == Task.State.APPROVED:
+        publication = submission.publications.select_related(
+            "current_gate__channel_account"
+        ).filter(
+            requested_by_principal=user,
+            current_gate__isnull=False,
+        ).order_by("-created_at", "-id").first()
+        if publication and _publish_decision(
+            user, task, publication.current_gate.channel_account
+        ).allowed:
+            return True
+    return False
+
+
+def _private_file_response(
+    *,
+    object_key: str,
+    filename: str,
+    mime_type: str,
+    inline_types: set[str],
+    expected_sha256: str,
+    expected_size: int | None = None,
+    maximum_size: int | None = None,
+    detect_proof_mime: bool = False,
+) -> FileResponse:
+    """Verify and stream a private object without exposing a permanent URL."""
+
+    if not object_key or not default_storage.exists(object_key):
+        raise Http404("Stored object not found.")
+    verified_file = tempfile.SpooledTemporaryFile(max_size=8 * 1024 * 1024, mode="w+b")
+    digest = hashlib.sha256()
+    byte_size = 0
+    try:
+        with default_storage.open(object_key, "rb") as stored_file:
+            while True:
+                chunk = stored_file.read(1024 * 1024)
+                if not chunk:
+                    break
+                byte_size += len(chunk)
+                if maximum_size is not None and byte_size > maximum_size:
+                    raise SuspiciousOperation("STORED_OBJECT_EXCEEDS_VERIFIED_SIZE_LIMIT")
+                if expected_size is not None and byte_size > expected_size:
+                    raise SuspiciousOperation("STORED_OBJECT_SIZE_MISMATCH")
+                digest.update(chunk)
+                verified_file.write(chunk)
+        if expected_size is not None and byte_size != expected_size:
+            raise SuspiciousOperation("STORED_OBJECT_SIZE_MISMATCH")
+        if not expected_sha256 or digest.hexdigest() != expected_sha256:
+            raise SuspiciousOperation("STORED_OBJECT_SHA256_MISMATCH")
+        verified_file.seek(0)
+        if detect_proof_mime:
+            detected_mime = _proof_mime_from_header(verified_file.read(12))
+            verified_file.seek(0)
+            if detected_mime is None:
+                raise SuspiciousOperation("STORED_PROOF_TYPE_MISMATCH")
+            mime_type = detected_mime
+    except Exception:
+        verified_file.close()
+        raise
+    safe_filename = Path(filename or object_key).name or "download.bin"
+    response = FileResponse(
+        verified_file,
+        as_attachment=mime_type not in inline_types,
+        filename=safe_filename,
+        content_type=mime_type or "application/octet-stream",
+    )
+    response["Cache-Control"] = "private, no-store"
+    response["X-Content-Type-Options"] = "nosniff"
+    response["Cross-Origin-Resource-Policy"] = "same-origin"
+    return response
+
+
+@login_required
+@require_GET
+def asset_version_file(request: HttpRequest, asset_version_id) -> HttpResponse:
+    asset_version = get_object_or_404(
+        ContentAssetVersion.objects.select_related(
+            "content_asset__task__product",
+            "content_asset__task__created_by_principal",
+            "content_asset__task__current_assignee_principal",
+        ),
+        pk=asset_version_id,
+    )
+    submissions = list(
+        TaskSubmission.objects.select_related("task__product", "primary_asset_version")
+        .filter(
+            primary_asset_version=asset_version,
+            task_id=asset_version.content_asset.task_id,
+        )
+        .order_by("id")[:2]
+    )
+    if len(submissions) != 1:
+        raise Http404("Asset version not found.")
+    submission = submissions[0]
+    task = submission.task
+    if not _can_view_asset_version(request.user, task, submission):
+        raise Http404("Asset version not found.")
+    return _private_file_response(
+        object_key=asset_version.object_key,
+        filename=asset_version.metadata.get("original_filename", "")
+        if isinstance(asset_version.metadata, dict)
+        else "",
+        mime_type=asset_version.mime_type,
+        inline_types=SAFE_INLINE_ASSET_TYPES,
+        expected_sha256=asset_version.content_sha256,
+        expected_size=asset_version.byte_size,
+    )
+
+
+@login_required
+@require_GET
+def publication_proof_file(request: HttpRequest, publication_event_id) -> HttpResponse:
+    event = get_object_or_404(
+        PublicationEvent.objects.select_related(
+            "publication__submission__task__product",
+            "publication__requested_by_principal",
+            "publication__current_gate__channel_account",
+        ),
+        pk=publication_event_id,
+        event_type=PublicationEvent.EventType.MANUAL_PUBLISHED_RECORDED,
+    )
+    if not _can_view_publication_proof_event(request.user, event):
+        raise Http404("Publication proof not found.")
+    if not event.proof_reference:
+        raise Http404("Publication proof not found.")
+    suffix = Path(event.proof_reference).suffix.lower()
+    mime_type = {
+        ".pdf": "application/pdf",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".webp": "image/webp",
+    }.get(suffix, "application/octet-stream")
+    return _private_file_response(
+        object_key=event.proof_reference,
+        filename=Path(event.proof_reference).name,
+        mime_type=mime_type,
+        inline_types=ALLOWED_PROOF_TYPES,
+        expected_sha256=event.proof_sha256,
+        maximum_size=MAX_PROOF_BYTES,
+        detect_proof_mime=True,
+    )
+
+
+def _can_view_publication_proof_event(
+    user: Principal,
+    event: PublicationEvent,
+) -> bool:
+    task = event.publication.submission.task
+    current_gate = event.publication.current_gate
+    may_complete = _product_decision(
+        user,
+        task,
+        PermissionGrant.Action.COMPLETE_TASK,
+    ).allowed
+    may_publish = bool(
+        current_gate
+        and event.publication.requested_by_principal_id == user.pk
+        and _publish_decision(
+            user,
+            task,
+            current_gate.channel_account,
+        ).allowed
+    )
+    return may_complete or may_publish
+
+
 def _review_context(task: Task, *, form=None):
     submission = _latest_submission(task)
     return {
@@ -140,17 +356,24 @@ def _release_context(task: Task, user: Principal, *, gate_form=None, proof_form=
         "current_gate__channel_account",
         "current_gate__runtime_environment",
         "requested_by_principal",
-    ).order_by("-created_at", "-id")
+    ).prefetch_related("events").order_by("-created_at", "-id")
     ready_publications = publications.filter(
         status=Publication.Status.READY_FOR_MANUAL_PUBLISH,
         requested_by_principal=user,
     )
     initial_publication = ready_publications.first()
     can_publish = accounts.exists()
+    publication_list = list(publications)
+    readable_proof_event_ids = {
+        event.pk
+        for publication in publication_list
+        for event in publication.events.all()
+        if event.proof_reference and _can_view_publication_proof_event(user, event)
+    }
     return {
         "task": task,
         "submission": submission,
-        "publications": publications,
+        "publications": publication_list,
         "gate_form": gate_form or ReleaseGateForm(
             accounts=accounts,
             environments=environments,
@@ -168,6 +391,8 @@ def _release_context(task: Task, user: Principal, *, gate_form=None, proof_form=
             CompleteTaskForm(state_version=task.state_version) if _can_complete(user, task) else None
         ),
         "can_publish": can_publish,
+        "can_view_asset": _can_view_asset_version(user, task, submission),
+        "readable_proof_event_ids": readable_proof_event_ids,
     }
 
 
@@ -232,6 +457,11 @@ def review_history_detail(request: HttpRequest, review_id) -> HttpResponse:
             "submission": review.submission,
             "task": review.submission.task,
             "asset_version": review.submission.primary_asset_version,
+            "can_view_asset": _can_view_asset_version(
+                request.user,
+                review.submission.task,
+                review.submission,
+            ),
         },
     )
 
@@ -386,15 +616,7 @@ def _hash_proof(uploaded) -> tuple[str, int]:
 def _valid_proof_signature(uploaded, mime_type: str) -> bool:
     header = uploaded.read(12)
     uploaded.seek(0)
-    if mime_type == "application/pdf":
-        return header.startswith(b"%PDF-")
-    if mime_type == "image/png":
-        return header.startswith(b"\x89PNG\r\n\x1a\n")
-    if mime_type == "image/jpeg":
-        return header.startswith(b"\xff\xd8\xff")
-    if mime_type == "image/webp":
-        return len(header) >= 12 and header[:4] == b"RIFF" and header[8:12] == b"WEBP"
-    return False
+    return _proof_mime_from_header(header) == mime_type
 
 
 @login_required
@@ -460,7 +682,11 @@ def release_proof_action(request: HttpRequest, task_id) -> HttpResponse:
         else:
             original_name = Path(uploaded.name or "proof.bin").name
             safe_name = default_storage.get_valid_name(original_name) or "proof.bin"
-            requested_name = f"publication-proofs/{publication.pk}/{root.hex}/{safe_name}"
+            # Keep proof keys content-addressed for the same reason as task
+            # assets: conflicting bytes must never share a COS object key.
+            requested_name = (
+                f"publication-proofs/{publication.pk}/{root.hex}/{proof_sha256}/{safe_name}"
+            )
             stored_write = None
             try:
                 stored_name = default_storage.save(requested_name, uploaded)

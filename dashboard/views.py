@@ -572,7 +572,12 @@ def _upload_and_submit(task: Task, user: Principal, grant, form: UploadDoDForm) 
     root_command = form.cleaned_data["command_id"]
     original_name = Path(uploaded.name or "deliverable.bin").name
     safe_name = default_storage.get_valid_name(original_name) or "deliverable.bin"
-    requested_name = f"task-deliveries/{task.pk}/{root_command.hex}/{safe_name}"
+    # Content addressing prevents two different payloads using the same
+    # command ID from ever targeting the same immutable object key. This stays
+    # safe even when COS bucket versioning makes its overwrite guard inactive.
+    requested_name = (
+        f"task-deliveries/{task.pk}/{root_command.hex}/{content_sha256}/{safe_name}"
+    )
     stored_write = None
     try:
         stored_name = default_storage.save(requested_name, uploaded)

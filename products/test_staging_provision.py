@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import os
+import tempfile
 from datetime import timedelta
 from io import StringIO
+from pathlib import Path
 from unittest.mock import patch
 
 from django.core.management import call_command
@@ -25,6 +27,9 @@ PASSWORD_ENV_NAMES = {
     "STAGING_OWNER_PASSWORD",
     "STAGING_ADMIN_PASSWORD",
     "STAGING_OPERATOR_PASSWORD",
+    "STAGING_OWNER_PASSWORD_FILE",
+    "STAGING_ADMIN_PASSWORD_FILE",
+    "STAGING_OPERATOR_PASSWORD_FILE",
 }
 
 FIRST_PASSWORDS = {
@@ -96,9 +101,35 @@ class ProvisionStagingStaffTests(TestCase):
         environment.update(passwords or {})
         return environment
 
-    def _call(self, *, passwords=FIRST_PASSWORDS, apply=True, **options):
-        with patch.dict(os.environ, self._environment(passwords), clear=True):
-            call_command("provision_staging_staff", stdout=self.stdout, apply=apply, **options)
+    def _call(
+        self,
+        *,
+        passwords=FIRST_PASSWORDS,
+        apply=True,
+        raw_password_environment=False,
+        **options,
+    ):
+        supplied = dict(passwords or {})
+        if raw_password_environment:
+            with patch.dict(os.environ, self._environment(supplied), clear=True):
+                call_command("provision_staging_staff", stdout=self.stdout, apply=apply, **options)
+            return
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            for environment_name in (
+                "STAGING_OWNER_PASSWORD",
+                "STAGING_ADMIN_PASSWORD",
+                "STAGING_OPERATOR_PASSWORD",
+            ):
+                if environment_name not in supplied:
+                    continue
+                secret_path = Path(temporary_directory) / environment_name.lower()
+                secret_path.write_text(f"{supplied.pop(environment_name)}\n", encoding="utf-8")
+                if os.name != "nt":
+                    secret_path.chmod(0o600)
+                supplied[f"{environment_name}_FILE"] = str(secret_path)
+            with patch.dict(os.environ, self._environment(supplied), clear=True):
+                call_command("provision_staging_staff", stdout=self.stdout, apply=apply, **options)
 
     def _add_publish_context(self):
         channel = ChannelAccount.objects.create(
@@ -212,7 +243,7 @@ class ProvisionStagingStaffTests(TestCase):
                 self.assertFalse(PermissionGrant.objects.exists())
 
     def test_password_policy_and_distinct_values_fail_before_writes(self):
-        with self.assertRaisesMessage(CommandError, "STAGING_OWNER_PASSWORD must be supplied"):
+        with self.assertRaisesMessage(CommandError, "STAGING_OWNER_PASSWORD_FILE must be supplied"):
             self._call(passwords=None)
 
         too_short = dict(FIRST_PASSWORDS)
@@ -227,6 +258,47 @@ class ProvisionStagingStaffTests(TestCase):
 
         self.assertFalse(Principal.objects.filter(username__in=["owner", "admin", "operator"]).exists())
         self.assertFalse(PermissionGrant.objects.exists())
+
+    def test_new_staff_passwords_can_be_read_from_temporary_secret_files(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            secret_environment = {}
+            for environment_name, password in FIRST_PASSWORDS.items():
+                secret_path = Path(temporary_directory) / environment_name.lower()
+                secret_path.write_text(f"{password}\n", encoding="utf-8")
+                if os.name != "nt":
+                    secret_path.chmod(0o600)
+                secret_environment[f"{environment_name}_FILE"] = str(secret_path)
+
+            self._call(passwords=secret_environment)
+
+        for username, environment_name in (
+            ("owner", "STAGING_OWNER_PASSWORD"),
+            ("admin", "STAGING_ADMIN_PASSWORD"),
+            ("operator", "STAGING_OPERATOR_PASSWORD"),
+        ):
+            self.assertTrue(
+                Principal.objects.get(username=username).check_password(
+                    FIRST_PASSWORDS[environment_name]
+                )
+            )
+        output = self.stdout.getvalue()
+        for password in FIRST_PASSWORDS.values():
+            self.assertNotIn(password, output)
+
+    def test_direct_password_environment_values_are_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            owner_file = Path(temporary_directory) / "owner"
+            owner_file.write_text(FIRST_PASSWORDS["STAGING_OWNER_PASSWORD"], encoding="utf-8")
+            if os.name != "nt":
+                owner_file.chmod(0o600)
+            ambiguous = {
+                **FIRST_PASSWORDS,
+                "STAGING_OWNER_PASSWORD_FILE": str(owner_file),
+            }
+            with self.assertRaisesMessage(CommandError, "STAGING_OWNER_PASSWORD is not accepted"):
+                self._call(passwords=ambiguous, raw_password_environment=True)
+
+        self.assertFalse(Principal.objects.filter(username__in=["owner", "admin", "operator"]).exists())
 
     def test_conflicting_existing_grant_risk_is_not_rewritten(self):
         self._call()
@@ -322,6 +394,40 @@ class ProvisionStagingStaffTests(TestCase):
                 action=PermissionGrant.Action.PUBLISH,
             ).exists()
         )
+
+    def test_future_overlapping_publish_grant_is_rejected_without_creating_an_allow(self):
+        channel, _binding, _capability = self._add_publish_context()
+        self._call()
+        owner = Principal.objects.get(username="owner")
+        operator = Principal.objects.get(username="operator")
+        now = timezone.now()
+        scheduled_deny = PermissionGrant.objects.create(
+            principal=operator,
+            scope_kind=PermissionGrant.ScopeKind.ACCOUNT,
+            account_ref=channel.account_code,
+            action=PermissionGrant.Action.PUBLISH,
+            effect=PermissionGrant.Effect.DENY,
+            risk_level=PermissionGrant.RiskLevel.HIGH,
+            valid_from=now + timedelta(days=1),
+            valid_until=now + timedelta(days=5),
+            grant_status=PermissionGrant.GrantStatus.ACTIVE,
+            granted_by_principal=owner,
+        )
+
+        with self.assertRaisesMessage(CommandError, "Current/future ACTIVE exact-scope Grant overlap"):
+            self._call(passwords=None, publish_account_code=channel.account_code)
+
+        self.assertTrue(PermissionGrant.objects.filter(pk=scheduled_deny.pk).exists())
+        self.assertFalse(
+            PermissionGrant.objects.filter(
+                principal=operator,
+                scope_kind=PermissionGrant.ScopeKind.ACCOUNT,
+                account_ref=channel.account_code,
+                action=PermissionGrant.Action.PUBLISH,
+                effect=PermissionGrant.Effect.ALLOW,
+            ).exists()
+        )
+        self.assertEqual(PermissionGrant.objects.count(), 14)
 
     def test_missing_current_profile_or_contract_fails_without_staff_writes(self):
         self.product.current_profile_version = None

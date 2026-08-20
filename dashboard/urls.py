@@ -1,6 +1,8 @@
 from django.urls import path
 
 from dashboard.review_views import (
+    asset_version_file,
+    publication_proof_file,
     release_detail,
     release_done_action,
     release_gate_action,
@@ -24,6 +26,12 @@ urlpatterns = [
     path("review/<uuid:task_id>/", review_detail, name="review-detail"),
     path("review/<uuid:task_id>/action/", review_action, name="review-action"),
     path("review/history/<uuid:review_id>/", review_history_detail, name="review-history-detail"),
+    path("files/assets/<uuid:asset_version_id>/", asset_version_file, name="asset-version-file"),
+    path(
+        "files/publication-events/<uuid:publication_event_id>/proof/",
+        publication_proof_file,
+        name="publication-proof-file",
+    ),
     path("release/", release_queue, name="release-queue"),
     path("release/<uuid:task_id>/", release_detail, name="release-detail"),
     path("release/<uuid:task_id>/gate/", release_gate_action, name="release-gate-action"),

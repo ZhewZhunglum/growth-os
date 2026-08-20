@@ -1,6 +1,7 @@
 import os
 import subprocess
 import sys
+import tempfile
 import uuid
 from pathlib import Path
 
@@ -131,38 +132,63 @@ class DeploymentIdentitySettingsTests(SimpleTestCase):
 
     def test_staging_uses_secure_cookies_and_https_redirect(self):
         process_environment = dict(os.environ)
+        for name in (
+            "DJANGO_SECRET_KEY",
+            "DJANGO_SECRET_KEY_FILE",
+            "POSTGRES_PASSWORD",
+            "POSTGRES_PASSWORD_FILE",
+            "TENCENT_COS_SECRET_ID",
+            "TENCENT_COS_SECRET_ID_FILE",
+            "TENCENT_COS_SECRET_KEY",
+            "TENCENT_COS_SECRET_KEY_FILE",
+        ):
+            process_environment.pop(name, None)
         process_environment.update(
             {
                 "GROWTH_OS_ENV": "staging",
                 "GROWTH_OS_DEPLOYMENT_STAGE": "staging-candidate",
                 "DATABASE_ENGINE": "postgresql",
-                "DJANGO_SECRET_KEY": "staging-test-key-that-is-not-a-deployment-secret",
                 "DJANGO_ALLOWED_HOSTS": "staging.example.test",
                 "DJANGO_CSRF_TRUSTED_ORIGINS": "https://staging.example.test",
                 "POSTGRES_DB": "growth_os_test",
                 "POSTGRES_USER": "growth_os_test",
-                "POSTGRES_PASSWORD": "test-only-not-a-real-secret",
                 "POSTGRES_HOST": "127.0.0.1",
+                "MEDIA_STORAGE_BACKEND": "cos",
+                "TENCENT_COS_BUCKET": "settings-test-1234567890",
+                "TENCENT_COS_REGION": "ap-beijing",
             }
         )
-        result = subprocess.run(
-            [
-                sys.executable,
-                "-c",
-                (
-                    "import growth_os.settings as configured; "
-                    "print(configured.SECURE_SSL_REDIRECT); "
-                    "print(configured.SESSION_COOKIE_SECURE); "
-                    "print(configured.CSRF_COOKIE_SECURE); "
-                    "print(hasattr(configured, 'SECURE_HSTS_SECONDS'))"
+        with tempfile.TemporaryDirectory() as secret_directory:
+            secret_values = {
+                "DJANGO_SECRET_KEY_FILE": (
+                    "staging-test-only-A7x!Q2m#R9v$K4p%T8s&N6d*L3c-W5z-X9Z"
                 ),
-            ],
-            cwd=self.PROJECT_ROOT,
-            env=process_environment,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+                "POSTGRES_PASSWORD_FILE": "test-only-not-a-real-secret",
+                "TENCENT_COS_SECRET_ID_FILE": "settings-test-id",
+                "TENCENT_COS_SECRET_KEY_FILE": "settings-test-key",
+            }
+            for name, value in secret_values.items():
+                path = Path(secret_directory) / name.lower()
+                path.write_text(f"{value}\n", encoding="utf-8")
+                process_environment[name] = str(path)
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import growth_os.settings as configured; "
+                        "print(configured.SECURE_SSL_REDIRECT); "
+                        "print(configured.SESSION_COOKIE_SECURE); "
+                        "print(configured.CSRF_COOKIE_SECURE); "
+                        "print(hasattr(configured, 'SECURE_HSTS_SECONDS'))"
+                    ),
+                ],
+                cwd=self.PROJECT_ROOT,
+                env=process_environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines(), ["True", "True", "True", "False"])

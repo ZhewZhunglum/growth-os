@@ -2,8 +2,23 @@
 .venv
 __pycache__
 *.pyc
+*.pyo
+*.pyd
 .env
-db.sqlite3
+.env.*
+*.pem
+*.key
+*.dump
+*.backup
+secrets/
+deploy/secrets/
+*.sqlite3
+*.log
+.coverage
+htmlcov/
+.pytest_cache/
+.ruff_cache/
 media
 staticfiles
+docs/STAGING-SERVER-AUDIT*
 

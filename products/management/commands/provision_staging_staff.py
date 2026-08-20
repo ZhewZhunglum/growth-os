@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import os
+import stat
 from dataclasses import dataclass
 from datetime import timedelta
+from pathlib import Path
 
 from django.conf import settings
 from django.contrib.auth.password_validation import validate_password
@@ -117,15 +119,43 @@ class Command(BaseCommand):
         return specs
 
     @staticmethod
-    def _passwords_for_new_set(specs: tuple[StaffSpec, ...]) -> dict[str, str]:
+    def _read_password(spec: StaffSpec) -> str:
+        direct_value = os.getenv(spec.password_environment)
+        file_name = f"{spec.password_environment}_FILE"
+        file_value = os.getenv(file_name)
+        if direct_value is not None:
+            raise CommandError(
+                f"{spec.password_environment} is not accepted in Staging; use the temporary {file_name} Secret file."
+            )
+        if file_value is None:
+            raise CommandError(
+                f"{file_name} must be supplied through a temporary Staging Secret file."
+            )
+
+        password_path = Path(file_value)
+        try:
+            file_status = password_path.stat()
+            if not stat.S_ISREG(file_status.st_mode):
+                raise CommandError(f"{file_name} must identify a regular file.")
+            if os.name != "nt" and stat.S_IMODE(file_status.st_mode) & 0o077:
+                raise CommandError(
+                    f"{file_name} must not be readable or writable by group/other users."
+                )
+            value = password_path.read_text(encoding="utf-8").rstrip("\r\n")
+        except CommandError:
+            raise
+        except OSError as error:
+            raise CommandError(f"Unable to read {file_name}.") from error
+        if not value or any(character in value for character in ("\x00", "\r", "\n")):
+            raise CommandError(f"{file_name} must contain one non-empty single-line password.")
+        return value
+
+    @classmethod
+    def _passwords_for_new_set(cls, specs: tuple[StaffSpec, ...]) -> dict[str, str]:
         passwords: dict[str, str] = {}
         minimum = max(12, settings.PASSWORD_MIN_LENGTH)
         for spec in specs:
-            value = os.getenv(spec.password_environment)
-            if value is None:
-                raise CommandError(
-                    f"{spec.password_environment} must be supplied through the Staging process environment."
-                )
+            value = cls._read_password(spec)
             if len(value) < minimum:
                 raise CommandError(
                     f"{spec.password_environment} does not satisfy the Staging minimum of {minimum} characters."
@@ -280,23 +310,37 @@ class Command(BaseCommand):
         return principal
 
     @staticmethod
-    def _current_exact_grants(
+    def _active_exact_grants(
         *, principal: Principal, action: str, scope_kind: str, product: Product | None, account_ref: str
     ) -> list[PermissionGrant]:
         now = timezone.now()
-        query = PermissionGrant.objects.select_for_update().filter(
-            principal=principal,
-            action=action,
-            scope_kind=scope_kind,
-            product=product,
-            platform_code="",
-            account_ref=account_ref,
-            surface_ref="",
-            effect=PermissionGrant.Effect.ALLOW,
-            grant_status=PermissionGrant.GrantStatus.ACTIVE,
-            valid_from__lte=now,
+        return list(
+            PermissionGrant.objects.select_for_update().filter(
+                principal=principal,
+                action=action,
+                scope_kind=scope_kind,
+                product=product,
+                platform_code="",
+                account_ref=account_ref,
+                surface_ref="",
+                grant_status=PermissionGrant.GrantStatus.ACTIVE,
+            )
+            .filter(Q(valid_until__isnull=True) | Q(valid_until__gt=now))
+            .order_by("valid_from", "created_at", "id")
         )
-        return list(query.filter(Q(valid_until__isnull=True) | Q(valid_until__gt=now)).order_by("created_at", "id"))
+
+    @staticmethod
+    def _windows_overlap(
+        *,
+        left_start,
+        left_end,
+        right_start,
+        right_end,
+    ) -> bool:
+        return (
+            (right_end is None or left_start < right_end)
+            and (left_end is None or right_start < left_end)
+        )
 
     def _ensure_grant(
         self,
@@ -311,19 +355,27 @@ class Command(BaseCommand):
         allow_create: bool,
     ) -> PermissionGrant:
         account_ref = publish_context.channel.account_code if publish_context else ""
-        grants = self._current_exact_grants(
+        now = timezone.now()
+        active_grants = self._active_exact_grants(
             principal=principal,
             action=action,
             scope_kind=scope_kind,
             product=product if scope_kind == PermissionGrant.ScopeKind.PRODUCT else None,
             account_ref=account_ref,
         )
-        if len(grants) > 1:
+        current_allows = [
+            candidate
+            for candidate in active_grants
+            if candidate.effect == PermissionGrant.Effect.ALLOW
+            and candidate.valid_from <= now
+            and (candidate.valid_until is None or candidate.valid_until > now)
+        ]
+        if len(current_allows) > 1:
             raise CommandError(
                 f"Multiple current exact Grants exist for {principal.username}/{action}; revoke duplicates explicitly."
             )
-        if grants:
-            grant = grants[0]
+        if current_allows:
+            grant = current_allows[0]
             if grant.risk_level != risk_level:
                 raise CommandError(
                     f"Existing {principal.username}/{action} Grant has risk {grant.risk_level}; "
@@ -334,12 +386,41 @@ class Command(BaseCommand):
                     f"Existing {principal.username}/{action} Grant is not a bounded Staging grant. "
                     "Revoke it explicitly before provisioning a 30-day replacement."
                 )
+            target_start = grant.valid_from
+            target_end = grant.valid_until
         else:
             if not allow_create:
+                if active_grants:
+                    raise CommandError(
+                        f"Existing {principal.username}/{action} authority has a current/future ACTIVE exact-scope "
+                        "Grant but no single current ALLOW Grant. Resolve the scheduled or conflicting Grant "
+                        "explicitly before provisioning."
+                    )
                 raise CommandError(
                     f"Existing Staging staff set is missing required exact {principal.username}/{action} Grant. "
                     "The provisioning command will not silently expand an existing identity's base authority."
                 )
+            target_start = now
+            target_end = now + timedelta(days=30)
+
+        overlapping = [
+            candidate
+            for candidate in active_grants
+            if (not current_allows or candidate.pk != current_allows[0].pk)
+            and self._windows_overlap(
+                left_start=candidate.valid_from,
+                left_end=candidate.valid_until,
+                right_start=target_start,
+                right_end=target_end,
+            )
+        ]
+        if overlapping:
+            raise CommandError(
+                f"Current/future ACTIVE exact-scope Grant overlap exists for {principal.username}/{action}; "
+                "revoke or reschedule it explicitly before provisioning."
+            )
+
+        if not current_allows:
             grant = PermissionGrant(
                 principal=principal,
                 scope_kind=scope_kind,
@@ -348,8 +429,8 @@ class Command(BaseCommand):
                 action=action,
                 effect=PermissionGrant.Effect.ALLOW,
                 risk_level=risk_level,
-                valid_from=timezone.now(),
-                valid_until=timezone.now() + timedelta(days=30),
+                valid_from=target_start,
+                valid_until=target_end,
                 grant_status=PermissionGrant.GrantStatus.ACTIVE,
                 granted_by_principal=grantor,
             )

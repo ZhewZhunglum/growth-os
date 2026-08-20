@@ -38,6 +38,25 @@ class PrincipalTests(TestCase):
             self.assertFalse(principal.is_active)
             self.assertIsNone(authenticate(username=username, password="valid-test-password"))
 
+    def test_non_human_principal_cannot_use_interactive_password_login(self):
+        for principal_type in (
+            Principal.PrincipalType.SERVICE_ACCOUNT,
+            Principal.PrincipalType.API_CLIENT,
+            Principal.PrincipalType.SYSTEM,
+        ):
+            with self.subTest(principal_type=principal_type):
+                username = f"non-human-{principal_type.lower()}"
+                principal = Principal.objects.create_user(
+                    username=username,
+                    password="valid-test-password",
+                    principal_type=principal_type,
+                )
+                self.assertTrue(principal.is_active)
+                self.assertTrue(principal.has_usable_password())
+                self.assertIsNone(
+                    authenticate(username=username, password="valid-test-password")
+                )
+
     def test_status_only_update_also_disables_login_flag(self):
         principal = Principal.objects.create_user(username="locked-later", password="valid-test-password")
         principal.principal_status = Principal.PrincipalStatus.LOCKED

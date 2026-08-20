@@ -45,9 +45,58 @@ def positive_int_env(name: str, default: int) -> int:
     return value
 
 
-SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "local-development-only-not-for-deployment")
-if not IS_LOCAL and SECRET_KEY == "local-development-only-not-for-deployment":
-    raise ImproperlyConfigured("DJANGO_SECRET_KEY must be supplied outside local development.")
+def secret_env_or_file(
+    name: str,
+    *,
+    required: bool = False,
+    file_only: bool = False,
+) -> str:
+    """Read one secret from either NAME or NAME_FILE, never both.
+
+    ``*_FILE`` supports read-only container secret mounts without placing the
+    value in Compose files or command arguments.  Error messages deliberately
+    name only the setting, never the secret value.
+    """
+
+    direct_value = os.getenv(name)
+    file_value = os.getenv(f"{name}_FILE")
+    if direct_value is not None and file_value is not None:
+        raise ImproperlyConfigured(f"Set only one of {name} or {name}_FILE.")
+    if file_only and direct_value is not None:
+        raise ImproperlyConfigured(
+            f"{name} must use the {name}_FILE secret mount outside Local."
+        )
+
+    value = direct_value
+    if file_value is not None:
+        secret_path = Path(file_value)
+        try:
+            value = secret_path.read_text(encoding="utf-8").rstrip("\r\n")
+        except OSError as error:
+            raise ImproperlyConfigured(f"Unable to read {name}_FILE.") from error
+
+    if value is not None and any(character in value for character in ("\x00", "\r", "\n")):
+        raise ImproperlyConfigured(f"{name} must be a single-line secret.")
+    if required and not value:
+        raise ImproperlyConfigured(f"{name} or {name}_FILE must be supplied.")
+    return value or ""
+
+
+SECRET_KEY = secret_env_or_file(
+    "DJANGO_SECRET_KEY",
+    required=not IS_LOCAL,
+    file_only=not IS_LOCAL,
+)
+if not SECRET_KEY:
+    SECRET_KEY = "local-development-only-not-for-deployment"
+if not IS_LOCAL and (
+    len(SECRET_KEY) < 50
+    or len(set(SECRET_KEY)) < 5
+    or SECRET_KEY.startswith("django-insecure-")
+):
+    raise ImproperlyConfigured(
+        "DJANGO_SECRET_KEY_FILE must contain a strong deployment signing key."
+    )
 
 DEBUG = IS_LOCAL and os.getenv("DJANGO_DEBUG", "1") == "1"
 ALLOWED_HOSTS = csv_env("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1" if IS_LOCAL else "")
@@ -116,7 +165,11 @@ elif DATABASE_ENGINE == "postgresql":
     required_db_values = {
         "NAME": os.getenv("POSTGRES_DB", ""),
         "USER": os.getenv("POSTGRES_USER", ""),
-        "PASSWORD": os.getenv("POSTGRES_PASSWORD", ""),
+        "PASSWORD": secret_env_or_file(
+            "POSTGRES_PASSWORD",
+            required=True,
+            file_only=not IS_LOCAL,
+        ),
         "HOST": os.getenv("POSTGRES_HOST", ""),
         "PORT": os.getenv("POSTGRES_PORT", "5432"),
     }
@@ -135,6 +188,7 @@ else:
     raise ImproperlyConfigured("DATABASE_ENGINE must be sqlite or postgresql.")
 
 AUTH_USER_MODEL = "accounts.Principal"
+AUTHENTICATION_BACKENDS = ["accounts.backends.PrincipalStatusBackend"]
 
 PASSWORD_MIN_LENGTH = positive_int_env("PASSWORD_MIN_LENGTH", 6 if IS_LOCAL else 12)
 required_password_minimum = 6 if IS_LOCAL else 12
@@ -162,8 +216,47 @@ USE_TZ = True
 STATIC_URL = "static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
 STATICFILES_DIRS = [BASE_DIR / "static"]
+
+MEDIA_STORAGE_BACKEND = os.getenv(
+    "MEDIA_STORAGE_BACKEND", "filesystem" if IS_LOCAL else ""
+).strip().lower()
+if IS_LOCAL:
+    if MEDIA_STORAGE_BACKEND != "filesystem":
+        raise ImproperlyConfigured(
+            "Local media storage must use MEDIA_STORAGE_BACKEND=filesystem."
+        )
+    DEFAULT_MEDIA_STORAGE = {"BACKEND": "django.core.files.storage.FileSystemStorage"}
+    TENCENT_COS_BUCKET = ""
+    TENCENT_COS_REGION = ""
+    TENCENT_COS_SECRET_ID = ""
+    TENCENT_COS_SECRET_KEY = ""
+else:
+    if MEDIA_STORAGE_BACKEND != "cos":
+        raise ImproperlyConfigured(
+            "Staging and Production require explicit MEDIA_STORAGE_BACKEND=cos."
+        )
+    TENCENT_COS_BUCKET = os.getenv("TENCENT_COS_BUCKET", "").strip()
+    TENCENT_COS_REGION = os.getenv("TENCENT_COS_REGION", "").strip()
+    if not TENCENT_COS_BUCKET or not TENCENT_COS_REGION:
+        raise ImproperlyConfigured(
+            "TENCENT_COS_BUCKET and TENCENT_COS_REGION must be supplied for private COS storage."
+        )
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*-[0-9]+", TENCENT_COS_BUCKET):
+        raise ImproperlyConfigured(
+            "TENCENT_COS_BUCKET must use the BucketName-APPID format."
+        )
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", TENCENT_COS_REGION):
+        raise ImproperlyConfigured("TENCENT_COS_REGION is invalid.")
+    TENCENT_COS_SECRET_ID = secret_env_or_file(
+        "TENCENT_COS_SECRET_ID", required=True, file_only=True
+    )
+    TENCENT_COS_SECRET_KEY = secret_env_or_file(
+        "TENCENT_COS_SECRET_KEY", required=True, file_only=True
+    )
+    DEFAULT_MEDIA_STORAGE = {"BACKEND": "growth_os.storage_backends.TencentCOSPrivateStorage"}
+
 STORAGES = {
-    "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"},
+    "default": DEFAULT_MEDIA_STORAGE,
     "staticfiles": {
         "BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage"
         if not IS_LOCAL
@@ -206,5 +299,15 @@ LOGGING = {
         "standard": {"format": "%(asctime)s %(levelname)s %(name)s %(message)s"},
     },
     "handlers": {"console": {"class": "logging.StreamHandler", "formatter": "standard"}},
+    "loggers": {
+        # COS INFO logs include full private object keys and request headers.
+        # Keep failures visible without copying asset identifiers into the
+        # general application log stream.
+        "qcloud_cos": {
+            "handlers": ["console"],
+            "level": "WARNING",
+            "propagate": False,
+        },
+    },
     "root": {"handlers": ["console"], "level": os.getenv("LOG_LEVEL", "INFO")},
 }

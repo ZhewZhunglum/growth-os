@@ -504,7 +504,8 @@ class ControlledTaskUiTests(TestCase):
         concurrent_payload = b"A different successful request already owns this exact name."
         with tempfile.TemporaryDirectory() as media_root, override_settings(MEDIA_ROOT=media_root):
             requested_name = (
-                f"task-deliveries/{self.task.pk}/{root_command.hex}/answer.txt"
+                f"task-deliveries/{self.task.pk}/{root_command.hex}/"
+                f"{hashlib.sha256(payload).hexdigest()}/answer.txt"
             )
             requested_path = Path(media_root) / requested_name
             requested_path.parent.mkdir(parents=True, exist_ok=True)
