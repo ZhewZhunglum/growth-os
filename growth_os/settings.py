@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 from django.core.exceptions import ImproperlyConfigured
@@ -8,8 +9,25 @@ from django.core.exceptions import ImproperlyConfigured
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 ENVIRONMENT = os.getenv("GROWTH_OS_ENV", "local").strip().lower()
+if ENVIRONMENT not in {"local", "staging", "production"}:
+    raise ImproperlyConfigured("GROWTH_OS_ENV must be local, staging, or production.")
 IS_LOCAL = ENVIRONMENT == "local"
 IS_PRODUCTION = ENVIRONMENT == "production"
+
+# Deployment identity is intentionally small and non-sensitive.  The release
+# SHA is baked into Docker images at build time; source checkouts may leave it
+# as ``unknown`` so they never claim to be a traceable deployment by accident.
+DEPLOYMENT_STAGE = os.getenv("GROWTH_OS_DEPLOYMENT_STAGE", ENVIRONMENT).strip().lower()
+if DEPLOYMENT_STAGE not in {"local", "staging", "staging-candidate", "production"}:
+    raise ImproperlyConfigured(
+        "GROWTH_OS_DEPLOYMENT_STAGE must be local, staging, staging-candidate, or production."
+    )
+
+RELEASE_SHA = os.getenv("GROWTH_OS_RELEASE_SHA", "unknown").strip()
+if RELEASE_SHA != "unknown" and not re.fullmatch(r"[0-9a-f]{40}", RELEASE_SHA):
+    raise ImproperlyConfigured(
+        "GROWTH_OS_RELEASE_SHA must be 'unknown' or a full 40-character lowercase Git SHA."
+    )
 
 
 def csv_env(name: str, default: str = "") -> list[str]:
@@ -166,7 +184,7 @@ X_FRAME_OPTIONS = "DENY"
 SECURE_CONTENT_TYPE_NOSNIFF = True
 SECURE_REFERRER_POLICY = "same-origin"
 
-if IS_PRODUCTION:
+if not IS_LOCAL:
     if os.getenv("TRUST_PROXY_SSL_HEADER", "0") == "1":
         SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
     SECURE_SSL_REDIRECT = True
@@ -175,6 +193,8 @@ if IS_PRODUCTION:
     SECURE_REDIRECT_EXEMPT = [r"^health/$"]
     SESSION_COOKIE_SECURE = True
     CSRF_COOKIE_SECURE = True
+
+if IS_PRODUCTION:
     SECURE_HSTS_SECONDS = 31_536_000
     SECURE_HSTS_INCLUDE_SUBDOMAINS = True
     SECURE_HSTS_PRELOAD = True

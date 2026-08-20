@@ -93,8 +93,11 @@ the approved deployment process.
 ## Docker/PostgreSQL start
 
 1. Copy `.env.example` to `.env` and replace every placeholder locally.
-2. Install Docker Desktop.
-3. Run `docker compose up -d --build`, then inspect `docker compose ps` and
+2. Set `GIT_COMMIT_SHA` in `.env` to the exact 40-character output of
+   `git rev-parse HEAD`. The build deliberately rejects a branch name, `latest`,
+   an abbreviated SHA, and the example placeholder.
+3. Install Docker Desktop.
+4. Run `docker compose up -d --build`, then inspect `docker compose ps` and
    `docker compose logs --tail 200 web db`.
 
 The canonical Compose file is `compose.yaml` (the current Docker Compose default
@@ -117,7 +120,9 @@ they are a Staging prerequisite.
 The repository is deployable source, not evidence of a completed deployment.
 Before a staging or production start:
 
-- set `GROWTH_OS_ENV=production`;
+- set `GROWTH_OS_ENV=staging` for Staging and `GROWTH_OS_ENV=production`
+  for Production; both non-Local profiles force HTTPS and Secure cookies,
+  while long-lived HSTS remains Production-only;
 - provide a new high-entropy `DJANGO_SECRET_KEY`;
 - set exact `DJANGO_ALLOWED_HOSTS` and HTTPS origins in
   `DJANGO_CSRF_TRUSTED_ORIGINS`;
@@ -132,8 +137,40 @@ Before a staging or production start:
   volume is persistence, not a backup.
 
 The `/health/` endpoint is exempt from Django's HTTPS redirect so Docker can
-check the private HTTP listener. It returns service health only and must not
-contain secrets or business data.
+check the private HTTP listener. It returns database reachability plus a small,
+non-sensitive deployment identity:
+
+```json
+{
+  "status": "ok",
+  "database": "ok",
+  "deployment": {
+    "stage": "staging-candidate",
+    "revision": "c91160c3b8baec39d955c38e41ee1995af900c3e"
+  }
+}
+```
+
+`GROWTH_OS_DEPLOYMENT_STAGE` is limited to `local`, `staging`,
+`staging-candidate`, or `production`. The revision is baked into the image from
+the full build-time `GIT_COMMIT_SHA`; a source checkout that was not built as a
+traceable image reports the honest default `unknown`. The same revision is in
+the image's `org.opencontainers.image.revision` OCI label, while
+`org.opencontainers.image.source` identifies this repository. Verify both the
+running endpoint and image label during deployment; neither contains secrets or
+business data. Health responses use `Cache-Control: no-store`.
+
+For example, compare the running image and endpoint without printing any
+environment variables:
+
+```powershell
+docker image inspect <image-id> --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}'
+Invoke-RestMethod https://staging.example.test/health/
+```
+
+Do not add environment dumps, hostnames, database connection details, keys,
+tokens, user data, or build URLs containing credentials to `/health/` or OCI
+labels.
 
 No real secret belongs in source control, screenshots, chat, logs, or `.env.example`.
 

@@ -1,10 +1,22 @@
 FROM python:3.12-slim AS runtime
 
+ARG GIT_COMMIT_SHA
+
+LABEL org.opencontainers.image.source="https://github.com/ZhewZhunglum/growth-os" \
+      org.opencontainers.image.revision="${GIT_COMMIT_SHA}"
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    GROWTH_OS_RELEASE_SHA="${GIT_COMMIT_SHA}"
 
 WORKDIR /app
+
+# A deployable image must identify one immutable full commit.  This validation
+# also prevents a branch name, "latest", or an abbreviated SHA being recorded
+# as deployment evidence.
+RUN test "${#GIT_COMMIT_SHA}" -eq 40 \
+    && case "${GIT_COMMIT_SHA}" in *[!0-9a-f]*) exit 1 ;; esac
 
 RUN addgroup --system growthos && adduser --system --ingroup growthos growthos
 

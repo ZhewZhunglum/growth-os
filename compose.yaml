@@ -15,7 +15,12 @@ services:
       retries: 12
 
   web:
-    build: .
+    build:
+      context: .
+      args:
+        # Set this from `git rev-parse HEAD`; Dockerfile rejects branch names,
+        # abbreviated SHAs and the unedited example placeholder.
+        GIT_COMMIT_SHA: ${GIT_COMMIT_SHA:?Set GIT_COMMIT_SHA to the full output of git rev-parse HEAD}
     restart: unless-stopped
     env_file:
       - .env
