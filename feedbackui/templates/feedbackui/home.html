@@ -1,0 +1,107 @@
+{% extends "base.html" %}
+{% load ui_i18n %}
+{% block title %}{% ui 'AI 搜索曝光与结果' 'AI Search Visibility & Results' %} · PUKO{% endblock %}
+{% block page_title %}{% ui 'AI 搜索曝光与结果' 'AI Search Visibility & Results' %}{% endblock %}
+{% block content %}
+<section class="hero-panel config-hero">
+  <div>
+    <p class="eyebrow">{% ui '结果回流' 'Results feedback' %}</p>
+    <h2>{% ui 'AI 会不会提到 PUKO？' 'Will AI answers mention PUKO?' %}</h2>
+    <p>{% ui '用真实问题测试 DeepSeek、ChatGPT、Perplexity 等 AI：它们有没有提到、推荐或引用 PUKO。这里记录的是 AI 搜索曝光，不是普通搜索排名。' 'Test real questions in DeepSeek, ChatGPT, Perplexity, and other AI services: do they mention, recommend, or cite PUKO? This tracks AI search visibility, not ordinary search ranking.' %}</p>
+  </div>
+  <div class="status-pill"><span></span>{% ui '只记录结果，不自动改任务或规则' 'Results only; no automatic task or rule changes' %}</div>
+</section>
+
+<section class="metric-grid" aria-label="{% ui 'AI 搜索曝光概览' 'AI search visibility overview' %}">
+  <article class="metric-card"><span>{% ui '已测试问题' 'Questions tested' %}</span><strong>{{ geo_result_count }}</strong><small>{% ui '人工记录的 AI 回答次数' 'Manually recorded AI answers' %}</small></article>
+  <article class="metric-card"><span>{% ui '提到 PUKO' 'PUKO mentioned' %}</span><strong>{{ geo_mention_count }}</strong><small>{% ui '回答中出现了 PUKO' 'Answers that included PUKO' %}</small></article>
+  <article class="metric-card"><span>{% ui '带引用链接' 'Answers with citations' %}</span><strong>{{ geo_citation_count }}</strong><small>{% ui 'AI 给出了可核对的网页来源' 'AI supplied a source that can be checked' %}</small></article>
+</section>
+
+<section class="section-heading">
+  <div><p class="eyebrow">{% ui '主要操作' 'Main action' %}</p><h2>{% ui '手动记录一次 AI 搜索结果' 'Record one AI search result' %}</h2></div>
+  <span class="section-note">{% ui '先在 AI 里提问，再把结果记到这里' 'Ask the AI first, then record the result here' %}</span>
+</section>
+<section class="detail-panel">
+  {% if can_record_geo %}
+  <form method="post" action="{% url 'feedback:geo-result' %}" class="config-form">
+    {% csrf_token %}{{ geo_form.non_field_errors }}
+    {% for hidden in geo_form.hidden_fields %}{{ hidden }}{% endfor %}
+    <p>{{ geo_form.panel_item.errors }}{{ geo_form.panel_item.label_tag }}{{ geo_form.panel_item }}</p>
+    <p>{{ geo_form.provider.errors }}{{ geo_form.provider.label_tag }}{{ geo_form.provider }}<span class="helptext">{{ geo_form.provider.help_text }}</span></p>
+    <p>{{ geo_form.availability_state.errors }}{{ geo_form.availability_state.label_tag }}{{ geo_form.availability_state }}</p>
+    <p>{{ geo_form.response_text.errors }}{{ geo_form.response_text.label_tag }}{{ geo_form.response_text }}</p>
+    <p>{{ geo_form.brand_mentioned.errors }}{{ geo_form.brand_mentioned }} {{ geo_form.brand_mentioned.label_tag }}</p>
+    <p>{{ geo_form.citation_urls.errors }}{{ geo_form.citation_urls.label_tag }}{{ geo_form.citation_urls }}<span class="helptext">{{ geo_form.citation_urls.help_text }}</span></p>
+    <details>
+      <summary><strong>{% ui '高级录入（通常不用打开）' 'Advanced entry (usually leave closed)' %}</strong></summary>
+      <p>{{ geo_form.model_reference.errors }}{{ geo_form.model_reference.label_tag }}{{ geo_form.model_reference }}<span class="helptext">{{ geo_form.model_reference.help_text }}</span></p>
+      <p>{{ geo_form.rank_position.errors }}{{ geo_form.rank_position.label_tag }}{{ geo_form.rank_position }}</p>
+    </details>
+    <button class="button button-primary" type="submit">{% ui '保存这次 AI 搜索结果' 'Save this AI search result' %}</button>
+  </form>
+  {% else %}
+    <h3>{% ui '还没有可测试的问题' 'No questions are ready yet' %}</h3>
+    <p class="muted">{% ui 'Owner 或 Admin 先在下面的“高级设置”里建立问题组并添加问题，然后这里就会出现可选问题。' 'An Owner or Admin must create a question set and add a question under Advanced settings. The question will then appear here.' %}</p>
+  {% endif %}
+</section>
+
+{% if can_configure_geo %}
+<details class="detail-panel">
+  <summary><strong>{% ui '高级设置：管理 AI 搜索问题' 'Advanced settings: manage AI search questions' %}</strong></summary>
+  <p class="muted">{% ui '只有需要新增或修改测试问题时才使用。旧问题不会被覆盖；修改时创建一个新版本。' 'Use this only when adding or revising test questions. Existing questions are never overwritten; revisions create a new version.' %}</p>
+  <div class="config-grid">
+    <section><h3>{% ui '设置一组要问 AI 的问题' 'Create an AI question set' %}</h3>
+      <form method="post" action="{% url 'feedback:geo-panel-version' %}" class="config-form">{% csrf_token %}{{ panel_version_form.as_p }}<button class="button button-primary" type="submit">{% ui '创建问题组' 'Create question set' %}</button></form>
+    </section>
+    <section><h3>{% ui '向问题组添加一个问题' 'Add a question to a set' %}</h3>
+      <form method="post" action="{% url 'feedback:geo-panel-item' %}" class="config-form">{% csrf_token %}{{ panel_item_form.as_p }}<button class="button button-primary" type="submit">{% ui '添加问题' 'Add question' %}</button></form>
+    </section>
+  </div>
+  <details><summary><strong>{% ui '查看已有问题组' 'View existing question sets' %}</strong></summary>
+    {% for panel in recent_panels %}<p><strong>{{ panel.product.name }}</strong> · {{ panel.market_code }}/{{ panel.language_code }}<br><small>{{ panel.items.count }} {% ui '个问题' 'question(s)' %}</small></p>{% empty %}<p class="muted">{% ui '尚未建立问题组。' 'No question set has been created.' %}</p>{% endfor %}
+  </details>
+</details>
+{% endif %}
+
+<details class="detail-panel">
+  <summary><strong>{% ui '其他结果工具：平台表现与改进建议' 'Other result tools: platform performance and proposals' %}</strong></summary>
+  <p class="muted">{% ui '日常只需要使用上面的 AI 搜索曝光。发布后的浏览量、点击量，或要提交人工改进建议时，再打开这里。真实的 0 是有效数据；没有拿到数据不要填 0。' 'For daily work, use AI Search Visibility above. Open this section for post-publication views or clicks, or when submitting a human improvement proposal. A real zero is valid data; do not use zero when data is missing.' %}</p>
+  <details><summary><strong>{% ui '记录一条平台表现' 'Record one platform result' %}</strong></summary>
+    <form method="post" action="{% url 'feedback:performance-manual' %}" class="config-form">
+      {% csrf_token %}{{ manual_form.non_field_errors }}{% for hidden in manual_form.hidden_fields %}{{ hidden }}{% endfor %}
+      <p>{{ manual_form.channel_account.errors }}{{ manual_form.channel_account.label_tag }}{{ manual_form.channel_account }}</p>
+      <p>{{ manual_form.publication.errors }}{{ manual_form.publication.label_tag }}{{ manual_form.publication }}<span class="helptext">{{ manual_form.publication.help_text }}</span></p>
+      <p>{{ manual_form.metric_name.errors }}{{ manual_form.metric_name.label_tag }}{{ manual_form.metric_name }}<span class="helptext">{{ manual_form.metric_name.help_text }}</span></p>
+      <p>{{ manual_form.availability_state.errors }}{{ manual_form.availability_state.label_tag }}{{ manual_form.availability_state }}</p>
+      <p>{{ manual_form.numeric_value.errors }}{{ manual_form.numeric_value.label_tag }}{{ manual_form.numeric_value }}<span class="helptext">{{ manual_form.numeric_value.help_text }}</span></p>
+      <p>{{ manual_form.observed_at.errors }}{{ manual_form.observed_at.label_tag }}{{ manual_form.observed_at }}<span class="helptext">{{ manual_form.observed_at.help_text }}</span></p>
+      <p>{{ manual_form.source_reference.errors }}{{ manual_form.source_reference.label_tag }}{{ manual_form.source_reference }}<span class="helptext">{{ manual_form.source_reference.help_text }}</span></p>
+      <details><summary><strong>{% ui '高级录入' 'Advanced entry' %}</strong></summary><p>{{ manual_form.metric_key.errors }}{{ manual_form.metric_key.label_tag }}{{ manual_form.metric_key }}<span class="helptext">{{ manual_form.metric_key.help_text }}</span></p><p>{{ manual_form.unit.errors }}{{ manual_form.unit.label_tag }}{{ manual_form.unit }}</p></details>
+      <button class="button button-primary" type="submit">{% ui '保存平台表现' 'Save platform result' %}</button>
+    </form>
+  </details>
+  <details><summary><strong>{% ui '高级批量录入：粘贴 CSV' 'Advanced bulk entry: paste CSV' %}</strong></summary>
+    <form method="post" action="{% url 'feedback:performance-csv' %}" class="config-form">{% csrf_token %}{{ csv_form.as_p }}<button class="button button-primary" type="submit">{% ui '检查并保存 CSV' 'Check and save CSV' %}</button></form>
+  </details>
+  <details><summary><strong>{% ui '根据结果提出改进建议' 'Propose an improvement from a result' %}</strong></summary>
+    <p class="muted">{% ui '建议只会等待人工决定，不会自动创建任务或更改规则。' 'The proposal waits for a human decision; it never creates tasks or changes rules automatically.' %}</p>
+    <form method="post" action="{% url 'feedback:learning-proposal' %}" class="config-form">{% csrf_token %}{{ learning_form.as_p }}<button class="button button-primary" type="submit">{% ui '保存建议' 'Save proposal' %}</button></form>
+  </details>
+</details>
+
+<details class="detail-panel">
+  <summary><strong>{% ui '查看我以前记录的结果' 'View my previous results' %}</strong></summary>
+  <div class="config-grid config-history">
+    <section><h3>{% ui '平台表现' 'Platform performance' %}</h3>
+      {% if recent_publication_performance or recent_performance %}{% for item in recent_publication_performance %}<p><strong>{{ item.publication.current_gate.channel_account.display_name }} · {{ item.metric_definition.name }}</strong><br><small>{% if item.numeric_value == None %}{% ui '没有数值' 'No value' %}{% else %}{{ item.numeric_value }} {{ item.unit }}{% endif %} · {{ item.observed_at }}</small></p>{% endfor %}{% for item in recent_performance %}<p><strong>{{ item.channel_account.display_name }} · {{ item.metric_definition.name }}</strong><br><small>{% if item.numeric_value == None %}{% ui '没有数值' 'No value' %}{% else %}{{ item.numeric_value }} {{ item.unit }}{% endif %} · {{ item.observed_at }}</small></p>{% endfor %}{% else %}<p class="muted">{% ui '尚无记录。' 'No records yet.' %}</p>{% endif %}
+    </section>
+    <section><h3>{% ui 'AI 搜索曝光' 'AI search visibility' %}</h3>
+      {% for item in recent_geo %}<p><strong>{{ item.panel_item.panel.product.name }} · {{ item.probe_run.provider }}</strong><br><small>{% if item.brand_mentioned %}{% ui '提到了 PUKO' 'PUKO mentioned' %}{% else %}{% ui '没有提到 PUKO' 'PUKO not mentioned' %}{% endif %} · {{ item.citations.count }} {% ui '个引用' 'citation(s)' %} · {{ item.recorded_at }}</small></p>{% empty %}<p class="muted">{% ui '尚无记录。' 'No records yet.' %}</p>{% endfor %}
+    </section>
+    <section><h3>{% ui '改进建议' 'Improvement proposals' %}</h3>
+      {% for item in recent_learning %}<p><strong>{{ item.title }}</strong><br><small>{{ item.product.name }} · v{{ item.version_number }} · {% if item.status == 'PROPOSED' %}{% ui '等待人工决定' 'Awaiting human decision' %}{% elif item.status == 'APPROVED' %}{% ui '已同意' 'Approved' %}{% else %}{% ui '未采用' 'Not adopted' %}{% endif %}</small></p>{% empty %}<p class="muted">{% ui '尚无记录。' 'No records yet.' %}</p>{% endfor %}
+    </section>
+  </div>
+</details>
+{% endblock %}

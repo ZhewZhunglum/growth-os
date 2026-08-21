@@ -519,8 +519,6 @@ class FrozenV1AcceptanceTests(TestCase):
             gate,
             external_publication_id="tiktok-ac01",
             external_url="https://www.tiktok.com/@puko/video/ac01",
-            proof_reference="acceptance/ac01-proof.png",
-            proof_sha256="a" * 64,
         )
         self._transition(task, Task.State.DONE)
 
@@ -692,8 +690,6 @@ class FrozenV1AcceptanceTests(TestCase):
             4,
             new_gate,
             external_publication_id="tiktok-ac04",
-            proof_reference="acceptance/ac04-proof.png",
-            proof_sha256="b" * 64,
         )
         self.assertEqual(publication.gate_records.count(), 2)
         self.assertEqual(publication.current_gate_id, new_gate.pk)

@@ -1,13 +1,13 @@
 {% extends "base.html" %}
-{% load dashboard_display %}
-{% block title %}人工发布队列 · PUKO Growth OS{% endblock %}
-{% block page_title %}人工发布队列{% endblock %}
+{% load dashboard_display ui_i18n %}
+{% block title %}{% ui '受控发布队列' 'Publishing queue' %} · PUKO Growth OS{% endblock %}
+{% block page_title %}{% ui '受控发布队列' 'Publishing queue' %}{% endblock %}
 {% block content %}
-<section class="hero-panel"><div><p class="eyebrow">发布门禁 · 仅人工发布</p><h2>系统负责检查，人负责真正发布。</h2><p>这里只显示你拥有匹配发布权限的已审核任务；有发布证明后，负责人或运营主管可以核对并完成任务。</p></div><div class="status-pill"><span></span> 绝不自动外发</div></section>
-<section class="section-heading"><div><p class="eyebrow">审核已通过</p><h2>等待门禁或发布证明</h2></div><span class="section-note">{{ tasks|length }} 项</span></section>
+<section class="hero-panel"><div><p class="eyebrow">{% ui '发布检查 · 最终人工确认' 'Release checks · final human confirmation' %}</p><h2>{% ui '系统负责检查，人负责最后确认。' 'The system checks; a person gives final confirmation.' %}</h2><p>{% ui '这里只显示你拥有匹配发布权限的已审核任务；人工路径可直接登记证明，API/浏览器路径未配置时会安全拒绝。' 'This page shows reviewed tasks that match your publishing access. Manual publishing records proof directly; unconfigured API or browser paths fail safely.' %}</p></div><div class="status-pill"><span></span> {% ui '未确认绝不外发' 'Nothing is published without confirmation' %}</div></section>
+<section class="section-heading"><div><p class="eyebrow">{% ui '审核已通过' 'Review approved' %}</p><h2>{% ui '等待检查或发布证明' 'Waiting for release checks or publishing proof' %}</h2></div><span class="section-note">{{ tasks|length }} {% ui '项' 'items' %}</span></section>
 <section class="task-list">
     {% for task in tasks %}
-    <article class="task-card"><header class="task-card-header"><div><p class="task-meta">{{ task.product.name }}</p><h3>{{ task.title }}</h3></div><span class="task-state task-state-approved">{{ task.current_state|task_state_zh }}</span></header><div class="task-section"><span class="task-label">下一步</span><p>选择账号和运行环境进行门禁检查；通过后请到平台人工发布，再回来上传证明。</p></div><footer class="task-card-footer"><span>系统不会替你点击平台发布按钮</span><a class="button button-primary" href="{% url 'dashboard:release-detail' task.id %}">打开发布流程</a></footer></article>
-    {% empty %}<article class="empty-state task-empty-state"><span class="empty-number">00</span><div><h3>当前没有可处理的发布任务</h3><p>你现在不需要做任何操作。</p></div></article>{% endfor %}
+    <article class="task-card"><header class="task-card-header"><div><p class="task-meta">{{ task.product.name }}</p><h3>{{ task.title }}</h3></div><span class="task-state task-state-approved">{% ui_task_state task.current_state %}</span></header><div class="task-section"><span class="task-label">{% ui '下一步' 'Next step' %}</span><p>{% ui '选择账号和运行环境进行发布检查；通过后选择人工、API 或受控浏览器路径，并做最终人工确认。' 'Choose the account and runtime for release checks. After they pass, choose manual, API, or controlled-browser publishing and give final human confirmation.' %}</p></div><footer class="task-card-footer"><span>{% ui '未配置的自动路径会安全拒绝' 'Unconfigured automated paths fail safely' %}</span><a class="button button-primary" href="{% url 'dashboard:release-detail' task.id %}">{% ui '打开发布流程' 'Open publishing flow' %}</a></footer></article>
+    {% empty %}<article class="empty-state task-empty-state"><span class="empty-number">00</span><div><h3>{% ui '当前没有可处理的发布任务' 'No publishing tasks are ready' %}</h3><p>{% ui '你现在不需要做任何操作。' 'No action is needed.' %}</p></div></article>{% endfor %}
 </section>
 {% endblock %}

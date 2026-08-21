@@ -1,0 +1,80 @@
+{% extends "base.html" %}
+{% load dashboard_display ui_i18n %}
+{% block title %}{{ member.display_name|default:member.username }}的权限 · PUKO Growth OS{% endblock %}
+{% block page_title %}{% ui '员工权限详情' 'Staff access details' %}{% endblock %}
+{% block content %}
+<a class="back-link" href="{% url 'dashboard:team-members' %}">← {% ui '返回员工列表' 'Back to staff list' %}</a>
+<section class="task-detail-hero">
+    <div>
+        <p class="eyebrow">{{ member.role|role_zh }}</p>
+        <h2>{{ member.display_name|default:member.username }}</h2>
+        <p>{% ui '用户名' 'Username' %} {{ member.username }}。{% ui '角色只是人员边界；每次操作仍检查下方实时有效的 PermissionGrant。' 'Role only defines staff boundaries; every action still checks the active PermissionGrant below.' %}</p>
+    </div>
+    <div class="detail-status-stack"><span class="task-state">{{ member.get_principal_status_display }}</span></div>
+</section>
+
+<div class="team-detail-grid">
+    <section class="detail-panel action-panel">
+        <p class="eyebrow">{% ui '新增权限' 'New permission' %}</p>
+        <h3>{% ui '让这名员工可以做什么' 'What this staff member can do' %}</h3>
+        <p class="action-explanation">{% ui '每次只发一条明确权限。发布权限只能由 Owner 发放，并且必须选择具体发布账号、风险等级和到期时间。' 'Issue one explicit permission at a time. Only an Owner may issue publishing access, with an exact account, risk level, and expiry.' %}</p>
+        <form class="task-action-form" method="post" action="{% url 'dashboard:team-grant-issue' member.id %}">
+            {% csrf_token %}
+            {{ issue_form.non_field_errors }}
+            {% for field in issue_form %}
+            <div class="field-row">
+                {{ field.label_tag }}{{ field }}{{ field.errors }}
+                {% if field.help_text %}<small>{{ field.help_text }}</small>{% endif %}
+            </div>
+            {% endfor %}
+            <button class="button button-primary team-primary-action" type="submit">{% ui '确认发放这项权限' 'Issue this permission' %}</button>
+        </form>
+        <p class="read-only-note">{% ui '管理员不能发放“发布、管理员工、紧急停止”；执行人员完全不能进入本页。服务端会再次检查，不依赖按钮是否显示。' 'Admins cannot issue Publish, Manage Team, or Emergency Stop; Operators cannot access this page. The server checks again regardless of button visibility.' %}</p>
+    </section>
+
+    <section class="detail-panel">
+        <p class="eyebrow">{% ui '有效与历史记录' 'Active and historical records' %}</p>
+        <h3>{% ui '所有权限记录' 'All permission records' %}</h3>
+        <div class="grant-list">
+        {% for grant, is_current in grant_rows %}
+            <article class="grant-card {% if is_current %}grant-current{% endif %}">
+                <div class="grant-heading">
+                    <div><strong>{{ grant.action|grant_action_zh }}</strong><small>{{ grant.effect|grant_effect_zh }} · {{ grant.scope_kind|grant_scope_zh }} · {{ grant.risk_level|grant_risk_zh }}</small></div>
+                    {% if is_current %}<span class="task-state task-state-ready">当前有效</span>{% else %}<span class="task-state">历史记录</span>{% endif %}
+                </div>
+                <dl class="grant-facts">
+                    <dt>具体范围</dt><dd>{% if grant.product %}{{ grant.product.name }}{% elif grant.platform_code %}{{ grant.platform_code }}{% elif grant.account_ref %}{{ grant.account_ref }}{% elif grant.surface_ref %}{{ grant.surface_ref }}{% else %}全局{% endif %}</dd>
+                    <dt>有效时间</dt><dd>{{ grant.valid_from|date:"Y-m-d H:i" }} ～ {{ grant.valid_until|date:"Y-m-d H:i"|default:"无到期时间" }}</dd>
+                    <dt>授权人</dt><dd>{{ grant.granted_by_principal.display_name|default:grant.granted_by_principal.username }}</dd>
+                    <dt>记录状态</dt><dd>{{ grant.grant_status|grant_status_zh }}{% if grant.revocation_reason %} · {{ grant.revocation_reason }}{% endif %}</dd>
+                </dl>
+                {% if selected_grant.id == grant.id and renew_form %}
+                    {{ renew_form.non_field_errors }}{% for field in renew_form %}{{ field.errors }}{% endfor %}
+                {% endif %}
+                {% if selected_grant.id == grant.id and revoke_form %}
+                    {{ revoke_form.non_field_errors }}{% for field in revoke_form %}{{ field.errors }}{% endfor %}
+                {% endif %}
+                {% if is_current %}
+                <details class="grant-actions">
+                    <summary>续期或撤销</summary>
+                    <form method="post" action="{% url 'dashboard:team-grant-renew' grant.id %}">
+                        {% csrf_token %}
+                        <label>新权限开始时间<input type="datetime-local" name="valid_from" required></label>
+                        <label>新权限到期时间<input type="datetime-local" name="valid_until" {% if grant.action == "PUBLISH" %}required{% endif %}></label>
+                        <button class="button button-secondary" type="submit">生成新的续期记录</button>
+                    </form>
+                    <form method="post" action="{% url 'dashboard:team-grant-revoke' grant.id %}">
+                        {% csrf_token %}
+                        <label>撤销原因<textarea name="reason" rows="2" required placeholder="请说明为什么收回权限"></textarea></label>
+                        <button class="button button-danger" type="submit">撤销这项权限</button>
+                    </form>
+                </details>
+                {% endif %}
+            </article>
+        {% empty %}
+            <div class="empty-state"><div><h3>还没有权限记录</h3><p>可在左侧发放第一条明确权限。</p></div></div>
+        {% endfor %}
+        </div>
+    </section>
+</div>
+{% endblock %}

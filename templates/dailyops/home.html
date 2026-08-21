@@ -1,0 +1,96 @@
+{% extends "base.html" %}
+{% load ui_i18n %}
+{% block title %}{% ui '机会与计划' 'Opportunities' %} · PUKO{% endblock %}
+{% block page_title %}{% ui '机会与计划' 'Opportunities' %}{% endblock %}
+{% block content %}
+<div class="daily-page">
+  <header class="daily-page-heading">
+    <div>
+      <p class="eyebrow">{% ui '每日运营' 'Daily operations' %}</p>
+      <h2>{% ui '开始今天的一轮工作' "Start today's run" %}</h2>
+    </div>
+  </header>
+
+  {% if configured_source_count < expected_source_count %}
+  <aside class="daily-notice" role="status">
+    <div>
+      <strong>{% ui '还差一步初始化' 'One setup step remains' %}</strong>
+      <p>{% ui '先准备七个平台的采集入口。这里只建立清单，不联网，也不会产生 API 费用。' 'Prepare the seven platform collection routes. This only creates the checklist: it does not connect to the network or incur API fees.' %}</p>
+    </div>
+    {% if can_setup_sources %}
+    <form method="post" action="{% url 'dailyops:source-setup' %}">
+      {% csrf_token %}<button class="button button-secondary" type="submit">{% ui '完成初始化' 'Finish setup' %}</button>
+    </form>
+    {% else %}
+    <span class="status-pill">{% ui '请让 Owner 或 Admin 完成' 'Ask an Owner or Admin' %}</span>
+    {% endif %}
+  </aside>
+  {% endif %}
+
+  <section class="daily-start-card" aria-labelledby="daily-start-title">
+    <div class="daily-start-copy">
+      <span class="daily-step-number">1</span>
+      <div>
+        <p class="eyebrow">{% ui '第一步' 'Step one' %}</p>
+        <h3 id="daily-start-title">{% ui '告诉系统今天研究什么' 'Choose what to research today' %}</h3>
+      </div>
+    </div>
+    <form class="config-form daily-start-form" method="post" action="{% url 'dailyops:batch-start' %}">
+      {% csrf_token %}
+      {{ form.command_id }}
+      {{ form.non_field_errors }}
+      <div class="daily-form-grid">
+        <label>
+          <span>{% ui '产品' 'Product' %}</span>
+          {{ form.product }}{{ form.product.errors }}
+        </label>
+        <label class="daily-form-wide">
+          <span>{% ui '今天要研究的问题' "Today's research question" %}</span>
+          {{ form.query }}{{ form.query.errors }}
+        </label>
+        <label>
+          <span>{% ui '从什么时候开始看' 'Look back from' %}</span>
+          {{ form.window_start }}{{ form.window_start.errors }}
+        </label>
+        <label>
+          <span>{% ui '看到什么时候' 'Look through' %}</span>
+          {{ form.window_end }}{{ form.window_end.errors }}
+        </label>
+      </div>
+      <button class="button button-primary daily-primary-action" type="submit"{% if configured_source_count < expected_source_count %} disabled aria-disabled="true"{% endif %}>
+        {% ui '开始收集线索' 'Start collecting signals' %}
+      </button>
+    </form>
+  </section>
+
+  <section class="daily-recent" aria-labelledby="daily-recent-title">
+    <header class="daily-section-title">
+      <div><p class="eyebrow">{% ui '继续处理' 'Continue' %}</p><h2 id="daily-recent-title">{% ui '最近的工作' 'Recent work' %}</h2></div>
+    </header>
+    <div class="task-list">
+    {% for batch in recent_batches %}
+      <article class="task-card daily-recent-card">
+        <div>
+          <p class="task-meta">{{ batch.product.name }} · {{ batch.created_at|date:"Y-m-d H:i" }}</p>
+          <h3>{{ batch.query|default_if_none:""|default:"—" }}</h3>
+        </div>
+        <a class="button button-primary" href="{% url 'dailyops:batch-detail' batch.product.id batch.batch_key %}">{% ui '继续下一步' 'Continue' %}</a>
+      </article>
+    {% empty %}
+      <article class="empty-state daily-empty-state">
+        <span class="empty-number">0</span>
+        <div><h3>{% ui '还没有开始过' 'No runs yet' %}</h3><p>{% ui '填写上面的三项信息，就能开始第一轮。' 'Fill in the form above to start the first run.' %}</p></div>
+      </article>
+    {% endfor %}
+    </div>
+  </section>
+</div>
+<script>
+(() => {
+  const query = document.getElementById('id_query');
+  if (query) query.placeholder = document.documentElement.lang.startsWith('en')
+    ? 'For example: How can I stay focused in the afternoon?'
+    : '例如：下午注意力不集中怎么办';
+})();
+</script>
+{% endblock %}

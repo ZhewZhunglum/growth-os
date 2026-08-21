@@ -1,41 +1,98 @@
-{% load static dashboard_display %}
+{% load static dashboard_display ui_i18n %}
 <!doctype html>
-<html lang="zh-CN">
+<html lang="{% ui_language_code %}">
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>{% block title %}PUKO Growth OS{% endblock %}</title>
-    <meta name="description" content="PUKO 内部内容执行、人工审核与发布治理工作台。">
+    <meta name="description" content="{% ui 'PUKO 内部内容执行、人工审核与发布治理工作台。' 'PUKO internal operations, human review, and governed publishing workspace.' %}">
     <link rel="stylesheet" href="{% static 'css/app.css' %}">
 </head>
 <body>
+    {% url 'set_language' as set_language_url %}
+    {% url 'dailyops:home' as dailyops_home_url %}
+    {% url 'feedback:home' as feedback_home_url %}
+    {% url 'governanceui:home' as governance_home_url %}
+    {% url 'dashboard:home' as dashboard_home_url %}
+    {% url 'dashboard:review-queue' as review_queue_url %}
+    {% url 'dashboard:release-queue' as release_queue_url %}
+    {% url 'dashboard:team-members' as team_members_url %}
+    {% url 'dashboard:configuration-home' as configuration_home_url %}
+    {% url 'dashboard:change-my-password' as change_password_url %}
+    {% url 'dashboard:guide' as guide_url %}
+    {% url 'logout' as logout_url %}
+    {% if user.is_authenticated %}{% action_center_for user as global_action_center %}{% endif %}
     <div class="app-shell">
         <aside class="sidebar">
-            <a class="brand" href="{% url 'dashboard:home' %}" aria-label="返回 Growth OS 今日任务">
+            <a class="brand" href="{{ dashboard_home_url|default:'#' }}" aria-label="{% ui '返回 Growth OS 今日任务' 'Back to Growth OS Today' %}">
                 <span class="brand-mark">P</span>
                 <span><strong>PUKO</strong><small>Growth OS</small></span>
             </a>
-            <nav aria-label="主导航">
-                <a class="nav-item" href="{% url 'dashboard:home' %}"><span>今日任务</span><small>执行</small></a>
-                <a class="nav-item" href="{% url 'dashboard:review-queue' %}"><span>内容审核</span><small>人工</small></a>
-                <a class="nav-item" href="{% url 'dashboard:release-queue' %}"><span>人工发布</span><small>门禁</small></a>
-                <span class="nav-item is-disabled"><span>内容库</span><small>后续开放</small></span>
+            <nav aria-label="{% ui '主导航' 'Main navigation' %}">
+                <a class="nav-item{% if request.resolver_match.namespace == 'dashboard' and request.resolver_match.url_name == 'home' %} is-active{% endif %}" href="{{ dashboard_home_url|default:'#' }}">{% ui '首页' 'Home' %}</a>
+                {% if user.role == "OWNER" or user.role == "OPERATIONS_ADMIN" %}
+                <a class="nav-item{% if request.resolver_match.namespace == 'dailyops' %} is-active{% endif %}" href="{{ dailyops_home_url|default:'#' }}">{% ui '机会与计划' 'Opportunities' %}</a>
+                {% endif %}
+                <a class="nav-item{% if request.resolver_match.namespace == 'dashboard' and request.resolver_match.url_name == 'task-detail' or request.resolver_match.url_name == 'task-create' %} is-active{% endif %}" href="{{ dashboard_home_url|default:'#' }}#my-tasks">{% ui '我的任务' 'My work' %}</a>
+                {% if global_action_center.can_open_review %}
+                <a class="nav-item{% if request.resolver_match.url_name == 'review-queue' or request.resolver_match.url_name == 'review-detail' or request.resolver_match.url_name == 'review-history-detail' %} is-active{% endif %}" href="{{ review_queue_url|default:'#' }}">{% ui '审核' 'Review' %}</a>
+                {% endif %}
+                {% if global_action_center.can_open_publish or global_action_center.can_open_complete %}
+                <a class="nav-item{% if request.resolver_match.url_name == 'release-queue' or request.resolver_match.url_name == 'release-detail' %} is-active{% endif %}" href="{{ release_queue_url|default:'#' }}">{% ui '发布' 'Publish' %}</a>
+                {% endif %}
+                <details class="sidebar-nav-more"{% if request.resolver_match.namespace == 'feedback' or request.resolver_match.namespace == 'governanceui' or request.resolver_match.url_name == 'team-members' or request.resolver_match.url_name == 'team-member-detail' or request.resolver_match.url_name == 'configuration-home' or request.resolver_match.url_name == 'product-configuration' or request.resolver_match.url_name == 'runtime-configuration' or request.resolver_match.url_name == 'guide' %} open{% endif %}>
+                    <summary class="nav-item{% if request.resolver_match.namespace == 'feedback' or request.resolver_match.namespace == 'governanceui' or request.resolver_match.url_name == 'team-members' or request.resolver_match.url_name == 'team-member-detail' or request.resolver_match.url_name == 'configuration-home' or request.resolver_match.url_name == 'product-configuration' or request.resolver_match.url_name == 'runtime-configuration' or request.resolver_match.url_name == 'guide' %} is-active{% endif %}">{% ui '更多' 'More' %}<span aria-hidden="true">⌄</span></summary>
+                    <div class="sidebar-nav-more-links">
+                        {% if user.role == "OWNER" or user.role == "OPERATIONS_ADMIN" %}
+                        <a class="nav-item{% if request.resolver_match.namespace == 'feedback' %} is-active{% endif %}" href="{{ feedback_home_url|default:'#' }}">{% ui '查看结果' 'Results' %}</a>
+                        <a class="nav-item{% if request.resolver_match.namespace == 'governanceui' %} is-active{% endif %}" href="{{ governance_home_url|default:'#' }}">{% ui '问题与规则' 'Issues & rules' %}</a>
+                        <a class="nav-item{% if request.resolver_match.url_name == 'team-members' or request.resolver_match.url_name == 'team-member-detail' %} is-active{% endif %}" href="{{ team_members_url|default:'#' }}">{% ui '员工' 'Team' %}</a>
+                        {% endif %}
+                        {% if user.role == "OWNER" %}
+                        <a class="nav-item{% if request.resolver_match.url_name == 'configuration-home' or request.resolver_match.url_name == 'product-configuration' or request.resolver_match.url_name == 'runtime-configuration' %} is-active{% endif %}" href="{{ configuration_home_url|default:'#' }}">{% ui '设置' 'Settings' %}</a>
+                        {% endif %}
+                        <a class="nav-item{% if request.resolver_match.url_name == 'guide' %} is-active{% endif %}" href="{{ guide_url|default:'#' }}">{% ui '使用说明' 'Guide' %}</a>
+                    </div>
+                </details>
             </nav>
             {% if user.is_authenticated %}
-            <div class="sidebar-user">
-                <span class="avatar">{{ user.username|slice:":1"|upper }}</span>
-                <span><strong>{{ user.display_name|default:user.username }}</strong><small>{{ user.principal_type|principal_type_zh }}</small></span>
-            </div>
+            <details class="sidebar-user-menu">
+                <summary class="sidebar-user">
+                    <span class="avatar">{{ user.display_name|default:user.username|slice:":1"|upper }}</span>
+                    <span><strong>{{ user.display_name|default:user.username }}</strong><small>{% ui_role user.role %}</small></span>
+                </summary>
+                <div class="sidebar-user-popover">
+                    <a href="{{ guide_url|default:'#' }}">{% ui '使用说明' 'Guide' %}</a>
+                    <a href="{{ change_password_url|default:'#' }}">{% ui '修改密码' 'Change password' %}</a>
+                    <form action="{{ logout_url|default:'#' }}" method="post">{% csrf_token %}<button type="submit">{% ui '退出登录' 'Sign out' %}</button></form>
+                </div>
+            </details>
             {% endif %}
         </aside>
         <main class="main-content">
             <header class="topbar">
-                <div><p class="eyebrow">内部工作台</p><h1>{% block page_title %}PUKO Growth OS{% endblock %}</h1></div>
-                {% if user.is_authenticated %}
-                <form action="{% url 'logout' %}" method="post">
-                    {% csrf_token %}<button class="button button-secondary" type="submit">退出登录</button>
-                </form>
-                {% endif %}
+                <h1>{% block page_title %}PUKO Growth OS{% endblock %}</h1>
+                <div class="topbar-actions">
+                    {% if user.is_authenticated %}
+                    <details class="notification-center">
+                        <summary aria-label="{% ui '打开待办通知' 'Open action inbox' %}">
+                            <svg aria-hidden="true" viewBox="0 0 24 24" width="20" height="20"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                            {% if global_action_center.total_count %}<span class="notification-badge">{{ global_action_center.total_count }}</span>{% endif %}
+                        </summary>
+                        <div class="notification-popover">
+                            <header><strong>{% ui '我的待办' 'My inbox' %}</strong><small>{% ui '只显示你现在有权处理的事项' 'Only work you can handle now' %}</small></header>
+                            {% for item in global_action_center.items %}
+                            <a href="{{ item.url }}"><span>{% ui item.label_zh item.label_en %}</span><strong>{{ item.count }}</strong></a>
+                            {% empty %}<p>{% ui '现在没有待办。' 'Your inbox is clear.' %}</p>{% endfor %}
+                        </div>
+                    </details>
+                    {% endif %}
+                    <form class="language-switch" action="{{ set_language_url|default:'/i18n/setlang/' }}" method="post" aria-label="{% ui '界面语言' 'Interface language' %}">
+                        {% csrf_token %}<input name="next" type="hidden" value="{{ request.get_full_path }}">
+                        <button class="language-option{% if request.LANGUAGE_CODE|slice:':2' == 'zh' %} is-selected{% endif %}" type="submit" name="language" value="zh-hans" lang="zh-CN">中文</button>
+                        <button class="language-option{% if request.LANGUAGE_CODE|slice:':2' == 'en' %} is-selected{% endif %}" type="submit" name="language" value="en" lang="en">EN</button>
+                    </form>
+                </div>
             </header>
             {% if messages %}<section class="messages" aria-live="polite">{% for message in messages %}<p>{{ message }}</p>{% endfor %}</section>{% endif %}
             {% block content %}{% endblock %}

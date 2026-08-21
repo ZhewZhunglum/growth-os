@@ -142,7 +142,7 @@ class BootstrapDogfoodTests(TestCase):
             "policy_versions": 1,
             "contracts": 1,
             "policy_links": 1,
-            "grants": 6,
+            "grants": 19,
             "accounts": 1,
             "environments": 1,
             "bindings": 1,
@@ -176,7 +176,9 @@ class BootstrapDogfoodTests(TestCase):
                 ).values_list("action", flat=True)
             ),
             {
+                PermissionGrant.Action.VIEW,
                 PermissionGrant.Action.EDIT,
+                PermissionGrant.Action.COLLECT_READ_ONLY,
                 PermissionGrant.Action.CREATE_TASK,
                 PermissionGrant.Action.ASSIGN_TASK,
                 PermissionGrant.Action.CANCEL_TASK,
@@ -252,7 +254,7 @@ class BootstrapDogfoodTests(TestCase):
         self.assertEqual(admin.role, Principal.Role.OPERATIONS_ADMIN)
         self.assertEqual(evaluator.principal_type, Principal.PrincipalType.SERVICE_ACCOUNT)
         self.assertEqual(Principal.objects.count(), 4)
-        self.assertEqual(PermissionGrant.objects.count(), 15)
+        self.assertEqual(PermissionGrant.objects.count(), 52)
         self.assertFalse(Principal.objects.filter(username__in=["reviewer", "publisher"]).exists())
         self.assertTrue(PermissionGrant.objects.filter(
             principal=operator, action=PermissionGrant.Action.EDIT,
@@ -281,7 +283,9 @@ class BootstrapDogfoodTests(TestCase):
                 ).values_list("action", flat=True)
             ),
             {
+                PermissionGrant.Action.VIEW,
                 PermissionGrant.Action.EDIT,
+                PermissionGrant.Action.COLLECT_READ_ONLY,
                 PermissionGrant.Action.CREATE_TASK,
                 PermissionGrant.Action.ASSIGN_TASK,
                 PermissionGrant.Action.CANCEL_TASK,
@@ -297,7 +301,11 @@ class BootstrapDogfoodTests(TestCase):
                     product=product,
                 ).values_list("action", flat=True)
             ),
-            {PermissionGrant.Action.EDIT},
+            {
+                PermissionGrant.Action.VIEW,
+                PermissionGrant.Action.EDIT,
+                PermissionGrant.Action.COLLECT_READ_ONLY,
+            },
         )
         self.assertFalse(PermissionGrant.objects.filter(
             principal__in=[owner, admin],
@@ -323,7 +331,7 @@ class BootstrapDogfoodTests(TestCase):
             call_command("bootstrap_dogfood", full_demo=True, stdout=self.stdout)
 
         self.assertEqual(Principal.objects.count(), 4)
-        self.assertEqual(PermissionGrant.objects.count(), 15)
+        self.assertEqual(PermissionGrant.objects.count(), 52)
 
     def test_full_demo_accepts_legacy_reviewer_password_env_for_new_admin(self):
         self._owner()
@@ -360,7 +368,7 @@ class BootstrapDogfoodTests(TestCase):
         self.assertEqual(reviewer.role, Principal.Role.OPERATIONS_ADMIN)
         self.assertEqual(publisher.role, Principal.Role.OPERATOR)
         self.assertEqual(Principal.objects.count(), 5)
-        self.assertEqual(PermissionGrant.objects.count(), 11)
+        self.assertEqual(PermissionGrant.objects.count(), 35)
         self.assertTrue(PermissionGrant.objects.filter(
             principal=reviewer,
             action=PermissionGrant.Action.REVIEW,

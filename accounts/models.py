@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from django.contrib.auth.models import AbstractUser
+from django.core.exceptions import ValidationError
 from django.db import models
 from django.db.models import Q
 from django.utils import timezone
@@ -41,6 +42,7 @@ class Principal(AbstractUser):
     mfa_status = models.CharField(max_length=20, choices=MfaStatus.choices, default=MfaStatus.NOT_ENROLLED)
     principal_status = models.CharField(max_length=20, choices=PrincipalStatus.choices, default=PrincipalStatus.ACTIVE)
     decommissioned_at = models.DateTimeField(null=True, blank=True)
+    must_change_password = models.BooleanField(default=False)
 
     class Meta:
         constraints = [
@@ -56,6 +58,10 @@ class Principal(AbstractUser):
         ]
 
     def save(self, *args, **kwargs):
+        if self.pk:
+            original = type(self).objects.filter(pk=self.pk).only("role", "principal_type").first()
+            if original and (original.role != self.role or original.principal_type != self.principal_type):
+                raise ValidationError("Principal role and type are immutable; create a new identity instead.")
         forced_fields: set[str] = set()
         if self.principal_status != self.PrincipalStatus.ACTIVE:
             self.is_active = False
@@ -78,6 +84,73 @@ class Principal(AbstractUser):
 
     def __str__(self) -> str:
         return self.display_name or self.get_full_name() or self.username
+
+
+class SecretReference(TimeStampedModel):
+    """Metadata-only pointer to a deployment secret.
+
+    The secret value is deliberately never stored in Growth OS.  Runtime
+    adapters resolve the named ``*_FILE`` mount or an external secret manager.
+    """
+
+    class Backend(models.TextChoices):
+        FILE_MOUNT = "FILE_MOUNT", "Read-only file mount"
+        EXTERNAL_MANAGER = "EXTERNAL_MANAGER", "External secret manager"
+
+    class EnvironmentScope(models.TextChoices):
+        LOCAL = "LOCAL", "Local"
+        STAGING = "STAGING", "Staging"
+        PRODUCTION = "PRODUCTION", "Production"
+
+    class Status(models.TextChoices):
+        ACTIVE = "ACTIVE", "Active"
+        ROTATION_REQUIRED = "ROTATION_REQUIRED", "Rotation required"
+        REVOKED = "REVOKED", "Revoked"
+
+    secret_key = models.CharField(max_length=120)
+    provider_code = models.CharField(max_length=64)
+    backend = models.CharField(max_length=24, choices=Backend.choices)
+    reference_name = models.CharField(
+        max_length=255,
+        help_text="Environment variable base name or external secret identifier; never the value.",
+    )
+    environment_scope = models.CharField(max_length=16, choices=EnvironmentScope.choices)
+    purpose = models.CharField(max_length=240)
+    status = models.CharField(max_length=24, choices=Status.choices, default=Status.ACTIVE)
+    last_rotated_at = models.DateTimeField(null=True, blank=True)
+    expires_at = models.DateTimeField(null=True, blank=True)
+    created_by_principal = models.ForeignKey(Principal, on_delete=models.PROTECT, related_name="secret_references_created")
+    updated_by_principal = models.ForeignKey(Principal, on_delete=models.PROTECT, related_name="secret_references_updated")
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["secret_key", "environment_scope"],
+                name="accounts_unique_secret_reference_scope",
+            ),
+            models.CheckConstraint(
+                condition=Q(expires_at__isnull=True) | Q(last_rotated_at__isnull=True) | Q(expires_at__gt=models.F("last_rotated_at")),
+                name="accounts_secret_expiry_after_rotation",
+            ),
+        ]
+
+    def clean(self):
+        super().clean()
+        forbidden_fragments = ("BEGIN PRIVATE", "sk-", "Bearer ")
+        if any(fragment.lower() in self.reference_name.lower() for fragment in forbidden_fragments):
+            raise ValidationError({"reference_name": "Store only a reference name, never secret material."})
+        if self.backend == self.Backend.FILE_MOUNT and self.reference_name.upper().endswith("_FILE"):
+            raise ValidationError(
+                {
+                    "reference_name": (
+                        "Use the environment-variable base name without _FILE; "
+                        "the runtime adds that suffix when resolving the read-only mount."
+                    )
+                }
+            )
+
+    def __str__(self) -> str:
+        return f"{self.provider_code}:{self.secret_key}@{self.environment_scope}"
 
 
 class PermissionGrant(TimeStampedModel):
@@ -138,6 +211,13 @@ class PermissionGrant(TimeStampedModel):
         Principal, null=True, blank=True, on_delete=models.PROTECT, related_name="grants_revoked"
     )
     revocation_reason = models.TextField(blank=True)
+    supersedes_grant = models.OneToOneField(
+        "self",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="renewed_by_grant",
+    )
 
     class Meta:
         constraints = [
@@ -179,7 +259,92 @@ class PermissionGrant(TimeStampedModel):
                 ),
                 name="accounts_grant_explicit_scope",
             ),
+            models.CheckConstraint(
+                condition=(
+                    Q(
+                        grant_status="REVOKED",
+                        revoked_at__isnull=False,
+                        revoked_by_principal__isnull=False,
+                    )
+                    & ~Q(revocation_reason="")
+                )
+                | (
+                    ~Q(grant_status="REVOKED")
+                    & Q(
+                        revoked_at__isnull=True,
+                        revoked_by_principal__isnull=True,
+                        revocation_reason="",
+                    )
+                ),
+                name="accounts_grant_revocation_metadata",
+            ),
         ]
+
+    def clean(self):
+        super().clean()
+        if self.supersedes_grant_id:
+            prior = self.supersedes_grant
+            immutable_fields = (
+                "principal_id",
+                "scope_kind",
+                "product_id",
+                "platform_code",
+                "account_ref",
+                "surface_ref",
+                "action",
+                "effect",
+                "risk_level",
+            )
+            if any(getattr(self, field) != getattr(prior, field) for field in immutable_fields):
+                raise ValidationError("A renewal must preserve the exact Principal, scope, action, effect, and risk.")
+            if self.valid_from < prior.valid_from:
+                raise ValidationError("A renewal cannot begin before the original grant.")
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            original = type(self).objects.filter(pk=self.pk).first()
+            if original:
+                authority_fields = {
+                    "principal_id",
+                    "scope_kind",
+                    "product_id",
+                    "platform_code",
+                    "account_ref",
+                    "surface_ref",
+                    "action",
+                    "effect",
+                    "risk_level",
+                    "valid_from",
+                    "valid_until",
+                    "granted_by_principal_id",
+                    "created_at",
+                    "supersedes_grant_id",
+                }
+                changed_authority = {
+                    field
+                    for field in authority_fields
+                    if getattr(self, field) != getattr(original, field)
+                }
+                if changed_authority:
+                    raise ValidationError(
+                        "A PermissionGrant authority record is immutable; revoke it and create a new grant."
+                    )
+                lifecycle_changed = any(
+                    getattr(self, field) != getattr(original, field)
+                    for field in (
+                        "grant_status",
+                        "revoked_at",
+                        "revoked_by_principal_id",
+                        "revocation_reason",
+                    )
+                )
+                if lifecycle_changed:
+                    if original.grant_status != self.GrantStatus.ACTIVE:
+                        raise ValidationError("Only an ACTIVE grant can be revoked.")
+                    if self.grant_status != self.GrantStatus.REVOKED:
+                        raise ValidationError("PermissionGrant lifecycle is one-way ACTIVE to REVOKED.")
+        self.full_clean()
+        return super().save(*args, **kwargs)
 
     @property
     def is_current(self) -> bool:

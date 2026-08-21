@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% load ui_i18n %}
+{% block title %}{% ui '使用说明' 'Guide' %} · PUKO Growth OS{% endblock %}
+{% block page_title %}{% ui '使用说明' 'Guide' %}{% endblock %}
+{% block content %}
+<section class="detail-panel action-panel">
+  <p class="eyebrow">{% ui '先看这一页，再开始操作' 'Read this before you start' %}</p>
+  <h2>{% ui '一次 Daily Task 到底怎么跑？' 'How does one Daily Task run?' %}</h2>
+  <p>{% ui '系统只负责把“找机会、安排工作、执行、审核、发布、看结果”串起来。你不用记代码，也不用理解数据库名词。' 'The system connects research, planning, execution, review, publishing, and results. You do not need to remember codes or database terms.' %}</p>
+</section>
+
+<section class="detail-columns" style="margin-top:18px">
+  <article class="detail-panel">
+    <h3>{% ui '每天的 6 个动作' 'Six daily actions' %}</h3>
+    <ol class="guide-steps">
+      <li><strong>{% ui '找素材' 'Find evidence' %}</strong> — {% ui '系统检查 7 个平台；没抓到时，你补一个链接即可。' 'The system checks seven platforms; if nothing is collected, paste one link.' %}</li>
+      <li><strong>{% ui '选题' 'Choose an idea' %}</strong> — {% ui 'AI 给建议，Owner 决定要不要做。' 'AI proposes; the Owner decides whether to proceed.' %}</li>
+      <li><strong>{% ui '安排' 'Plan' %}</strong> — {% ui '选平台和账号，环境与能力由系统自动核对。' 'Choose the platform and account; the system checks environment and capability.' %}</li>
+      <li><strong>{% ui '执行' 'Execute' %}</strong> — {% ui 'Operator 在“我的任务”里接受、制作并提交外部链接。' 'The Operator accepts, creates, and submits an external link from My work.' %}</li>
+      <li><strong>{% ui '审核与发布' 'Review and publish' %}</strong> — {% ui 'Admin 审核；有发布授权的人在门禁通过后人工确认发布。' 'An Admin reviews; an authorized publisher confirms publishing after the gate passes.' %}</li>
+      <li><strong>{% ui '看结果' 'Review results' %}</strong> — {% ui '记录平台表现和 AI 搜索是否提到 PUKO，再形成下一轮建议。' 'Record platform results and whether AI search mentions PUKO, then propose the next learning.' %}</li>
+    </ol>
+  </article>
+  <article class="detail-panel">
+    <h3>{% ui '三种账号分别做什么' 'What each account does' %}</h3>
+    <dl class="submission-summary">
+      <dt>Owner</dt><dd>{% ui '决定做什么、安排工作、管理高风险授权。也能执行普通任务，但不能审核自己提交的内容。' 'Decides what to do, plans work, and manages high-risk grants. Can execute ordinary work but cannot review their own submission.' %}</dd>
+      <dt>Admin</dt><dd>{% ui '审核内容、处理团队待办、管理 Operator 的低风险工作权限。' 'Reviews content, handles team actions, and manages low-risk Operator permissions.' %}</dd>
+      <dt>Operator</dt><dd>{% ui '在“我的任务”里完成被分配的工作并提交链接；没有审核权限。' 'Completes assigned work in My work and submits links; has no review permission.' %}</dd>
+    </dl>
+  </article>
+</section>
+
+<section class="detail-columns" style="margin-top:18px">
+  <article class="detail-panel">
+    <h3>{% ui '我该去哪里找工作？' 'Where do I find work?' %}</h3>
+    <ul class="guide-steps">
+      <li>{% ui '右上角铃铛：所有现在等你处理的事项。' 'Top-right bell: everything waiting for you now.' %}</li>
+      <li>{% ui '首页：只显示与你有关、且你现在有权处理的内容。' 'Home: only work related to you and currently allowed.' %}</li>
+      <li>{% ui '我的任务：你创建或分配给你的执行任务。' 'My work: execution tasks you created or were assigned.' %}</li>
+      <li>{% ui '审核：等 Admin/Owner 审核的提交；已完成审核也可回看。' 'Review: submissions awaiting review, plus completed review history.' %}</li>
+      <li>{% ui '发布：已经审核通过、等门禁或发布确认的任务。' 'Publish: approved work awaiting gate checks or publishing confirmation.' %}</li>
+    </ul>
+  </article>
+  <article class="detail-panel">
+    <h3>{% ui '几个容易误会的词' 'Plain-language glossary' %}</h3>
+    <dl class="submission-summary">
+      <dt>ChannelPlan</dt><dd>{% ui '某个平台这次具体要做什么。界面会显示为“平台任务安排”。' 'What to do on one platform. The UI calls this a platform work plan.' %}</dd>
+      <dt>GEO</dt><dd>{% ui 'AI 搜索曝光：测试 DeepSeek、ChatGPT、Perplexity 等是否提到或引用 PUKO。' 'AI search visibility: whether DeepSeek, ChatGPT, Perplexity, and others mention or cite PUKO.' %}</dd>
+      <dt>Release Gate</dt><dd>{% ui '发布前检查：审核、权限、账号状态和规则都没问题才允许继续。' 'Pre-publish check: review, permission, account state, and rules must all pass.' %}</dd>
+      <dt>Learning</dt><dd>{% ui '根据结果写下的改进建议；它不会自己修改规则或自动执行。' 'A proposed improvement from results; it never changes rules or acts automatically.' %}</dd>
+    </dl>
+  </article>
+</section>
+{% endblock %}

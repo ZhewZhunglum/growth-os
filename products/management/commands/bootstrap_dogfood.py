@@ -15,7 +15,16 @@ from django.utils import timezone
 
 from accounts.authorization import resolve_authorization
 from accounts.models import PermissionGrant, Principal
-from products.models import Product, ProductProfileVersion
+from products.models import (
+    ClaimMatrixItem,
+    ClaimMatrixVersion,
+    EvidenceLibraryVersion,
+    ObjectiveProfileVersion,
+    Product,
+    ProductClaimVersion,
+    ProductProfilePolicyLink,
+    ProductProfileVersion,
+)
 from releasegate.models import (
     AccountEnvironmentBinding,
     CapabilityState,
@@ -63,7 +72,9 @@ class HumanSpec:
 # validates the Principal's persisted acting role and resolves the Grant.
 ROLE_PRODUCT_GRANT_TEMPLATES = {
     Principal.Role.OWNER: (
+        PermissionGrant.Action.VIEW,
         PermissionGrant.Action.EDIT,
+        PermissionGrant.Action.COLLECT_READ_ONLY,
         PermissionGrant.Action.CREATE_TASK,
         PermissionGrant.Action.ASSIGN_TASK,
         PermissionGrant.Action.CANCEL_TASK,
@@ -71,15 +82,30 @@ ROLE_PRODUCT_GRANT_TEMPLATES = {
         PermissionGrant.Action.REVIEW,
     ),
     Principal.Role.OPERATIONS_ADMIN: (
+        PermissionGrant.Action.VIEW,
         PermissionGrant.Action.EDIT,
+        PermissionGrant.Action.COLLECT_READ_ONLY,
         PermissionGrant.Action.CREATE_TASK,
         PermissionGrant.Action.ASSIGN_TASK,
         PermissionGrant.Action.CANCEL_TASK,
         PermissionGrant.Action.COMPLETE_TASK,
         PermissionGrant.Action.REVIEW,
     ),
-    Principal.Role.OPERATOR: (PermissionGrant.Action.EDIT,),
+    Principal.Role.OPERATOR: (
+        PermissionGrant.Action.VIEW,
+        PermissionGrant.Action.EDIT,
+        PermissionGrant.Action.COLLECT_READ_ONLY,
+    ),
 }
+DAILY_COLLECTION_PLATFORMS = (
+    "PINTEREST",
+    "QUORA",
+    "TIKTOK",
+    "SHOPIFY",
+    "GOOGLE_SEARCH",
+    "GOOGLE_SEARCH_CONSOLE",
+    "GOOGLE_ANALYTICS_4",
+)
 
 
 class Command(BaseCommand):
@@ -246,22 +272,16 @@ class Command(BaseCommand):
             if password_entry is None:
                 raise CommandError(f"Password environment disappeared before creating '{spec.username}'.")
             _, password = password_entry
-            if spec.key == "owner":
-                principal = Principal.objects.create_superuser(
-                    username=spec.username,
-                    password=password,
-                    display_name=spec.display_name,
-                    principal_type=Principal.PrincipalType.HUMAN_USER,
-                    role=spec.role,
-                )
-            else:
-                principal = Principal.objects.create_user(
-                    username=spec.username,
-                    password=password,
-                    display_name=spec.display_name,
-                    principal_type=Principal.PrincipalType.HUMAN_USER,
-                    role=spec.role,
-                )
+            # Growth OS authority is expressed by exact PermissionGrants, not
+            # Django's unrestricted admin bypass.  Even the business Owner is
+            # therefore a normal authenticated Principal.
+            principal = Principal.objects.create_user(
+                username=spec.username,
+                password=password,
+                display_name=spec.display_name,
+                principal_type=Principal.PrincipalType.HUMAN_USER,
+                role=spec.role,
+            )
         elif spec.key == "owner" and principal.is_superuser and principal.role != Principal.Role.OWNER:
             principal.role = Principal.Role.OWNER
             principal.save(update_fields=["role"])
@@ -284,21 +304,143 @@ class Command(BaseCommand):
             principal.save()
         return principal
 
-    def _ensure_profile(self, product: Product, owner: Principal) -> ProductProfileVersion:
-        profile = ProductProfileVersion.objects.filter(product=product, version_number=1).first()
+    def _ensure_profile_context(self, product: Product, owner: Principal):
+        objective_values = {
+            "primary_objectives": ["EXPOSURE", "SEO", "GEO", "ACCOUNT_VISIT"],
+            "secondary_objectives": ["CONTENT_QUALITY", "AUDIENCE_FIT"],
+            "retained_metrics": ["PRODUCT_VIEW", "ADD_TO_CART", "CHECKOUT", "PURCHASE", "REVENUE"],
+            "priority_rules": {"daily_operations": "EXTERNAL_DEMAND_FIRST"},
+            "strategy_boundaries": {"commercial_outcomes_are_not_demand": True},
+        }
+        objective, created = ObjectiveProfileVersion.objects.get_or_create(
+            objective_key=PROFILE_VALUES["objective_profile_key"],
+            version_number=1,
+            defaults={"created_by_principal": owner, **objective_values},
+        )
+        if not created and any(getattr(objective, key) != value for key, value in objective_values.items()):
+            raise CommandError("Existing visibility ObjectiveProfileVersion differs from the Daily Operations seed.")
+        if not objective.is_sealed:
+            objective.seal(principal=owner)
+
+        claim = ProductClaimVersion.objects.filter(
+            product=product,
+            claim_key="NO_DISEASE_TREATMENT_CLAIM",
+            version_number=1,
+        ).first()
+        if claim is None:
+            claim = ProductClaimVersion.objects.create(
+                product=product,
+                claim_key="NO_DISEASE_TREATMENT_CLAIM",
+                version_number=1,
+                claim_type=ProductClaimVersion.ClaimType.PROHIBITED,
+                market_code=product.market_code,
+                platform_code="",
+                evidence_level=ProductClaimVersion.EvidenceLevel.UNSUPPORTED,
+                wording="Do not claim that the product cures, treats, or prevents disease.",
+                created_by_principal=owner,
+            )
+        elif (
+            claim.claim_type != ProductClaimVersion.ClaimType.PROHIBITED
+            or claim.market_code != product.market_code
+            or claim.platform_code
+            or claim.evidence_level != ProductClaimVersion.EvidenceLevel.UNSUPPORTED
+        ):
+            raise CommandError("Existing prohibited ProductClaimVersion differs from the Daily Operations seed.")
+        matrix, matrix_created = ClaimMatrixVersion.objects.get_or_create(
+            product=product,
+            version_number=1,
+            defaults={
+                "market_code": product.market_code,
+                "language_code": product.language_code,
+                "created_by_principal": owner,
+            },
+        )
+        if not matrix_created and (
+            matrix.market_code != product.market_code or matrix.language_code != product.language_code
+        ):
+            raise CommandError("Existing ClaimMatrixVersion differs from the Product market/language.")
+        if not matrix.is_sealed:
+            ClaimMatrixItem.objects.get_or_create(
+                claim_matrix_version=matrix,
+                product_claim_version=claim,
+                defaults={"created_by_principal": owner},
+            )
+            matrix.seal(principal=owner)
+        if not matrix.items.filter(product_claim_version=claim).exists():
+            raise CommandError("The sealed ClaimMatrixVersion is missing the prohibited-claim item.")
+
+        library, library_created = EvidenceLibraryVersion.objects.get_or_create(
+            product=product,
+            version_number=1,
+            defaults={
+                "market_code": product.market_code,
+                "language_code": product.language_code,
+                "created_by_principal": owner,
+            },
+        )
+        if not library_created and (
+            library.market_code != product.market_code or library.language_code != product.language_code
+        ):
+            raise CommandError("Existing EvidenceLibraryVersion differs from the Product market/language.")
+        if not library.is_sealed:
+            # Link-first V1 deliberately permits an empty controlled library;
+            # evidence is added later as immutable external references.
+            library.seal(principal=owner)
+        return objective, matrix, library
+
+    def _ensure_profile(
+        self,
+        product: Product,
+        owner: Principal,
+        policy_version: PolicyVersion,
+    ) -> ProductProfileVersion:
+        objective, matrix, library = self._ensure_profile_context(product, owner)
+        profile = (
+            ProductProfileVersion.objects.filter(
+                product=product,
+                objective_profile_version=objective,
+                claim_matrix_version=matrix,
+                evidence_library_version=library,
+            )
+            .order_by("-version_number")
+            .first()
+        )
         if profile is None:
+            latest_number = (
+                ProductProfileVersion.objects.filter(product=product)
+                .order_by("-version_number")
+                .values_list("version_number", flat=True)
+                .first()
+                or 0
+            )
             profile = ProductProfileVersion.objects.create(
                 product=product,
-                version_number=1,
+                version_number=latest_number + 1,
+                objective_profile_version=objective,
+                claim_matrix_version=matrix,
+                evidence_library_version=library,
                 created_by_principal=owner,
                 **PROFILE_VALUES,
             )
         else:
             mismatched = [name for name, value in PROFILE_VALUES.items() if getattr(profile, name) != value]
             if mismatched:
-                raise CommandError(f"Existing PUKO profile v1 differs in: {', '.join(mismatched)}.")
+                raise CommandError(
+                    f"Existing exact PUKO profile v{profile.version_number} differs in: {', '.join(mismatched)}."
+                )
         if not profile.is_sealed:
+            ProductProfilePolicyLink.objects.get_or_create(
+                product_profile_version=profile,
+                policy_version=policy_version,
+                policy_role=ProductProfilePolicyLink.PolicyRole.APPLICABLE,
+                defaults={"created_by_principal": owner},
+            )
             profile.seal(owner)
+        elif not profile.policy_links.filter(
+            policy_version=policy_version,
+            policy_role=ProductProfilePolicyLink.PolicyRole.APPLICABLE,
+        ).exists():
+            raise CommandError("The exact sealed Product Profile is missing its required Policy link.")
         return profile
 
     def _ensure_policy(self, owner: Principal) -> PolicyVersion:
@@ -452,13 +594,28 @@ class Command(BaseCommand):
         now = timezone.now()
         if action == PermissionGrant.Action.PUBLISH and scope_kind != PermissionGrant.ScopeKind.ACCOUNT:
             raise CommandError("Bootstrap PUBLISH capability must use an explicit ACCOUNT scope.")
-        required_risk = (
-            PermissionGrant.RiskLevel.HIGH
-            if action == PermissionGrant.Action.PUBLISH
-            else PermissionGrant.RiskLevel.MEDIUM
-        )
+        if action in {
+            PermissionGrant.Action.PUBLISH,
+            PermissionGrant.Action.MANAGE_ACCOUNT,
+            PermissionGrant.Action.EMERGENCY_STOP,
+        }:
+            required_risk = PermissionGrant.RiskLevel.HIGH
+        elif action in {
+            PermissionGrant.Action.VIEW,
+            PermissionGrant.Action.COLLECT_READ_ONLY,
+        }:
+            required_risk = PermissionGrant.RiskLevel.LOW
+        else:
+            required_risk = PermissionGrant.RiskLevel.MEDIUM
         scope_filter = {
+            PermissionGrant.ScopeKind.GLOBAL: Q(
+                product__isnull=True,
+                platform_code="",
+                account_ref="",
+                surface_ref="",
+            ),
             PermissionGrant.ScopeKind.PRODUCT: Q(product=product),
+            PermissionGrant.ScopeKind.PLATFORM: Q(platform_code=platform_code),
             PermissionGrant.ScopeKind.ACCOUNT: Q(account_ref=account_ref),
         }[scope_kind]
         grant = PermissionGrant.objects.filter(
@@ -480,6 +637,7 @@ class Command(BaseCommand):
                 principal=principal,
                 scope_kind=scope_kind,
                 product=product if scope_kind == PermissionGrant.ScopeKind.PRODUCT else None,
+                platform_code=platform_code if scope_kind == PermissionGrant.ScopeKind.PLATFORM else "",
                 account_ref=account_ref if scope_kind == PermissionGrant.ScopeKind.ACCOUNT else "",
                 action=action,
                 effect=PermissionGrant.Effect.ALLOW,
@@ -533,8 +691,21 @@ class Command(BaseCommand):
         )
         if not created and (product.market_code != "US" or product.language_code != "en"):
             raise CommandError("Existing PUKO Product is not the frozen US/en Dogfood product.")
-        profile = self._ensure_profile(product, owner)
-        if product.current_profile_version_id is None:
+        policy_version = self._ensure_policy(owner)
+        profile = self._ensure_profile(product, owner, policy_version)
+        current_profile = product.current_profile_version
+        current_is_legacy_seed = bool(
+            current_profile
+            and not all(
+                (
+                    current_profile.objective_profile_version_id,
+                    current_profile.claim_matrix_version_id,
+                    current_profile.evidence_library_version_id,
+                )
+            )
+            and all(getattr(current_profile, name) == value for name, value in PROFILE_VALUES.items())
+        )
+        if product.current_profile_version_id is None or current_is_legacy_seed:
             product.current_profile_version = profile
             product.updated_by_principal = owner
             product.full_clean()
@@ -549,7 +720,6 @@ class Command(BaseCommand):
                 )
             )
 
-        policy_version = self._ensure_policy(owner)
         contract = self._ensure_contract(profile, policy_version, owner)
         channel, environment, binding, capability = self._ensure_release_context(owner)
 
@@ -569,6 +739,75 @@ class Command(BaseCommand):
                     scope_kind=PermissionGrant.ScopeKind.PRODUCT,
                     product=product,
                 )
+
+        for key, risk_action in (
+            ("owner", PermissionGrant.Action.MANAGE_ACCOUNT),
+            ("admin", PermissionGrant.Action.MANAGE_ACCOUNT),
+        ):
+            principal = principals.get(key)
+            if principal is not None:
+                self._ensure_grant(
+                    principal=principal,
+                    action=risk_action,
+                    owner=owner,
+                    scope_kind=PermissionGrant.ScopeKind.GLOBAL,
+                )
+
+        # Governance is a real Daily Operations work queue.  The create and
+        # decision services require exact GLOBAL Grants, so bootstrap them
+        # explicitly instead of inferring authority from role names.
+        for key, actions in (
+            (
+                "owner",
+                (
+                    PermissionGrant.Action.VIEW,
+                    PermissionGrant.Action.EDIT,
+                    PermissionGrant.Action.APPROVE,
+                ),
+            ),
+            (
+                "admin",
+                (
+                    PermissionGrant.Action.VIEW,
+                    PermissionGrant.Action.EDIT,
+                    PermissionGrant.Action.APPROVE,
+                ),
+            ),
+            (
+                "operator",
+                (
+                    PermissionGrant.Action.VIEW,
+                    PermissionGrant.Action.EDIT,
+                ),
+            ),
+        ):
+            principal = principals.get(key)
+            if principal is not None:
+                for action in actions:
+                    self._ensure_grant(
+                        principal=principal,
+                        action=action,
+                        owner=owner,
+                        scope_kind=PermissionGrant.ScopeKind.GLOBAL,
+                    )
+
+        for key in ("owner", "admin", "operator"):
+            principal = principals.get(key)
+            if principal is not None:
+                for platform_code in DAILY_COLLECTION_PLATFORMS:
+                    self._ensure_grant(
+                        principal=principal,
+                        action=PermissionGrant.Action.COLLECT_READ_ONLY,
+                        owner=owner,
+                        scope_kind=PermissionGrant.ScopeKind.PLATFORM,
+                        platform_code=platform_code,
+                    )
+
+        # Non-secret connector descriptors are part of the local fixture, not
+        # network credentials and not a live API call.
+        from dailyops.services import ensure_default_sources
+
+        ensure_default_sources(principal=owner, acting_role=owner.role)
 
         reviewer = principals.get("reviewer")
         if reviewer is not None:

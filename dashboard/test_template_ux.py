@@ -62,11 +62,11 @@ class DashboardTemplateUXTests(SimpleTestCase):
             },
         )
 
-        self.assertIn("待我审核", html)
-        self.assertIn("待我发布", html)
-        self.assertIn("待我确认完成", html)
-        self.assertIn("这些不是我的执行任务", html)
-        self.assertIn("今天没有分配给你的任务", html)
+        self.assertIn("今天的待办已经清空", html)
+        self.assertIn("现在没有执行任务", html)
+        self.assertNotIn("先弄清楚为什么做", html)
+        self.assertNotIn("开工检查（DoR）", html)
+        self.assertNotIn("交付检查（DoD）", html)
 
     def test_review_queue_has_safe_empty_read_only_history_region(self):
         html = render_to_string(
@@ -77,7 +77,7 @@ class DashboardTemplateUXTests(SimpleTestCase):
         self.assertIn("我已完成的审核", html)
         self.assertIn("还没有已完成的审核记录", html)
 
-    def test_review_history_detail_is_read_only_and_names_exact_asset_version(self):
+    def test_review_history_detail_is_read_only_and_hides_link_without_permission(self):
         principal = SimpleNamespace(display_name="审核人员", username="reviewer")
         product = SimpleNamespace(name="PUKO")
         task = SimpleNamespace(title="审核历史测试", description="只读说明", product=product)
@@ -90,10 +90,10 @@ class DashboardTemplateUXTests(SimpleTestCase):
         )
         asset_version = SimpleNamespace(
             version_number=3,
-            mime_type="text/plain",
+            mime_type="text/uri-list",
             content_sha256="a" * 64,
-            object_key="controlled/task/asset-v3.txt",
-            metadata={"original_filename": "asset-v3.txt"},
+            object_key="https://docs.example.com/private/asset-v3",
+            metadata={"source": "external-url"},
         )
 
         html = render_to_string(
@@ -104,10 +104,16 @@ class DashboardTemplateUXTests(SimpleTestCase):
                 "submission": submission,
                 "review": review,
                 "asset_version": asset_version,
+                "is_link_delivery": True,
+                "can_view_asset": False,
             },
         )
 
         self.assertIn("只读记录", html)
-        self.assertIn("asset-v3.txt", html)
+        self.assertNotIn(asset_version.object_key, html)
         self.assertIn("a" * 64, html)
-        self.assertNotIn("<form", html)
+        self.assertIn("当前审核权限已失效", html)
+        # The shared header contains only the locale switch.  The immutable
+        # review content below the header must expose no editing form.
+        review_content = html.split("</header>", 1)[1]
+        self.assertNotIn("<form", review_content)

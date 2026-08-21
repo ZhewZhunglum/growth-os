@@ -1,5 +1,7 @@
 # ADR 0001: Python-first modular monolith
 
+> The storage bullets in this ADR are superseded by [V1 Link-Only Errata — 2026-08-20](../spec/v1-freeze-2026-08-18/05-LINK-ONLY-ERRATA-2026-08-20.md); the remaining architecture decision stays accepted.
+
 - Status: Accepted
 - Date: 2026-08-18
 

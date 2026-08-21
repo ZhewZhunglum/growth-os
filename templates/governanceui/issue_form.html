@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% load ui_i18n %}
+{% block title %}{% ui '上报问题' 'Report issue' %} · PUKO{% endblock %}
+{% block page_title %}{% ui '上报问题' 'Report issue' %}{% endblock %}
+{% block content %}
+<a class="back-link" href="{% url 'governanceui:home' %}">← {% ui '返回问题与规则治理' 'Back to issues and rules' %}</a>
+<section class="detail-columns"><article class="detail-panel action-panel"><p class="eyebrow">{% ui '员工与负责人都可以提交' 'Staff and owners can report issues' %}</p><h3>{% ui '把问题讲清楚' 'Describe the issue clearly' %}</h3><form class="config-form" method="post">{% csrf_token %}{{ form.as_p }}<button class="button button-primary" type="submit">{% ui '记录问题' 'Record issue' %}</button></form></article>
+<article class="detail-panel"><p class="eyebrow">{% ui '边界' 'Boundary' %}</p><h3>{% ui '上报不会自动改规则' 'A report never changes rules automatically' %}</h3><p class="muted">{% ui '问题会先进入待处理。严重安全事件可以立即升级，但普通问题必须经过处理、会议结论、规则提案和人工批准。' 'Issues begin as Open. Serious safety events can be escalated immediately, while ordinary issues must go through handling, a meeting decision, a rule proposal, and human approval.' %}</p></article></section>
+{% endblock %}
