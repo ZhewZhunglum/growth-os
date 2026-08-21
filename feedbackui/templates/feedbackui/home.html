@@ -1,0 +1,89 @@
+{% extends "base.html" %}
+{% block title %}表现、GEO 与学习 · PUKO{% endblock %}
+{% block page_title %}表现、GEO 与学习{% endblock %}
+{% block content %}
+<section class="hero-panel config-hero">
+  <div><p class="eyebrow">Daily Operations 反馈回路</p><h2>把今天看到的结果，变成下一轮可审核的建议</h2>
+  <p>这里只追加数据，不覆盖历史；不上传图片或视频，不调用付费 API。真实的 0 是“有数据且值为 0”，没有拿到数据要明确选择“缺失”。</p></div>
+  <div class="status-pill"><span></span> Learning 只保存为待人工决定</div>
+</section>
+
+<section class="metric-grid" aria-label="反馈概览">
+  <article class="metric-card"><span>我记录的平台数据</span><strong>{{ performance_count }}</strong><small>人工或粘贴 CSV</small></article>
+  <article class="metric-card"><span>我记录的 GEO 结果</span><strong>{{ geo_count }}</strong><small>与 Search Visibility 分开</small></article>
+  <article class="metric-card"><span>我的学习版本</span><strong>{{ learning_count }}</strong><small>含修订，不自动执行</small></article>
+</section>
+
+<section class="section-heading"><div><p class="eyebrow">第一步</p><h2>追加平台表现</h2></div><span class="section-note">不会修改旧记录</span></section>
+<div class="config-grid">
+  <section class="detail-panel">
+    <p class="eyebrow">单条人工记录</p><h3>记录一个指标</h3>
+    <form method="post" action="{% url 'feedback:performance-manual' %}" class="config-form">
+      {% csrf_token %}{{ manual_form.as_p }}<button class="button button-primary" type="submit">追加这条表现数据</button>
+    </form>
+  </section>
+  <section class="detail-panel">
+    <p class="eyebrow">粘贴 CSV</p><h3>一次追加多条指标</h3>
+    <form method="post" action="{% url 'feedback:performance-csv' %}" class="config-form">
+      {% csrf_token %}{{ csv_form.as_p }}<button class="button button-primary" type="submit">检查并追加 CSV</button>
+    </form>
+  </section>
+</div>
+
+{% if can_configure_geo %}
+<section class="section-heading"><div><p class="eyebrow">GEO 设置</p><h2>先建立问题组和问题</h2></div><span class="section-note">仅 Owner / Admin，版本创建后不可修改</span></section>
+<div class="config-grid">
+  <section class="detail-panel">
+    <p class="eyebrow">不可变版本</p><h3>新建一个问题组版本</h3>
+    <p class="muted">同一问题组要修改时，请创建 v2，而不是覆盖 v1。</p>
+    <form method="post" action="{% url 'feedback:geo-panel-version' %}" class="config-form">
+      {% csrf_token %}{{ panel_version_form.as_p }}<button class="button button-primary" type="submit">创建问题组版本</button>
+    </form>
+  </section>
+  <section class="detail-panel">
+    <p class="eyebrow">确切版本下的问题</p><h3>添加一个 GEO 问题</h3>
+    <p class="muted">问题会绑定到所选的确切版本；重复提交相同序号和内容不会重复创建。</p>
+    <form method="post" action="{% url 'feedback:geo-panel-item' %}" class="config-form">
+      {% csrf_token %}{{ panel_item_form.as_p }}<button class="button button-primary" type="submit">添加这个问题</button>
+    </form>
+  </section>
+</div>
+<section class="detail-panel">
+  <h3>最近可配置的问题组</h3>
+  {% for panel in recent_panels %}
+    <p><strong>{{ panel.panel_key }} v{{ panel.version_number }}</strong> · {{ panel.product.name }} · {{ panel.market_code }}/{{ panel.language_code }}<br><small>{{ panel.items.count }} 个问题 · 创建后不可修改</small></p>
+  {% empty %}<p class="muted">尚未建立 GEO 问题组。</p>{% endfor %}
+</section>
+{% endif %}
+
+<section class="section-heading"><div><p class="eyebrow">第二步</p><h2>记录 GEO 回答</h2></div><span class="section-note">只存文本与链接</span></section>
+<section class="detail-panel">
+  <form method="post" action="{% url 'feedback:geo-result' %}" class="config-form">
+    {% csrf_token %}{{ geo_form.as_p }}<button class="button button-primary" type="submit">追加 GEO 结果</button>
+  </form>
+</section>
+
+<section class="section-heading"><div><p class="eyebrow">第三步</p><h2>提出一个 Learning</h2></div><span class="section-note">必须绑定上面的确切证据</span></section>
+<section class="detail-panel">
+  <p class="muted">这里保存的是建议，不是命令。系统不会因此自动创建 Initiative、任务或激活规则。</p>
+  <form method="post" action="{% url 'feedback:learning-proposal' %}" class="config-form">
+    {% csrf_token %}{{ learning_form.as_p }}<button class="button button-primary" type="submit">保存为待人工决定</button>
+  </form>
+</section>
+
+<section class="section-heading"><div><p class="eyebrow">最近记录</p><h2>我追加的历史</h2></div></section>
+<div class="config-grid config-history">
+  <section class="detail-panel"><h3>平台表现</h3>
+    {% if recent_publication_performance or recent_performance %}
+    {% for item in recent_publication_performance %}<p><strong>{{ item.publication.current_gate.channel_account.account_code }} · 发布 {{ item.publication_id }} · {{ item.metric_definition.name }}</strong><br><small>确切发布记录 · {{ item.availability_state }} · {% if item.numeric_value == None %}无数值{% else %}{{ item.numeric_value }} {{ item.unit }}{% endif %} · {{ item.observed_at }}</small></p>{% endfor %}
+    {% for item in recent_performance %}<p><strong>{{ item.channel_account.account_code }} · {{ item.metric_definition.name }}</strong><br><small>账号整体 · {{ item.availability_state }} · {% if item.numeric_value == None %}无数值{% else %}{{ item.numeric_value }} {{ item.unit }}{% endif %} · {{ item.observed_at }}</small></p>{% endfor %}
+    {% else %}<p class="muted">尚无记录。</p>{% endif %}
+  </section>
+  <section class="detail-panel"><h3>GEO 结果</h3>
+    {% for item in recent_geo %}<p><strong>{{ item.panel_item.panel.product.name }} · {{ item.probe_run.provider }}</strong><br><small>{{ item.availability_state }} · 提到品牌：{{ item.brand_mentioned|yesno:"是,否" }} · {{ item.recorded_at }}</small></p>{% empty %}<p class="muted">尚无记录。</p>{% endfor %}
+  </section>
+  <section class="detail-panel"><h3>Learning 提案</h3>
+    {% for item in recent_learning %}<p><strong>{{ item.title }}</strong><br><small>{{ item.product.name }} · v{{ item.version_number }} · {{ item.status }}</small></p>{% empty %}<p class="muted">尚无记录。</p>{% endfor %}
+  </section>
+</div>
+{% endblock %}

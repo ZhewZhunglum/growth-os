@@ -113,4 +113,7 @@ class DashboardTemplateUXTests(SimpleTestCase):
         self.assertNotIn(asset_version.object_key, html)
         self.assertIn("a" * 64, html)
         self.assertIn("当前审核权限已失效", html)
-        self.assertNotIn("<form", html)
+        # The shared header contains only the locale switch.  The immutable
+        # review content below the header must expose no editing form.
+        review_content = html.split("</header>", 1)[1]
+        self.assertNotIn("<form", review_content)

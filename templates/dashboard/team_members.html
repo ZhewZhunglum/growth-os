@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% load dashboard_display ui_i18n %}
+{% block title %}{% ui '员工与权限' 'Team & access' %} · PUKO Growth OS{% endblock %}
+{% block page_title %}{% ui '员工与权限' 'Team & access' %}{% endblock %}
+{% block content %}
+<section class="hero-panel team-hero">
+    <div>
+        <p class="eyebrow">{% ui '谁能做什么' 'Who can do what' %}</p>
+        <h2>{% ui '员工账号和实时权限' 'Staff accounts and live permissions' %}</h2>
+        <p>{% ui '这里显示你有权管理的员工。网页只是操作入口，真正是否允许仍由服务器实时检查有效权限。' 'This page shows staff within your management scope. The server still checks an active permission for every action.' %}</p>
+    </div>
+    <span class="status-pill"><span></span>{{ staff_rows|length }} {% ui '个可管理员工' 'manageable staff' %}</span>
+</section>
+
+<section class="team-list" aria-label="员工列表">
+    {% for member, active_count in staff_rows %}
+    <article class="team-card">
+        <span class="avatar team-avatar">{{ member.username|slice:":1"|upper }}</span>
+        <div>
+            <p class="task-meta">{{ member.role|role_zh }} · {{ member.get_principal_status_display }}</p>
+            <h3>{{ member.display_name|default:member.username }}</h3>
+            <p class="muted">{% ui '用户名' 'Username' %}：{{ member.username }} · {% ui '当前有效权限' 'Active permissions' %} {{ active_count }}</p>
+        </div>
+        <a class="button button-primary task-open-button" href="{% url 'dashboard:team-member-detail' member.id %}">{% ui '查看并管理权限' 'View and manage access' %}</a>
+    </article>
+    {% empty %}
+    <article class="empty-state"><div><h3>{% ui '没有可管理的员工' 'No manageable staff' %}</h3><p>{% ui '这通常表示当前账号没有管理范围内的普通员工。' 'The current account has no staff within its management scope.' %}</p></div></article>
+    {% endfor %}
+</section>
+{% endblock %}

@@ -24,6 +24,21 @@
     <article><span class="task-label">交付检查当前结果</span><p>{% if task.latest_dod %}<strong class="check-result-{{ task.latest_dod.aggregate_result|lower }}">{{ task.latest_dod.aggregate_result|check_result_zh }}</strong> · 第 {{ task.latest_dod.attempt_number }} 次{% else %}尚未检查{% endif %}</p></article>
 </section>
 
+{% if compilation_context %}
+<section class="detail-panel" aria-label="Daily Operations 编译上下文">
+    <p class="eyebrow">Daily Operations 编译上下文（只读）</p>
+    <h3>这项任务要在哪个平台、哪个账号执行</h3>
+    <p class="action-explanation">以下内容来自任务生成时封存的确切 ChannelPlan。这里不能修改；配置变化也不会悄悄改写旧任务。</p>
+    <dl class="submission-summary">
+        <dt>目标平台</dt><dd>{{ channel_plan.platform_code }}</dd>
+        <dt>确切平台账号</dt><dd>{{ channel_plan.channel_account.display_name }}（{{ channel_plan.channel_account.account_code }}）</dd>
+        <dt>运行环境</dt><dd>{{ compilation_context.capability_state.account_environment_binding.runtime_environment.environment_code }} · {{ compilation_context.capability_state.account_environment_binding.runtime_environment.environment_type }}</dd>
+        <dt>能力快照</dt><dd>{{ compilation_context.capability_state.capability_code }} · {{ compilation_context.capability_state.state }} · v{{ compilation_context.capability_state.state_version }}</dd>
+        <dt>计划目标</dt><dd>{% for key, value in plan_goal_items %}{{ key }}：{{ value }}{% if not forloop.last %}<br>{% endif %}{% empty %}未填写结构化目标{% endfor %}</dd>
+    </dl>
+</section>
+{% endif %}
+
 <section class="detail-columns">
     <article class="detail-panel">
         <p class="eyebrow">任务合同</p><h3>开始前与交付时要核对什么</h3>

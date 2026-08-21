@@ -927,6 +927,11 @@ class ReleaseGateRecord(ImmutableFact):
     def current_blockers(self, *, at=None, include_gate_state=True) -> list[str]:
         at = at or timezone.now()
         blockers: list[str] = []
+        latest_asset_version = self.primary_asset_version.content_asset.versions.order_by(
+            "-version_number"
+        ).first()
+        if latest_asset_version is None or latest_asset_version.pk != self.primary_asset_version_id:
+            blockers.append("PRIMARY_ASSET_VERSION_NOT_LATEST")
         required_policies, has_contract_snapshot = required_policy_versions_for_contract(
             self.task_contract_version,
             at=at,

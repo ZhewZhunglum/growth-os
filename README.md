@@ -1,26 +1,40 @@
 # Growth OS
 
-Growth OS is the internal workflow system for the frozen PUKO Dogfood V1.
+Growth OS is PUKO's internal Daily Operations system.  Its V1 goal is concrete:
+run one daily evidence-to-publication loop inside the system, then feed the
+result back into the next human decision.
 
 The current milestone provides a cloud-neutral Django foundation with:
 
-- app-owned login and role-ready principals;
+- app-owned login, three staff levels, and capability-based work queues;
 - explicit scoped permission grants;
 - a sealed, versioned product profile;
+- seven-platform evidence collection for Pinterest, Quora, TikTok/TikHub,
+  Shopify, Google Search, Google Search Console, and Google Analytics 4, with
+  API, paired-browser, CSV, and manual-link routes that fail closed;
+- provenance-linked External Evidence, Demand, Opportunity, Initiative,
+  ChannelPlan, and a Task Compiler that binds an exact configuration snapshot;
+- a DeepSeek V4 adapter with deterministic offline mode, explicit Secret
+  references, pricing, and budget limits before live use;
 - versioned task contracts with immutable DoR/DoD checks and state events;
 - immutable content assets, submissions, and one final human review per submission;
 - a fail-closed release gate that binds the exact approved content, policy set,
   publisher permission, channel account, and runtime environment;
-- manual-publication events and proof records (the system never publishes to an
-  external platform automatically);
+- manual, API, and paired-browser publication routes with a mandatory final
+  human confirmation; all network transports are disabled by default;
+- publication-level and channel-level performance, a separate GEO data domain,
+  proposed Learning, Issue/Meeting governance, and controlled rule activation;
 - a recognizable internal dashboard;
 - PostgreSQL and Docker configuration for the target runtime;
 - a lightweight SQLite mode used only when Docker/PostgreSQL is unavailable locally;
 - fail-fast Production configuration and health checks.
 
-The repository carries the frozen specification snapshot in
-`docs/spec/v1-freeze-2026-08-18/`. New ideas do not change that runtime boundary;
-they move to the post-closure backlog unless they fix a demonstrated P0 issue.
+The repository carries the historical specification snapshot in
+`docs/spec/v1-freeze-2026-08-18/`, including the Link-only Errata.  The product
+owner subsequently expanded the runtime target from the minimal closure to the
+complete Daily Operations V1 chain listed above.  Unrelated B2B/CRM, multi-tenant
+SaaS, media hosting/DAM, advertising operations, and automatic rule relaxation
+remain outside V1.
 
 ## Local lightweight start
 
@@ -37,12 +51,17 @@ reuse that exact username with `--owner-username`. The bootstrap is the canonica
 way to create the first Owner and frozen test context. Open
 `http://127.0.0.1:8000/` only after it has created the requested test identities.
 
-After bootstrap and sign-in, an authorized Owner or Operations Admin can create
-a DRAFT task from the dashboard. The form only offers the ACTIVE product's
-current sealed profile and its latest exact task contract. Employees then use
-Today for DoR/DoD and submission, reviewers use Review, and authorized publishers
-use Manual publish. The last step records proof of a publication performed by a
-human; it never sends content to an external platform.
+After bootstrap and sign-in, start on **Daily Operations**.  Create a seven-platform
+batch, save at least one provenance-linked evidence item (automatic route, CSV,
+or manual link), generate an AI/dry-run proposal, and accept it as a human only
+when it is useful.  Move the Opportunity through Initiative and ChannelPlan,
+then compile the exact plan into a real Task.  Employees use **Today** for
+DoR/DoD and link-only submission, a different Principal uses **Content review**,
+and an explicitly authorized publisher uses **Manual publishing**.  API and
+paired-browser publishing may be enabled by reviewed deployment code, but the
+same final human confirmation and fresh Release Gate re-check remain mandatory.
+After publication, use **Performance, GEO & Learning** and **Issues & rule
+governance** to close the feedback loop without automatically activating a rule.
 
 ### Local Dogfood bootstrap
 
@@ -163,6 +182,38 @@ Publication proof records an external publication URL or platform content ID.
 Growth OS is not a file asset store, and V1 requires no separate content-storage
 backend or related credentials.
 
+## External runtime safety
+
+Growth OS can complete a Daily Operations run without any paid or live API:
+use manual links or CSV for evidence, deterministic dry-run proposals for AI,
+and the MANUAL publication route after human confirmation. This is the default.
+
+The DeepSeek adapter targets `deepseek-v4-flash`, but open model weights do not
+mean that DeepSeek's hosted API is automatically free. Live AI requires an
+explicit reviewed runtime factory, an ACTIVE stage-matched `SecretReference`, a
+read-only secret file, current official input/output prices, and hard request
+and dollar budgets. Missing or invalid configuration fails closed. Connector
+and publication networking follow the same rule: they remain disabled until a
+reviewed deployment factory supplies exact routes and transports. User form
+data can never select an endpoint, secret, or runtime factory.
+
+For a file-mounted secret, `SecretReference.reference_name` is the environment
+variable base name (for example `DEEPSEEK_API_KEY`); the runtime resolves its
+`_FILE` setting (for example `DEEPSEEK_API_KEY_FILE`). Do not save the suffix in
+the database, because that would incorrectly resolve `_FILE_FILE`.
+
+Keep these safe defaults unless a live integration has been separately reviewed:
+
+```text
+DAILYOPS_CONNECTORS_ENABLED=0
+DAILYOPS_DEEPSEEK_ENABLED=0
+PUBLICATION_NETWORK_ENABLED=0
+```
+
+Paired-browser work is represented by bounded, idempotent jobs sent only to an
+explicitly allowlisted HTTPS worker. No browser worker, API credential, or
+provider endpoint is assumed by this repository.
+
 ## Staging / production boundary
 
 The repository is deployable source, not evidence of a completed deployment.
@@ -197,10 +248,13 @@ non-sensitive deployment identity:
   "database": "ok",
   "deployment": {
     "stage": "staging-candidate",
-    "revision": "c91160c3b8baec39d955c38e41ee1995af900c3e"
+    "revision": "0123456789abcdef0123456789abcdef01234567"
   }
 }
 ```
+
+The revision above is an illustrative 40-character value, not a deployable
+candidate. Always compare the endpoint with the exact SHA of the image in use.
 
 `GROWTH_OS_DEPLOYMENT_STAGE` is limited to `local`, `staging`,
 `staging-candidate`, or `production`. The revision is baked into the image from
@@ -232,10 +286,18 @@ $env:DATABASE_ENGINE='sqlite'
 .\scripts\verify-local.ps1
 ```
 
-The full test suite currently exercises identity, sealed profiles, task checks,
-content review, idempotency, optimistic locking, stale-context detection, and
-manual release-gate behavior. SQLite passing is a local development checkpoint;
-PostgreSQL/Staging evidence is still required before release.
+The full test suite exercises identity and exact Grants, sealed configuration,
+seven-platform collection outcomes, provenance and data-domain isolation,
+human-approved opportunity/task compilation, task checks, link-only content
+review, idempotency, optimistic locking, stale-context detection, fail-closed
+publication, publication-level performance, GEO, Learning, and rule governance.
+It also contains one end-to-end offline Daily Operations V1 test. SQLite passing
+is a local development checkpoint; PostgreSQL/Staging evidence is still required
+before release.
+
+Latest local result (2026-08-21): 332 tests discovered, 328 passed, and four
+PostgreSQL-only two-connection concurrency tests were deliberately skipped on
+SQLite. No real external API or server was used by this verification.
 
 ## Deployment handoff checklist
 

@@ -13,6 +13,14 @@ from django.utils import timezone
 
 from accounts.models import PermissionGrant, Principal
 from contentops.models import ContentAsset, ContentAssetVersion, ReviewDecision, TaskSubmission
+from integrations.connectors.types import Platform
+from integrations.publishing import (
+    PublicationDispatchResult,
+    PublicationDispatchStatus,
+    PublicationMode,
+    PublicationRuntime,
+    PublicationRuntimeConfig,
+)
 from dashboard.review_views import (
     release_detail,
     release_done_action,
@@ -485,7 +493,18 @@ class ReviewReleaseUISliceTests(TestCase):
         allowed = self.client.get(history_url)
         self.assertContains(allowed, f'href="{self.asset_url}"')
         self.reviewer_review.grant_status = PermissionGrant.GrantStatus.REVOKED
-        self.reviewer_review.save(update_fields=["grant_status"])
+        self.reviewer_review.revoked_at = timezone.now()
+        self.reviewer_review.revoked_by_principal = self.owner
+        self.reviewer_review.revocation_reason = "Historical access removal test."
+        self.reviewer_review.save(
+            update_fields=[
+                "grant_status",
+                "revoked_at",
+                "revoked_by_principal",
+                "revocation_reason",
+                "updated_at",
+            ]
+        )
 
         response = self.client.get(history_url)
         self.assertEqual(response.status_code, 200)
@@ -500,6 +519,183 @@ class ReviewReleaseUISliceTests(TestCase):
         self.assertContains(response, f'href="{self.asset_url}"')
         self.assertContains(response, "打开待发布内容")
         self.assertNotContains(response, "/files/assets/")
+
+    def test_release_page_exposes_three_controlled_modes_and_explicit_confirmation(self):
+        self._approve()
+        self._gate_via_ui()
+
+        response = self.client.get(reverse("dashboard:release-detail", args=[self.task.pk]))
+
+        self.assertContains(response, 'value="MANUAL"')
+        self.assertContains(response, 'value="API"')
+        self.assertContains(response, 'value="BROWSER"')
+        self.assertContains(response, 'name="confirmed"')
+        self.assertContains(response, "我确认执行所选发布方式")
+        self.assertContains(response, "API 与受控浏览器方式当前默认关闭")
+
+    def test_release_requires_confirmation_and_rejects_client_supplied_api_proof(self):
+        self._approve()
+        _response, _command, publication = self._gate_via_ui()
+        before_events = PublicationEvent.objects.count()
+
+        missing_confirmation = self.client.post(
+            reverse("dashboard:release-proof-action", args=[self.task.pk]),
+            {
+                "command_id": uuid.uuid4(),
+                "publication": publication.pk,
+                "mode": "MANUAL",
+                "external_publication_id": "must-not-be-recorded",
+            },
+        )
+        self.assertEqual(missing_confirmation.status_code, 400)
+        self.assertContains(missing_confirmation, "这个字段是必填项", status_code=400)
+        self.assertEqual(PublicationEvent.objects.count(), before_events)
+
+        forged_api_result = self.client.post(
+            reverse("dashboard:release-proof-action", args=[self.task.pk]),
+            {
+                "command_id": uuid.uuid4(),
+                "publication": publication.pk,
+                "mode": "API",
+                "confirmed": "on",
+                "external_url": "https://attacker.example/fake-result",
+            },
+        )
+        self.assertEqual(forged_api_result.status_code, 400)
+        self.assertContains(forged_api_result, "只能由受控运行层返回", status_code=400)
+        self.assertEqual(PublicationEvent.objects.count(), before_events)
+
+    def test_api_and_browser_paths_are_default_disabled_and_fail_closed(self):
+        self._approve()
+        _response, _command, publication = self._gate_via_ui()
+        before_events = PublicationEvent.objects.count()
+
+        for mode in ("API", "BROWSER"):
+            with self.subTest(mode=mode):
+                response = self.client.post(
+                    reverse("dashboard:release-proof-action", args=[self.task.pk]),
+                    {
+                        "command_id": uuid.uuid4(),
+                        "publication": publication.pk,
+                        "mode": mode,
+                        "confirmed": "on",
+                    },
+                )
+                self.assertRedirects(
+                    response,
+                    reverse("dashboard:release-detail", args=[self.task.pk]),
+                )
+                publication.refresh_from_db()
+                self.assertEqual(publication.status, Publication.Status.READY_FOR_MANUAL_PUBLISH)
+                self.assertEqual(PublicationEvent.objects.count(), before_events)
+
+    def test_browser_path_uses_explicitly_injected_runtime(self):
+        self._approve()
+        _response, _command, publication = self._gate_via_ui()
+
+        class SuccessfulBrowserTransport:
+            def __init__(self):
+                self.calls = []
+
+            def dispatch(self, request):
+                self.calls.append(request)
+                return PublicationDispatchResult(
+                    platform=request.platform,
+                    mode=request.mode,
+                    provider="fake-quora-browser-worker",
+                    status=PublicationDispatchStatus.SUCCEEDED,
+                    operation_key=request.operation_key,
+                    external_url="https://www.quora.com/answer/fake-browser-proof",
+                    external_publication_id="fake-browser-proof",
+                )
+
+        transport = SuccessfulBrowserTransport()
+        runtime = PublicationRuntime(
+            PublicationRuntimeConfig(
+                {(Platform.QUORA, PublicationMode.BROWSER): transport}
+            )
+        )
+        command_id = uuid.uuid4()
+        with patch(
+            "dashboard.review_views.get_publication_runtime",
+            return_value=runtime,
+        ) as runtime_factory:
+            response = self.client.post(
+                reverse("dashboard:release-proof-action", args=[self.task.pk]),
+                {
+                    "command_id": command_id,
+                    "publication": publication.pk,
+                    "mode": "BROWSER",
+                    "confirmed": "on",
+                },
+            )
+
+        self.assertRedirects(
+            response, reverse("dashboard:release-detail", args=[self.task.pk])
+        )
+        runtime_factory.assert_called_once_with()
+        self.assertEqual(len(transport.calls), 1)
+        self.assertEqual(transport.calls[0].operation_key, str(command_id))
+        publication.refresh_from_db()
+        self.assertEqual(publication.status, Publication.Status.MANUAL_PUBLISHED_RECORDED)
+        self.assertTrue(
+            publication.events.filter(
+                command_id=command_id,
+                event_type=PublicationEvent.EventType.MANUAL_PUBLISHED_RECORDED,
+            ).exists()
+        )
+
+    def test_manual_path_never_loads_the_network_runtime_factory(self):
+        self._approve()
+        _response, _command, publication = self._gate_via_ui()
+
+        with patch(
+            "dashboard.review_views.get_publication_runtime",
+            side_effect=AssertionError("manual mode must not build a network runtime"),
+        ) as runtime_factory:
+            response = self.client.post(
+                reverse("dashboard:release-proof-action", args=[self.task.pk]),
+                {
+                    "command_id": uuid.uuid4(),
+                    "publication": publication.pk,
+                    "mode": "MANUAL",
+                    "confirmed": "on",
+                    "external_publication_id": "manual-without-runtime",
+                },
+            )
+
+        self.assertRedirects(
+            response, reverse("dashboard:release-detail", args=[self.task.pk])
+        )
+        runtime_factory.assert_not_called()
+        publication.refresh_from_db()
+        self.assertEqual(publication.status, Publication.Status.MANUAL_PUBLISHED_RECORDED)
+
+    @override_settings(
+        PUBLICATION_NETWORK_ENABLED=True,
+        PUBLICATION_RUNTIME_FACTORY="does.not.exist",
+    )
+    def test_invalid_runtime_factory_rejects_browser_without_an_event(self):
+        self._approve()
+        _response, _command, publication = self._gate_via_ui()
+        before_events = PublicationEvent.objects.count()
+
+        response = self.client.post(
+            reverse("dashboard:release-proof-action", args=[self.task.pk]),
+            {
+                "command_id": uuid.uuid4(),
+                "publication": publication.pk,
+                "mode": "BROWSER",
+                "confirmed": "on",
+            },
+        )
+
+        self.assertRedirects(
+            response, reverse("dashboard:release-detail", args=[self.task.pk])
+        )
+        publication.refresh_from_db()
+        self.assertEqual(publication.status, Publication.Status.READY_FOR_MANUAL_PUBLISH)
+        self.assertEqual(PublicationEvent.objects.count(), before_events)
 
     def test_today_action_counts_are_permission_filtered_at_every_stage(self):
         self.client.force_login(self.outsider)
@@ -527,6 +723,8 @@ class ReviewReleaseUISliceTests(TestCase):
             {
                 "command_id": uuid.uuid4(),
                 "publication": publication.pk,
+                "mode": "MANUAL",
+                "confirmed": "on",
                 "external_publication_id": "today-count-proof",
             },
         )
@@ -599,6 +797,8 @@ class ReviewReleaseUISliceTests(TestCase):
         proof_payload = {
             "command_id": proof_command,
             "publication": publication.pk,
+            "mode": "MANUAL",
+            "confirmed": "on",
             "external_url": "https://www.quora.com/answer/manual-123",
             "external_publication_id": "manual-123",
         }
@@ -654,6 +854,8 @@ class ReviewReleaseUISliceTests(TestCase):
             {
                 "command_id": uuid.uuid4(),
                 "publication": publication.pk,
+                "mode": "MANUAL",
+                "confirmed": "on",
                 "external_publication_id": "private-proof",
                 "external_url": published_url,
             },
@@ -678,10 +880,10 @@ class ReviewReleaseUISliceTests(TestCase):
         self.assertContains(owner_response, published_url)
         self.assertContains(owner_response, "private-proof")
 
-        self.publisher_grant.valid_until = timezone.now() - timedelta(seconds=1)
-        self.publisher_grant.save(update_fields=["valid_until", "updated_at"])
+        expired_at = self.publisher_grant.valid_until + timedelta(seconds=1)
         self.client.force_login(self.publisher)
-        stale_publisher_response = self.client.get(detail_url)
+        with patch("accounts.authorization.timezone.now", return_value=expired_at):
+            stale_publisher_response = self.client.get(detail_url)
         self.assertEqual(stale_publisher_response.status_code, 200)
         self.assertNotContains(stale_publisher_response, f'href="{published_url}"')
         self.assertNotContains(stale_publisher_response, "private-proof")
@@ -692,17 +894,21 @@ class ReviewReleaseUISliceTests(TestCase):
     def test_expired_publish_grant_after_ready_writes_no_publication_event(self):
         self._approve()
         _response, _command, publication = self._gate_via_ui()
-        self.publisher_grant.valid_until = timezone.now() - timedelta(seconds=1)
-        self.publisher_grant.save(update_fields=["valid_until", "updated_at"])
+        expired_at = self.publisher_grant.valid_until + timedelta(seconds=1)
         before_events = PublicationEvent.objects.count()
-        response = self.client.post(
-            reverse("dashboard:release-proof-action", args=[self.task.pk]),
-            {
-                "command_id": uuid.uuid4(),
-                "publication": publication.pk,
-                "external_publication_id": "not-recorded",
-            },
-        )
+        with patch("accounts.authorization.timezone.now", return_value=expired_at), patch(
+            "releasegate.services.timezone.now", return_value=expired_at
+        ):
+            response = self.client.post(
+                reverse("dashboard:release-proof-action", args=[self.task.pk]),
+                {
+                    "command_id": uuid.uuid4(),
+                    "publication": publication.pk,
+                    "mode": "MANUAL",
+                    "confirmed": "on",
+                    "external_publication_id": "not-recorded",
+                },
+            )
         self.assertRedirects(response, reverse("dashboard:release-detail", args=[self.task.pk]))
         self.assertEqual(PublicationEvent.objects.count(), before_events)
         publication.refresh_from_db()
@@ -714,7 +920,7 @@ class ReviewReleaseUISliceTests(TestCase):
         root_command = uuid.uuid4()
 
         with patch(
-            "dashboard.review_views.record_manual_publication_proof",
+            "dashboard.review_views.dispatch_confirmed_publication",
             side_effect=ValidationError("Simulated publication credential failure."),
         ):
             response = self.client.post(
@@ -722,6 +928,8 @@ class ReviewReleaseUISliceTests(TestCase):
                 {
                     "command_id": root_command,
                     "publication": publication.pk,
+                    "mode": "MANUAL",
+                    "confirmed": "on",
                     "external_publication_id": "must-not-be-recorded",
                 },
             )

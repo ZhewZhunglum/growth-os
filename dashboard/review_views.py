@@ -4,7 +4,7 @@ import uuid
 
 from django.contrib import messages
 from django.contrib.auth.decorators import login_required
-from django.core.exceptions import PermissionDenied, ValidationError
+from django.core.exceptions import ImproperlyConfigured, PermissionDenied, ValidationError
 from django.db import transaction
 from django.http import Http404, HttpRequest, HttpResponse
 from django.shortcuts import get_object_or_404, redirect, render
@@ -19,8 +19,13 @@ from dashboard.review_forms import (
     ReleaseGateForm,
     ReviewDecisionForm,
 )
+from integrations.publishing import PublicationMode, get_publication_runtime
 from releasegate.models import ChannelAccount, Publication, PublicationEvent, RuntimeEnvironment
-from releasegate.services import orchestrate_v1_release_gate, record_manual_publication_proof
+from releasegate.publishing import (
+    dispatch_confirmed_publication,
+    prepare_human_publication_confirmation,
+)
+from releasegate.services import orchestrate_v1_release_gate
 from workflow.models import Task
 
 
@@ -456,7 +461,7 @@ def release_gate_action(request: HttpRequest, task_id) -> HttpResponse:
             command_id=form.cleaned_data["command_id"],
         )
         if result.gate.outcome == "PASSED":
-            messages.success(request, "门禁已通过。请你在平台上人工发布，然后回来登记网址或内容 ID。")
+            messages.success(request, "门禁已通过。请选择发布方式并完成最终人工确认；未配置的 API/浏览器路径会直接拒绝。")
         else:
             messages.error(request, "门禁未通过，系统没有发布任何内容。请先处理页面显示的阻塞原因。")
     except ValidationError as error:
@@ -495,14 +500,36 @@ def release_proof_action(request: HttpRequest, task_id) -> HttpResponse:
         )
     publication = form.cleaned_data["publication"]
     try:
-        record_manual_publication_proof(
+        root_command = form.cleaned_data["command_id"]
+        mode = PublicationMode(form.cleaned_data["mode"])
+        confirmation = prepare_human_publication_confirmation(
             publication=publication,
             publisher_principal=request.user,
-            command_id=form.cleaned_data["command_id"],
-            external_url=form.cleaned_data["external_url"],
-            external_publication_id=form.cleaned_data["external_publication_id"],
+            mode=mode,
+            confirmation_id=_subcommand(root_command, "human-publish-confirmation"),
+            confirmed=form.cleaned_data["confirmed"],
         )
-        messages.success(request, "人工发布凭证已保存；系统没有执行任何外部发布动作。")
+        runtime = None
+        if mode is not PublicationMode.MANUAL:
+            try:
+                runtime = get_publication_runtime()
+            except ImproperlyConfigured as error:
+                raise ValidationError(
+                    {"mode": "受控发布运行层配置无效；本次没有执行发布。"}
+                ) from error
+        result = dispatch_confirmed_publication(
+            publication=publication,
+            publisher_principal=request.user,
+            confirmation=confirmation,
+            command_id=root_command,
+            runtime=runtime,
+            manual_external_url=form.cleaned_data["external_url"],
+            manual_external_publication_id=form.cleaned_data["external_publication_id"],
+        )
+        if result.mode is PublicationMode.MANUAL:
+            messages.success(request, "人工发布确认和外部网址/内容 ID 已保存。")
+        else:
+            messages.success(request, "受控发布已完成，并保存了不可变发布证明。")
     except ValidationError as error:
         messages.error(request, _validation_text(error))
     return redirect("dashboard:release-detail", task_id=task.pk)

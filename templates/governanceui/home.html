@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block title %}问题与规则治理 · PUKO{% endblock %}
+{% block page_title %}问题与规则治理{% endblock %}
+{% block content %}
+<section class="hero-panel governance-hero">
+  <div><p class="eyebrow">Daily Operations 的安全出口</p><h2>先把问题说清楚，再决定要不要改规则。</h2>
+  <p>员工上报不会自动改规则；Learning 只能提出建议。规则必须经过离线回放、影子验证、人工批准、Canary，最后由有权的人明确启用。</p></div>
+  <span class="status-pill"><span></span> 所有规则动作均人工受控</span>
+</section>
+
+<section class="action-queue-grid" style="margin-top:18px">
+  <a class="action-queue-card" href="{% url 'governanceui:issue-create' %}"><span>问题</span><strong>{{ open_issue_count }}</strong><small>提交阻塞、安全事件或规则冲突</small></a>
+  <a class="action-queue-card" href="{% url 'governanceui:meeting-create' %}"><span>会议</span><strong>{{ meetings|length }}</strong><small>记录参与人和结构化结论</small></a>
+  <a class="action-queue-card" href="{% url 'governanceui:proposal-create' %}"><span>已激活规则提案</span><strong>{{ active_policy_count }}</strong><small>新建提案不会自动生效</small></a>
+</section>
+
+<section class="section-heading config-heading"><div><p class="eyebrow">规则候选配置</p><h2>规则定义与不可变版本</h2></div><div><a class="button button-secondary" href="{% url 'governanceui:policy-definition-create' %}">新建规则定义</a> <a class="button button-primary" href="{% url 'governanceui:policy-version-create' %}">追加候选版本</a></div></section>
+<section class="product-list">
+{% for definition in policy_definitions %}
+  <article class="product-card"><span class="product-icon">规</span><div class="product-copy"><div class="product-title"><h3>{{ definition.name }}</h3><span>{{ definition.policy_code }}</span></div><p>{% if definition.is_mandatory %}发布硬门槛{% else %}观察项{% endif %} · {{ definition.versions.count }} 个不可变版本</p></div><a class="button button-secondary" href="{% url 'governanceui:policy-version-create' %}?definition={{ definition.id }}">追加版本</a></article>
+{% empty %}<article class="empty-state"><span class="empty-number">0</span><div><h3>还没有规则定义</h3><p>先建立稳定编号，再追加候选版本。</p></div></article>{% endfor %}
+</section>
+
+<section class="section-heading"><div><p class="eyebrow">当前问题</p><h2>待处理问题</h2></div><a class="button button-primary" href="{% url 'governanceui:issue-create' %}">上报问题</a></section>
+<section class="task-list">
+{% for issue in issues %}
+  <article class="task-card"><header class="task-card-header"><div><p class="task-meta">{{ issue.issue_key }} · {{ issue.get_issue_type_display }}</p><h3>{{ issue.title }}</h3></div><span class="task-state task-state-{{ issue.current_state|lower }}">{{ issue.get_current_state_display }}</span></header>
+  <div class="task-section"><span class="task-label">严重程度</span><p>{{ issue.get_severity_display }} · {{ issue.description|truncatechars:180 }}</p></div>
+  <footer class="task-card-footer"><span>{{ issue.created_at }}</span><a class="button button-primary" href="{% url 'governanceui:issue-detail' issue.id %}">处理问题</a></footer></article>
+{% empty %}<article class="empty-state"><span class="empty-number">0</span><div><h3>没有问题</h3><p>遇到阻塞时从“上报问题”开始。</p></div></article>{% endfor %}
+</section>
+
+<section class="section-heading config-heading"><div><p class="eyebrow">会议治理</p><h2>最近会议</h2></div><a class="button button-secondary" href="{% url 'governanceui:meeting-create' %}">记录会议</a></section>
+<section class="product-list">
+{% for meeting in meetings %}<article class="product-card"><span class="product-icon">会</span><div class="product-copy"><div class="product-title"><h3>{{ meeting.title }}</h3><span>{{ meeting.get_meeting_type_display }}</span></div><p>{{ meeting.occurred_at }} · {{ meeting.decision_count }} 条结论</p></div><a class="button button-secondary" href="{% url 'governanceui:meeting-detail' meeting.id %}">打开</a></article>
+{% empty %}<article class="empty-state"><span class="empty-number">0</span><div><h3>还没有会议记录</h3><p>只有结构化结论才能成为规则提案来源。</p></div></article>{% endfor %}
+</section>
+
+<section class="section-heading config-heading"><div><p class="eyebrow">规则生命周期</p><h2>规则提案</h2></div><a class="button button-secondary" href="{% url 'governanceui:proposal-create' %}">新建提案</a></section>
+<section class="task-list">
+{% for proposal in proposals %}<article class="task-card"><header class="task-card-header"><div><p class="task-meta">{{ proposal.proposal_key }} · v{{ proposal.version_number }}</p><h3>{{ proposal.target_policy_definition.name }}</h3></div><span class="task-state">{{ proposal.get_change_effect_display }}</span></header><div class="task-section"><span class="task-label">候选版本</span><p>Policy v{{ proposal.candidate_policy_version.version_number }} · {{ proposal.get_risk_level_display }} · {{ proposal.validation_runs.count }} 次验证 · {{ proposal.approval_decisions.count }} 次人工决定</p></div><footer class="task-card-footer"><span>{{ proposal.created_at }}</span><a class="button button-primary" href="{% url 'governanceui:proposal-detail' proposal.id %}">查看生命周期</a></footer></article>
+{% empty %}<article class="empty-state"><span class="empty-number">0</span><div><h3>还没有规则提案</h3><p>问题、会议或 Learning 可以发起提案，但不能自行启用。</p></div></article>{% endfor %}
+</section>
+{% endblock %}

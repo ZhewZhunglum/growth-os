@@ -47,6 +47,39 @@ PRINCIPAL_TYPE_LABELS = {
     "SYSTEM": "系统",
 }
 
+ROLE_LABELS = {
+    "OWNER": "负责人",
+    "OPERATIONS_ADMIN": "运营管理员",
+    "OPERATOR": "执行人员",
+}
+
+GRANT_ACTION_LABELS = {
+    "VIEW": "查看",
+    "EDIT": "编辑",
+    "CREATE_TASK": "创建任务",
+    "ASSIGN_TASK": "分配任务",
+    "CANCEL_TASK": "取消任务",
+    "COMPLETE_TASK": "完成任务",
+    "REVIEW": "审核",
+    "APPROVE": "批准",
+    "PUBLISH": "发布",
+    "MANAGE_ACCOUNT": "管理员工和账号",
+    "EMERGENCY_STOP": "紧急停止",
+    "COLLECT_READ_ONLY": "只读采集",
+}
+
+GRANT_SCOPE_LABELS = {
+    "GLOBAL": "全部业务",
+    "PRODUCT": "一个产品",
+    "PLATFORM": "一个平台",
+    "ACCOUNT": "一个发布账号",
+    "SURFACE": "一个页面或功能",
+}
+
+GRANT_EFFECT_LABELS = {"ALLOW": "允许", "DENY": "明确拒绝"}
+GRANT_RISK_LABELS = {"LOW": "低风险", "MEDIUM": "中风险", "HIGH": "高风险", "CRITICAL": "严重风险"}
+GRANT_STATUS_LABELS = {"ACTIVE": "有效记录", "REVOKED": "已撤销", "EXPIRED": "已过期", "SUSPENDED": "已暂停"}
+
 CRITERION_LABELS = {
     "Primary deliverable": "本次主要交付内容是否完整？",
     "primary deliverable": "本次主要交付内容是否完整？",
@@ -81,6 +114,42 @@ def publication_status_zh(value: object) -> str:
 def principal_type_zh(value: object) -> str:
     raw = str(value or "")
     return PRINCIPAL_TYPE_LABELS.get(raw, raw)
+
+
+@register.filter
+def role_zh(value: object) -> str:
+    raw = str(value or "")
+    return ROLE_LABELS.get(raw, raw)
+
+
+@register.filter
+def grant_action_zh(value: object) -> str:
+    raw = str(value or "")
+    return GRANT_ACTION_LABELS.get(raw, raw)
+
+
+@register.filter
+def grant_scope_zh(value: object) -> str:
+    raw = str(value or "")
+    return GRANT_SCOPE_LABELS.get(raw, raw)
+
+
+@register.filter
+def grant_effect_zh(value: object) -> str:
+    raw = str(value or "")
+    return GRANT_EFFECT_LABELS.get(raw, raw)
+
+
+@register.filter
+def grant_risk_zh(value: object) -> str:
+    raw = str(value or "")
+    return GRANT_RISK_LABELS.get(raw, raw)
+
+
+@register.filter
+def grant_status_zh(value: object) -> str:
+    raw = str(value or "")
+    return GRANT_STATUS_LABELS.get(raw, raw)
 
 
 @register.filter

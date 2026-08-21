@@ -146,7 +146,7 @@ class ProvisionStagingStaffTests(TestCase):
             environment_type=RuntimeEnvironment.EnvironmentType.STAGING,
             identity_namespace="staging-identities",
             database_namespace="staging-database",
-            object_storage_namespace="staging-cos-prefix",
+            object_storage_namespace="DISABLED_LINK_ONLY",
             status=RuntimeEnvironment.Status.ACTIVE,
             created_by_principal=self.seed,
             updated_by_principal=self.seed,
@@ -186,7 +186,9 @@ class ProvisionStagingStaffTests(TestCase):
             self.assertEqual(principal.principal_status, Principal.PrincipalStatus.ACTIVE)
 
         management_actions = {
+            PermissionGrant.Action.VIEW,
             PermissionGrant.Action.EDIT,
+            PermissionGrant.Action.COLLECT_READ_ONLY,
             PermissionGrant.Action.CREATE_TASK,
             PermissionGrant.Action.ASSIGN_TASK,
             PermissionGrant.Action.CANCEL_TASK,
@@ -212,10 +214,68 @@ class ProvisionStagingStaffTests(TestCase):
                     product=self.product,
                 ).values_list("action", flat=True)
             ),
-            {PermissionGrant.Action.EDIT},
+            {
+                PermissionGrant.Action.VIEW,
+                PermissionGrant.Action.EDIT,
+                PermissionGrant.Action.COLLECT_READ_ONLY,
+            },
         )
+        for principal in (owner, admin):
+            self.assertTrue(
+                PermissionGrant.objects.filter(
+                    principal=principal,
+                    scope_kind=PermissionGrant.ScopeKind.GLOBAL,
+                    action=PermissionGrant.Action.MANAGE_ACCOUNT,
+                    effect=PermissionGrant.Effect.ALLOW,
+                ).exists()
+            )
+        for principal, expected_actions in (
+            (
+                owner,
+                {
+                    PermissionGrant.Action.VIEW,
+                    PermissionGrant.Action.EDIT,
+                    PermissionGrant.Action.APPROVE,
+                    PermissionGrant.Action.MANAGE_ACCOUNT,
+                },
+            ),
+            (
+                admin,
+                {
+                    PermissionGrant.Action.VIEW,
+                    PermissionGrant.Action.EDIT,
+                    PermissionGrant.Action.APPROVE,
+                    PermissionGrant.Action.MANAGE_ACCOUNT,
+                },
+            ),
+            (
+                operator,
+                {
+                    PermissionGrant.Action.VIEW,
+                    PermissionGrant.Action.EDIT,
+                },
+            ),
+        ):
+            self.assertSetEqual(
+                set(
+                    PermissionGrant.objects.filter(
+                        principal=principal,
+                        scope_kind=PermissionGrant.ScopeKind.GLOBAL,
+                    ).values_list("action", flat=True)
+                ),
+                expected_actions,
+            )
+        for principal in (owner, admin, operator):
+            self.assertEqual(
+                PermissionGrant.objects.filter(
+                    principal=principal,
+                    scope_kind=PermissionGrant.ScopeKind.PLATFORM,
+                    action=PermissionGrant.Action.COLLECT_READ_ONLY,
+                ).count(),
+                7,
+            )
         self.assertFalse(PermissionGrant.objects.filter(action=PermissionGrant.Action.PUBLISH).exists())
-        self.assertEqual(PermissionGrant.objects.count(), 13)
+        self.assertEqual(PermissionGrant.objects.count(), 50)
         now = timezone.now()
         for grant in PermissionGrant.objects.all():
             self.assertIsNotNone(grant.valid_until)
@@ -302,20 +362,43 @@ class ProvisionStagingStaffTests(TestCase):
 
     def test_conflicting_existing_grant_risk_is_not_rewritten(self):
         self._call()
+        owner = Principal.objects.get(username="owner")
         operator = Principal.objects.get(username="operator")
-        conflict = PermissionGrant.objects.get(
+        original = PermissionGrant.objects.get(
             principal=operator,
             scope_kind=PermissionGrant.ScopeKind.PRODUCT,
             product=self.product,
             action=PermissionGrant.Action.EDIT,
         )
-        conflict.risk_level = PermissionGrant.RiskLevel.LOW
-        conflict.save(update_fields=["risk_level", "updated_at"])
+        original.grant_status = PermissionGrant.GrantStatus.REVOKED
+        original.revoked_at = timezone.now()
+        original.revoked_by_principal = owner
+        original.revocation_reason = "Fixture replacement with an intentionally wrong risk."
+        original.save(
+            update_fields=[
+                "grant_status",
+                "revoked_at",
+                "revoked_by_principal",
+                "revocation_reason",
+                "updated_at",
+            ]
+        )
+        conflict = PermissionGrant.objects.create(
+            principal=operator,
+            scope_kind=PermissionGrant.ScopeKind.PRODUCT,
+            product=self.product,
+            action=PermissionGrant.Action.EDIT,
+            effect=PermissionGrant.Effect.ALLOW,
+            risk_level=PermissionGrant.RiskLevel.LOW,
+            valid_from=timezone.now() - timedelta(minutes=1),
+            valid_until=timezone.now() + timedelta(days=30),
+            granted_by_principal=owner,
+        )
 
         with self.assertRaisesMessage(CommandError, "has risk LOW; expected MEDIUM"):
             self._call(passwords=None)
 
-        self.assertEqual(PermissionGrant.objects.count(), 13)
+        self.assertEqual(PermissionGrant.objects.count(), 51)
         self.assertTrue(PermissionGrant.objects.filter(pk=conflict.pk).exists())
         conflict.refresh_from_db()
         self.assertEqual(conflict.risk_level, PermissionGrant.RiskLevel.LOW)
@@ -427,7 +510,7 @@ class ProvisionStagingStaffTests(TestCase):
                 effect=PermissionGrant.Effect.ALLOW,
             ).exists()
         )
-        self.assertEqual(PermissionGrant.objects.count(), 14)
+        self.assertEqual(PermissionGrant.objects.count(), 51)
 
     def test_missing_current_profile_or_contract_fails_without_staff_writes(self):
         self.product.current_profile_version = None

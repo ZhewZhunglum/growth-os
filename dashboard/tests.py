@@ -315,6 +315,7 @@ class ControlledTaskUiTests(TestCase):
         self.assertContains(response, "逐项确认：现在是否具备开工条件？")
         self.assertContains(response, "Reliable sources are ready")
         self.assertContains(response, "本页不会审核、通过门禁或发布内容")
+        self.assertNotContains(response, "Daily Operations 编译上下文（只读）")
         self.assertNotContains(response, "/actions/review/")
         self.assertNotContains(response, "/actions/gate/")
         self.assertNotContains(response, "/actions/publish/")

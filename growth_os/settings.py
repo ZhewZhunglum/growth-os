@@ -45,6 +45,18 @@ def positive_int_env(name: str, default: int) -> int:
     return value
 
 
+def boolean_env(name: str, default: bool = False) -> bool:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    normalized = raw_value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off", ""}:
+        return False
+    raise ImproperlyConfigured(f"{name} must be an explicit boolean.")
+
+
 def secret_env_or_file(
     name: str,
     *,
@@ -104,6 +116,11 @@ CSRF_TRUSTED_ORIGINS = csv_env("DJANGO_CSRF_TRUSTED_ORIGINS")
 if not IS_LOCAL and not ALLOWED_HOSTS:
     raise ImproperlyConfigured("DJANGO_ALLOWED_HOSTS must be explicit outside local development.")
 
+# Networked Daily Operations and publication adapters are opt-in deployment
+# composition.  Local/source defaults stay offline and therefore cost nothing.
+PUBLICATION_NETWORK_ENABLED = boolean_env("PUBLICATION_NETWORK_ENABLED", False)
+PUBLICATION_RUNTIME_FACTORY = os.getenv("PUBLICATION_RUNTIME_FACTORY", "").strip()
+
 INSTALLED_APPS = [
     "django.contrib.admin",
     "django.contrib.auth",
@@ -117,6 +134,12 @@ INSTALLED_APPS = [
     "workflow",
     "contentops",
     "releasegate",
+    "insights",
+    "intelligence",
+    "governance",
+    "dailyops",
+    "feedbackui",
+    "governanceui",
     "dashboard",
 ]
 
@@ -124,6 +147,7 @@ MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
     "whitenoise.middleware.WhiteNoiseMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
+    "django.middleware.locale.LocaleMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
@@ -208,7 +232,11 @@ AUTH_PASSWORD_VALIDATORS = [
     {"NAME": "django.contrib.auth.password_validation.NumericPasswordValidator"},
 ]
 
-LANGUAGE_CODE = "en-us"
+LANGUAGE_CODE = "zh-hans"
+LANGUAGES = [
+    ("zh-hans", "简体中文"),
+    ("en", "English"),
+]
 TIME_ZONE = "Asia/Shanghai"
 USE_I18N = True
 USE_TZ = True

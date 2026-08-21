@@ -1,0 +1,7 @@
+{% extends "base.html" %}
+{% block title %}记录会议 · PUKO{% endblock %}
+{% block page_title %}记录会议{% endblock %}
+{% block content %}
+<a class="back-link" href="{% url 'governanceui:home' %}">← 返回问题与规则治理</a>
+<section class="detail-columns"><article class="detail-panel action-panel"><p class="eyebrow">结构化留痕</p><h3>会议基本信息</h3><form class="config-form" method="post">{% csrf_token %}{{ form.as_p }}<button class="button button-primary" type="submit">创建会议记录</button></form></article><article class="detail-panel"><p class="eyebrow">下一步</p><h3>创建后再记录结论</h3><p class="muted">会议摘要本身不能改规则。只有单独保存的结构化结论，才可以作为 Rule Proposal 的 typed source。</p></article></section>
+{% endblock %}

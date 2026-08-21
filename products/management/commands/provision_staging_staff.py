@@ -27,12 +27,28 @@ from workflow.models import TaskContractVersion
 
 
 PRODUCT_MANAGEMENT_ACTIONS = (
+    PermissionGrant.Action.VIEW,
     PermissionGrant.Action.EDIT,
+    PermissionGrant.Action.COLLECT_READ_ONLY,
     PermissionGrant.Action.CREATE_TASK,
     PermissionGrant.Action.ASSIGN_TASK,
     PermissionGrant.Action.CANCEL_TASK,
     PermissionGrant.Action.COMPLETE_TASK,
     PermissionGrant.Action.REVIEW,
+)
+OPERATOR_PRODUCT_ACTIONS = (
+    PermissionGrant.Action.VIEW,
+    PermissionGrant.Action.EDIT,
+    PermissionGrant.Action.COLLECT_READ_ONLY,
+)
+DAILY_COLLECTION_PLATFORMS = (
+    "PINTEREST",
+    "QUORA",
+    "TIKTOK",
+    "SHOPIFY",
+    "GOOGLE_SEARCH",
+    "GOOGLE_SEARCH_CONSOLE",
+    "GOOGLE_ANALYTICS_4",
 )
 
 
@@ -110,7 +126,7 @@ class Command(BaseCommand):
                 display_name="Staging Operator",
                 role=Principal.Role.OPERATOR,
                 password_environment="STAGING_OPERATOR_PASSWORD",
-                actions=(PermissionGrant.Action.EDIT,),
+                actions=OPERATOR_PRODUCT_ACTIONS,
             ),
         )
         folded = [spec.username.casefold() for spec in specs]
@@ -311,7 +327,13 @@ class Command(BaseCommand):
 
     @staticmethod
     def _active_exact_grants(
-        *, principal: Principal, action: str, scope_kind: str, product: Product | None, account_ref: str
+        *,
+        principal: Principal,
+        action: str,
+        scope_kind: str,
+        product: Product | None,
+        platform_code: str,
+        account_ref: str,
     ) -> list[PermissionGrant]:
         now = timezone.now()
         return list(
@@ -320,7 +342,7 @@ class Command(BaseCommand):
                 action=action,
                 scope_kind=scope_kind,
                 product=product,
-                platform_code="",
+                platform_code=platform_code,
                 account_ref=account_ref,
                 surface_ref="",
                 grant_status=PermissionGrant.GrantStatus.ACTIVE,
@@ -351,6 +373,7 @@ class Command(BaseCommand):
         scope_kind: str,
         risk_level: str,
         product: Product | None = None,
+        platform_code: str = "",
         publish_context: PublishContext | None = None,
         allow_create: bool,
     ) -> PermissionGrant:
@@ -361,6 +384,7 @@ class Command(BaseCommand):
             action=action,
             scope_kind=scope_kind,
             product=product if scope_kind == PermissionGrant.ScopeKind.PRODUCT else None,
+            platform_code=platform_code if scope_kind == PermissionGrant.ScopeKind.PLATFORM else "",
             account_ref=account_ref,
         )
         current_allows = [
@@ -425,6 +449,7 @@ class Command(BaseCommand):
                 principal=principal,
                 scope_kind=scope_kind,
                 product=product if scope_kind == PermissionGrant.ScopeKind.PRODUCT else None,
+                platform_code=platform_code if scope_kind == PermissionGrant.ScopeKind.PLATFORM else "",
                 account_ref=account_ref,
                 action=action,
                 effect=PermissionGrant.Effect.ALLOW,
@@ -443,10 +468,10 @@ class Command(BaseCommand):
             "action": action,
             "scope_kind": scope_kind,
             "product": product,
+            "platform_code": platform_code,
         }
         if publish_context:
             context.update(
-                platform_code=publish_context.channel.platform_code,
                 account_ref=publish_context.channel.account_code,
             )
         decision = resolve_authorization(**context)
@@ -483,13 +508,96 @@ class Command(BaseCommand):
             for spec in specs:
                 principal = principals[spec.key]
                 for action in spec.actions:
+                    risk_level = (
+                        PermissionGrant.RiskLevel.LOW
+                        if action in {
+                            PermissionGrant.Action.VIEW,
+                            PermissionGrant.Action.COLLECT_READ_ONLY,
+                        }
+                        else PermissionGrant.RiskLevel.MEDIUM
+                    )
                     self._ensure_grant(
                         principal=principal,
                         grantor=owner,
                         action=action,
                         scope_kind=PermissionGrant.ScopeKind.PRODUCT,
-                        risk_level=PermissionGrant.RiskLevel.MEDIUM,
+                        risk_level=risk_level,
                         product=product,
+                        allow_create=create_set,
+                    )
+
+            # Team/configuration pages themselves are controlled by one exact
+            # global Grant.  The service layer still limits Admin to Operator
+            # accounts and forbids high-risk delegation.
+            for key, risk in (
+                ("owner", PermissionGrant.RiskLevel.CRITICAL),
+                ("admin", PermissionGrant.RiskLevel.HIGH),
+            ):
+                self._ensure_grant(
+                    principal=principals[key],
+                    grantor=owner,
+                    action=PermissionGrant.Action.MANAGE_ACCOUNT,
+                    scope_kind=PermissionGrant.ScopeKind.GLOBAL,
+                    risk_level=risk,
+                    allow_create=create_set,
+                )
+
+            # Governance permissions are explicit GLOBAL capabilities.  An
+            # Operator may report/handle an Issue, while only Owner/Admin can
+            # record meeting decisions or approve rule-governance stages.
+            for key, actions in (
+                (
+                    "owner",
+                    (
+                        PermissionGrant.Action.VIEW,
+                        PermissionGrant.Action.EDIT,
+                        PermissionGrant.Action.APPROVE,
+                    ),
+                ),
+                (
+                    "admin",
+                    (
+                        PermissionGrant.Action.VIEW,
+                        PermissionGrant.Action.EDIT,
+                        PermissionGrant.Action.APPROVE,
+                    ),
+                ),
+                (
+                    "operator",
+                    (
+                        PermissionGrant.Action.VIEW,
+                        PermissionGrant.Action.EDIT,
+                    ),
+                ),
+            ):
+                for action in actions:
+                    risk_level = (
+                        PermissionGrant.RiskLevel.LOW
+                        if action == PermissionGrant.Action.VIEW
+                        else PermissionGrant.RiskLevel.HIGH
+                        if action == PermissionGrant.Action.APPROVE
+                        else PermissionGrant.RiskLevel.MEDIUM
+                    )
+                    self._ensure_grant(
+                        principal=principals[key],
+                        grantor=owner,
+                        action=action,
+                        scope_kind=PermissionGrant.ScopeKind.GLOBAL,
+                        risk_level=risk_level,
+                        allow_create=create_set,
+                    )
+
+            # Daily research is read-only and explicitly scoped per platform;
+            # no role name is used as an authorization shortcut.
+            for principal in principals.values():
+                for platform_code in DAILY_COLLECTION_PLATFORMS:
+                    self._ensure_grant(
+                        principal=principal,
+                        grantor=owner,
+                        action=PermissionGrant.Action.COLLECT_READ_ONLY,
+                        scope_kind=PermissionGrant.ScopeKind.PLATFORM,
+                        risk_level=PermissionGrant.RiskLevel.LOW,
+                        platform_code=platform_code,
                         allow_create=create_set,
                     )
 

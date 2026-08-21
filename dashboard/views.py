@@ -26,6 +26,7 @@ from dashboard.forms import (
     WithdrawSubmissionForm,
     criterion_label,
 )
+from intelligence.models import TaskCompilationContext
 from products.models import ProductProfileVersion
 from releasegate.models import Publication
 from workflow.models import Task, TaskAssignment, TaskCheckRun, TaskStateEvent
@@ -184,8 +185,24 @@ def _detail_context(
     _decorate_task(task)
     if action_kind is None:
         action_kind, action_form = _action_form(task, user)
+    compilation_context = (
+        TaskCompilationContext.objects.select_related(
+            "channel_plan__channel_account",
+            "capability_state__account_environment_binding__channel_account",
+            "capability_state__account_environment_binding__runtime_environment",
+        )
+        .filter(task_id=task.pk)
+        .first()
+    )
     return {
         "task": task,
+        "compilation_context": compilation_context,
+        "channel_plan": compilation_context.channel_plan if compilation_context else None,
+        "plan_goal_items": (
+            list(compilation_context.channel_plan.goal.items())
+            if compilation_context and isinstance(compilation_context.channel_plan.goal, dict)
+            else []
+        ),
         "action_kind": action_kind,
         "action_form": action_form,
         "submission": task.submissions.order_by("-submission_number").first(),

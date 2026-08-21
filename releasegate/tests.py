@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import timedelta
+from unittest.mock import patch
 
 from django.core.exceptions import ValidationError
 from django.test import TestCase
@@ -622,7 +623,18 @@ class ReleaseGateDomainTests(TestCase):
 
     def test_v1_service_missing_evaluator_rolls_back_without_half_gate_or_event(self):
         self.rule_evaluation_grant.grant_status = PermissionGrant.GrantStatus.REVOKED
-        self.rule_evaluation_grant.save()
+        self.rule_evaluation_grant.revoked_at = timezone.now()
+        self.rule_evaluation_grant.revoked_by_principal = self.owner
+        self.rule_evaluation_grant.revocation_reason = "Evaluator authorization withdrawn for test."
+        self.rule_evaluation_grant.save(
+            update_fields=[
+                "grant_status",
+                "revoked_at",
+                "revoked_by_principal",
+                "revocation_reason",
+                "updated_at",
+            ]
+        )
         original_event_count = self.publication.events.count()
         with self.assertRaises(ValidationError):
             orchestrate_v1_release_gate(
@@ -639,20 +651,20 @@ class ReleaseGateDomainTests(TestCase):
         self.assertEqual(ReleaseGateRecord.objects.count(), 0)
 
     def test_v1_service_expired_publish_grant_before_gate_leaves_zero_half_facts(self):
-        self.publish_grant.valid_until = timezone.now() - timedelta(seconds=1)
-        self.publish_grant.save(update_fields=["valid_until", "updated_at"])
+        expired_at = self.publish_grant.valid_until + timedelta(seconds=1)
         before_publications = Publication.objects.count()
         before_events = PublicationEvent.objects.count()
 
-        with self.assertRaises(ValidationError):
-            orchestrate_v1_release_gate(
-                task=self.task,
-                submission=self.submission,
-                publisher_principal=self.publisher,
-                channel_account=self.channel_account,
-                runtime_environment=self.environment,
-                command_id=uuid.uuid4(),
-            )
+        with patch("releasegate.services.timezone.now", return_value=expired_at):
+            with self.assertRaises(ValidationError):
+                orchestrate_v1_release_gate(
+                    task=self.task,
+                    submission=self.submission,
+                    publisher_principal=self.publisher,
+                    channel_account=self.channel_account,
+                    runtime_environment=self.environment,
+                    command_id=uuid.uuid4(),
+                )
 
         self.assertEqual(Publication.objects.count(), before_publications)
         self.assertEqual(PublicationEvent.objects.count(), before_events)
