@@ -2,12 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import uuid
-from pathlib import Path
 
 from django.contrib import messages
 from django.contrib.auth.decorators import login_required
 from django.core.exceptions import ObjectDoesNotExist, PermissionDenied, ValidationError
-from django.core.files.storage import default_storage
 from django.db import transaction
 from django.db.models import F, Prefetch, Q
 from django.http import Http404, HttpRequest, HttpResponse
@@ -20,36 +18,21 @@ from contentops.models import ContentAsset, ContentAssetVersion, ReviewDecision,
 from dashboard.forms import (
     AssignmentForm,
     CancelTaskForm,
+    DeliveryDoDForm,
     DoRForm,
     ResumeDraftForm,
     StartWorkForm,
     TaskCreateForm,
-    UploadDoDForm,
     WithdrawSubmissionForm,
     criterion_label,
 )
-from dashboard.storage_cleanup import StoredObjectWrite
 from products.models import ProductProfileVersion
 from releasegate.models import Publication
 from workflow.models import Task, TaskAssignment, TaskCheckRun, TaskStateEvent
 
 
-MAX_UPLOAD_BYTES = 100 * 1024 * 1024
-ALLOWED_UPLOAD_TYPES = {
-    "application/json",
-    "application/msword",
-    "application/pdf",
-    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    "image/jpeg",
-    "image/png",
-    "image/webp",
-    "text/csv",
-    "text/markdown",
-    "text/plain",
-    "video/mp4",
-    "video/quicktime",
-    "video/webm",
-}
+EXTERNAL_URL_MIME_TYPE = "text/uri-list"
+EXTERNAL_URL_METADATA = {"source": "external-url"}
 
 
 def _subcommand_id(root: uuid.UUID, label: str) -> uuid.UUID:
@@ -185,7 +168,7 @@ def _action_form(task: Task, user: Principal):
     if task.current_state == Task.State.HUMAN_REWORK and task.current_assignee_principal_id == user.pk and can_edit:
         return "resume-work", StartWorkForm(**common)
     if task.current_state == Task.State.IN_PROGRESS and task.current_assignee_principal_id == user.pk and can_edit:
-        return "upload", UploadDoDForm(criteria=task.contract_version.dod_criteria, **common)
+        return "deliver", DeliveryDoDForm(criteria=task.contract_version.dod_criteria, **common)
     return "", None
 
 
@@ -451,31 +434,7 @@ def _start_task(task: Task, user: Principal, grant, form: StartWorkForm) -> None
     )
 
 
-def _asset_kind(mime_type: str) -> str:
-    if mime_type.startswith("image/"):
-        return ContentAsset.AssetKind.IMAGE
-    if mime_type.startswith("video/"):
-        return ContentAsset.AssetKind.VIDEO
-    if mime_type.startswith("text/") or mime_type == "application/json":
-        return ContentAsset.AssetKind.COPY
-    return ContentAsset.AssetKind.DOCUMENT
-
-
-def _hash_upload(uploaded) -> tuple[str, int]:
-    digest = hashlib.sha256()
-    byte_size = 0
-    for chunk in uploaded.chunks():
-        byte_size += len(chunk)
-        if byte_size > MAX_UPLOAD_BYTES:
-            raise ValidationError("交付文件超过 100 MB 上限。")
-        digest.update(chunk)
-    if byte_size == 0:
-        raise ValidationError("交付文件不能为空。")
-    uploaded.seek(0)
-    return digest.hexdigest(), byte_size
-
-
-def _criterion_results(form: UploadDoDForm) -> dict[str, str]:
+def _criterion_results(form: DeliveryDoDForm) -> dict[str, str]:
     return {
         criterion["key"]: form.cleaned_data[f"{form.field_prefix}{criterion['key']}"]
         for criterion in form.criteria
@@ -486,17 +445,12 @@ def _replayed_submission_result(
     *,
     task: Task,
     user: Principal,
-    form: UploadDoDForm,
-    mime_type: str,
+    form: DeliveryDoDForm,
+    external_url: str,
     content_sha256: str,
     byte_size: int,
 ) -> str | None:
-    """Return the prior result for an exact upload-command replay.
-
-    This lookup happens before storage.save(), so an HTTP retry cannot create a
-    duplicate object.  Reusing the same root command for a different payload is
-    a hard conflict rather than a request to overwrite immutable facts.
-    """
+    """Return the prior result for an exact link-delivery command replay."""
 
     submission_command = _subcommand_id(form.cleaned_data["command_id"], "submission")
     existing = (
@@ -518,33 +472,34 @@ def _replayed_submission_result(
             existing.task_id == task.pk,
             existing.expected_task_version == form.cleaned_data["expected_state_version"],
             existing.submitted_by_principal_id == user.pk,
+            existing.primary_asset_version.object_key == external_url,
             existing.primary_asset_version.content_sha256 == content_sha256,
             existing.primary_asset_version.byte_size == byte_size,
-            existing.primary_asset_version.mime_type == mime_type,
+            existing.primary_asset_version.mime_type == EXTERNAL_URL_MIME_TYPE,
+            existing.primary_asset_version.metadata == EXTERNAL_URL_METADATA,
             existing.submission_note == form.cleaned_data["submission_note"],
             actual_criteria == _criterion_results(form),
         )
     )
     if not is_exact_replay:
         raise ValidationError(
-            "该 command_id 已用于另一份上传内容或表单；请刷新页面后使用新的命令。"
+            "该 command_id 已用于另一份交付链接或表单；请刷新页面后使用新的命令。"
         )
     return existing.dod_check_run.aggregate_result
 
 
-def _upload_and_submit(task: Task, user: Principal, grant, form: UploadDoDForm) -> str:
+def _deliver_and_submit(task: Task, user: Principal, grant, form: DeliveryDoDForm) -> str:
     if task.current_assignee_principal_id != user.pk:
         raise PermissionDenied("ONLY_CURRENT_ASSIGNEE_CAN_SUBMIT")
-    uploaded = form.cleaned_data["deliverable"]
-    mime_type = (uploaded.content_type or "application/octet-stream").lower()
-    if mime_type not in ALLOWED_UPLOAD_TYPES:
-        raise ValidationError("不支持该文件类型；请上传文本、图片、PDF、Word 或视频文件。")
-    content_sha256, byte_size = _hash_upload(uploaded)
+    external_url = form.cleaned_data["external_url"]
+    encoded_url = external_url.encode("utf-8")
+    content_sha256 = hashlib.sha256(encoded_url).hexdigest()
+    byte_size = len(encoded_url)
     replayed_result = _replayed_submission_result(
         task=task,
         user=user,
         form=form,
-        mime_type=mime_type,
+        external_url=external_url,
         content_sha256=content_sha256,
         byte_size=byte_size,
     )
@@ -570,115 +525,88 @@ def _upload_and_submit(task: Task, user: Principal, grant, form: UploadDoDForm) 
                 raise ValidationError("只有明确要求修改的审核结论才能创建返工版本。")
 
     root_command = form.cleaned_data["command_id"]
-    original_name = Path(uploaded.name or "deliverable.bin").name
-    safe_name = default_storage.get_valid_name(original_name) or "deliverable.bin"
-    # Content addressing prevents two different payloads using the same
-    # command ID from ever targeting the same immutable object key. This stays
-    # safe even when COS bucket versioning makes its overwrite guard inactive.
-    requested_name = (
-        f"task-deliveries/{task.pk}/{root_command.hex}/{content_sha256}/{safe_name}"
-    )
-    stored_write = None
-    try:
-        stored_name = default_storage.save(requested_name, uploaded)
-        stored_write = StoredObjectWrite(
-            storage=default_storage,
-            stored_name=stored_name,
-            is_referenced=lambda name: ContentAssetVersion.objects.filter(
-                object_key=name
-            ).exists(),
-        )
-        result = ""
-        # ``durable=True`` makes this the outer commit boundary in production,
-        # so a successful return cannot later leave an orphan after an unseen
-        # outer rollback. Django's TestCase wrapper is explicitly supported.
-        with transaction.atomic(durable=True):
-            asset = task.content_assets.filter(asset_key="primary-deliverable").first()
-            if asset is None:
-                asset = ContentAsset.create_idempotent(
-                    task=task,
-                    asset_key="primary-deliverable",
-                    title=f"Primary delivery for {task.title}",
-                    asset_kind=_asset_kind(mime_type),
-                    description="Primary file uploaded through the controlled task UI.",
-                    command_id=_subcommand_id(root_command, "content-asset"),
-                    actor_principal=user,
-                    acting_role=user.role,
-                    permission_grant=grant,
-                    recorded_by_principal=user,
-                )
-            version = ContentAssetVersion.create_next(
-                content_asset=asset,
-                object_key=stored_name,
-                mime_type=mime_type,
-                byte_size=byte_size,
-                content_sha256=content_sha256,
-                metadata={"original_filename": original_name, "source": "dashboard-upload"},
-                command_id=_subcommand_id(root_command, "content-asset-version"),
+    with transaction.atomic():
+        asset = task.content_assets.filter(asset_key="primary-deliverable").first()
+        if asset is None:
+            asset = ContentAsset.create_idempotent(
+                task=task,
+                asset_key="primary-deliverable",
+                title=f"Primary delivery for {task.title}",
+                asset_kind=ContentAsset.AssetKind.OTHER,
+                description="Primary external delivery link submitted through the task UI.",
+                command_id=_subcommand_id(root_command, "content-asset"),
                 actor_principal=user,
                 acting_role=user.role,
                 permission_grant=grant,
                 recorded_by_principal=user,
             )
-            run = TaskCheckRun.record_completed(
+        version = ContentAssetVersion.create_next(
+            content_asset=asset,
+            object_key=external_url,
+            mime_type=EXTERNAL_URL_MIME_TYPE,
+            byte_size=byte_size,
+            content_sha256=content_sha256,
+            metadata=EXTERNAL_URL_METADATA,
+            command_id=_subcommand_id(root_command, "content-asset-version"),
+            actor_principal=user,
+            acting_role=user.role,
+            permission_grant=grant,
+            recorded_by_principal=user,
+        )
+        run = TaskCheckRun.record_completed(
+            task=task,
+            check_kind=TaskCheckRun.Kind.DOD,
+            results=form.result_rows(
+                evidence={
+                    "asset_version_id": str(version.pk),
+                    "external_url": external_url,
+                    "content_sha256": content_sha256,
+                    "byte_size": byte_size,
+                }
+            ),
+            command_id=_subcommand_id(root_command, "dod-check"),
+            evaluator_principal=user,
+            acting_role=user.role,
+            permission_grant=grant,
+            recorded_by_principal=user,
+        )
+        if run.aggregate_result == TaskCheckRun.Result.PASS:
+            TaskSubmission.seal(
                 task=task,
-                check_kind=TaskCheckRun.Kind.DOD,
-                results=form.result_rows(
-                    evidence={
-                        "asset_version_id": str(version.pk),
-                        "content_sha256": content_sha256,
-                        "byte_size": byte_size,
-                    }
-                ),
-                command_id=_subcommand_id(root_command, "dod-check"),
-                evaluator_principal=user,
+                dod_check_run=run,
+                primary_asset_version=version,
+                supersedes_submission=supersedes_submission,
+                triggering_review=triggering_review,
+                submission_note=form.cleaned_data["submission_note"],
+                command_id=_subcommand_id(root_command, "submission"),
+                expected_task_version=form.cleaned_data["expected_state_version"],
+                actor_principal=user,
                 acting_role=user.role,
                 permission_grant=grant,
                 recorded_by_principal=user,
             )
-            if run.aggregate_result == TaskCheckRun.Result.PASS:
-                TaskSubmission.seal(
-                    task=task,
-                    dod_check_run=run,
-                    primary_asset_version=version,
-                    supersedes_submission=supersedes_submission,
-                    triggering_review=triggering_review,
-                    submission_note=form.cleaned_data["submission_note"],
-                    command_id=_subcommand_id(root_command, "submission"),
-                    expected_task_version=form.cleaned_data["expected_state_version"],
-                    actor_principal=user,
-                    acting_role=user.role,
-                    permission_grant=grant,
-                    recorded_by_principal=user,
-                )
-                Task.transition(
-                    task_id=task.pk,
-                    to_state=Task.State.SUBMITTED,
-                    command_id=_subcommand_id(root_command, "submitted-transition"),
-                    expected_state_version=form.cleaned_data["expected_state_version"],
-                    actor_principal=user,
-                    acting_role=user.role,
-                    permission_grant=grant,
-                    recorded_by_principal=user,
-                )
-                task.refresh_from_db()
-                Task.transition(
-                    task_id=task.pk,
-                    to_state=Task.State.UNDER_REVIEW,
-                    command_id=_subcommand_id(root_command, "under-review-transition"),
-                    expected_state_version=task.state_version,
-                    actor_principal=user,
-                    acting_role=user.role,
-                    permission_grant=grant,
-                    recorded_by_principal=user,
-                )
-            result = run.aggregate_result
-            stored_write.retain_on_commit()
-        return result
-    except Exception:
-        if stored_write is not None:
-            stored_write.cleanup_after_rollback()
-        raise
+            Task.transition(
+                task_id=task.pk,
+                to_state=Task.State.SUBMITTED,
+                command_id=_subcommand_id(root_command, "submitted-transition"),
+                expected_state_version=form.cleaned_data["expected_state_version"],
+                actor_principal=user,
+                acting_role=user.role,
+                permission_grant=grant,
+                recorded_by_principal=user,
+            )
+            task.refresh_from_db()
+            Task.transition(
+                task_id=task.pk,
+                to_state=Task.State.UNDER_REVIEW,
+                command_id=_subcommand_id(root_command, "under-review-transition"),
+                expected_state_version=task.state_version,
+                actor_principal=user,
+                acting_role=user.role,
+                permission_grant=grant,
+                recorded_by_principal=user,
+            )
+        return run.aggregate_result
 
 
 @login_required
@@ -750,19 +678,18 @@ def task_action(request: HttpRequest, task_id, action: str) -> HttpResponse:
                 return render(request, "dashboard/task_detail.html", _detail_context(task, request.user, action_kind=action, action_form=form), status=400)
             _start_task(task, request.user, grant, form)
             messages.success(request, "返工任务已恢复制作；请完成新版本后重新填写 DoD。")
-        elif action == "upload":
-            form = UploadDoDForm(
+        elif action == "deliver":
+            form = DeliveryDoDForm(
                 request.POST,
-                request.FILES,
                 criteria=task.contract_version.dod_criteria,
                 state_version=task.state_version,
             )
             if not form.is_valid():
                 return render(request, "dashboard/task_detail.html", _detail_context(task, request.user, action_kind=action, action_form=form), status=400)
-            result = _upload_and_submit(task, request.user, grant, form)
+            result = _deliver_and_submit(task, request.user, grant, form)
             messages.success(
                 request,
-                "交付已封存并送入人工审核。" if result == TaskCheckRun.Result.PASS else "文件和本次 DoD 已保留，但仍有阻塞项，尚未送审。",
+                "交付链接已封存并送入人工审核。" if result == TaskCheckRun.Result.PASS else "交付链接和本次 DoD 已保留，但仍有阻塞项，尚未送审。",
             )
         elif action == "cancel":
             form = CancelTaskForm(request.POST, state_version=task.state_version)

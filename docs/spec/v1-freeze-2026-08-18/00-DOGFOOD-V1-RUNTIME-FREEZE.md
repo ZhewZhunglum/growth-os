@@ -1,5 +1,7 @@
 # Dogfood V1 Runtime Freeze
 
+> File delivery and storage requirements are superseded by [V1 Link-Only Errata — 2026-08-20](05-LINK-ONLY-ERRATA-2026-08-20.md).
+
 | Item | Frozen value |
 |---|---|
 | Status | `FROZEN` |

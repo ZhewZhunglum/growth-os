@@ -198,10 +198,11 @@ class WithdrawSubmissionForm(CommandForm):
     confirm = forms.BooleanField(label="确认撤回并重新修改")
 
 
-class UploadDoDForm(CriteriaCommandForm):
-    deliverable = forms.FileField(
-        label="上传本次交付文件",
-        help_text="系统会记录文件真实大小和 SHA-256；单个文件最大 100 MB。",
+class DeliveryDoDForm(CriteriaCommandForm):
+    external_url = forms.URLField(
+        label="本次交付链接",
+        max_length=1024,
+        help_text="必填。请填写可供审核和发布人员打开的内容链接。链接变化时需提交新版本。",
     )
     submission_note = forms.CharField(
         label="交付说明",

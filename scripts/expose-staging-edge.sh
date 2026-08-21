@@ -114,8 +114,6 @@ from django.contrib.sessions.models import Session
 from django.db.models import Q
 
 from accounts.models import Principal
-from contentops.models import ContentAssetVersion
-from releasegate.models import PublicationEvent
 
 expected = {
     sys.argv[1]: Principal.Role.OWNER,
@@ -145,17 +143,10 @@ if Principal.objects.filter(Q(is_staff=True) | Q(is_superuser=True)).exists():
     problems.append("a staff or superuser Principal exists")
 if Session.objects.exists():
     problems.append("a live Django session exists")
-if sys.argv[4] == "bootstrap":
-    counts = {
-        "content_asset_object_references": ContentAssetVersion.objects.exclude(object_key="").count(),
-        "publication_proof_references": PublicationEvent.objects.exclude(proof_reference="").count(),
-    }
-    if any(counts.values()):
-        problems.append(", ".join(f"{name}={value}" for name, value in counts.items()))
 if problems:
-    raise SystemExit("PRE_EDGE_STAFF_OR_MEDIA_GATE_FAILED: " + "; ".join(problems))
+    raise SystemExit("PRE_EDGE_IDENTITY_OR_SESSION_GATE_FAILED: " + "; ".join(problems))
 print("Pre-edge exact-three identity/session gate: PASS")
-' "$STAGING_OWNER_USERNAME" "$STAGING_ADMIN_USERNAME" "$STAGING_OPERATOR_USERNAME" "$deploy_mode"
+' "$STAGING_OWNER_USERNAME" "$STAGING_ADMIN_USERNAME" "$STAGING_OPERATOR_USERNAME"
 
 # Reuse the command's transactionally locked exact-grant verifier. Because all
 # three Principals already exist, no password file is read and this remains a

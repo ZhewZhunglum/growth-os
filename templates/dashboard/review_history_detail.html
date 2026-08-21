@@ -23,21 +23,21 @@
 </section>
 <section class="detail-columns">
     <article class="detail-panel">
-        <p class="eyebrow">精确交付版本</p><h3>{{ asset_version.metadata.original_filename|default:asset_version.object_key }}</h3>
+        <p class="eyebrow">精确交付版本</p><h3>资产版本 v{{ asset_version.version_number }}</h3>
         <dl class="submission-summary">
             <dt>资产版本</dt><dd>v{{ asset_version.version_number }}</dd>
-            <dt>文件类型</dt><dd>{{ asset_version.mime_type }}</dd>
-            <dt>SHA-256</dt><dd class="hash-value">{{ asset_version.content_sha256 }}</dd>
-            <dt>文件存储标识</dt><dd class="hash-value">{{ asset_version.object_key }}</dd>
+            <dt>版本清单类型</dt><dd>{{ asset_version.mime_type }}</dd>
+            <dt>链接 SHA-256</dt><dd class="hash-value">{{ asset_version.content_sha256 }}</dd>
+            {% if can_view_asset and is_link_delivery %}<dt>封存链接</dt><dd class="hash-value">{{ asset_version.object_key }}</dd>{% endif %}
             <dt>封存时间</dt><dd>{{ submission.sealed_at }}</dd>
         </dl>
-        {% if can_view_asset %}<a class="button" href="{% url 'dashboard:asset-version-file' asset_version.id %}" target="_blank" rel="noopener">打开当时审核的文件</a>{% else %}<p class="read-only-note">当前审核权限已失效，因此只能查看历史摘要，不能再下载文件。</p>{% endif %}
+        {% if can_view_asset and is_link_delivery %}<a class="button" href="{{ asset_version.object_key }}" target="_blank" rel="noopener noreferrer">打开当时审核的内容</a>{% elif can_view_asset %}<p class="read-only-note">V1 已停止支持该旧文件交付。</p>{% else %}<p class="read-only-note">当前审核权限已失效，因此只能查看历史摘要，不能再打开交付链接。</p>{% endif %}
     </article>
     <article class="detail-panel read-only-panel">
         <p class="eyebrow">不可变人工结论</p><h3>{{ review.decision|review_decision_zh }}</h3>
         <span class="task-label">审核说明</span>
         <p class="review-rationale">{{ review.rationale|default:"未填写审核说明"|linebreaksbr }}</p>
-        <p class="read-only-note">该结论、提交批次和精确文件版本仅供查看，不能在本页修改或重新提交。</p>
+        <p class="read-only-note">该结论、提交批次和精确链接版本仅供查看，不能在本页修改或重新提交。</p>
     </article>
 </section>
 {% endblock %}

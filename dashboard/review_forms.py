@@ -62,17 +62,13 @@ class PublicationProofForm(forms.Form):
     external_url = forms.URLField(
         label="已发布内容网址",
         required=False,
-        max_length=2000,
+        max_length=1024,
         help_text="网址或平台内容 ID 至少填写一项。",
     )
     external_publication_id = forms.CharField(
         label="平台内容 ID",
         required=False,
         max_length=255,
-    )
-    proof_file = forms.FileField(
-        label="上传发布证明",
-        help_text="上传截图或 PDF。系统只保存证明，不会替你发布。",
     )
 
     def __init__(self, *args, publications, initial_publication=None, **kwargs):

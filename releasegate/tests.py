@@ -287,7 +287,6 @@ class ReleaseGateDomainTests(TestCase):
         published = self._append(
             PublicationEvent.EventType.MANUAL_PUBLISHED_RECORDED, 2, gate,
             external_publication_id="external-123", external_url="https://example.com/p/123",
-            proof_reference="proofs/puko-123.png", proof_sha256="b" * 64,
         )
         self.publication.refresh_from_db()
         self.assertEqual(self.publication.status, Publication.Status.MANUAL_PUBLISHED_RECORDED)
@@ -539,8 +538,6 @@ class ReleaseGateDomainTests(TestCase):
             command_id=proof_command,
             external_url="https://www.tiktok.com/@puko/video/123",
             external_publication_id="tiktok-123",
-            proof_reference="proofs/tiktok-123.png",
-            proof_sha256="c" * 64,
         )
         proof_replay = record_manual_publication_proof(
             publication=first.publication,
@@ -548,8 +545,6 @@ class ReleaseGateDomainTests(TestCase):
             command_id=proof_command,
             external_url="https://www.tiktok.com/@puko/video/123",
             external_publication_id="tiktok-123",
-            proof_reference="proofs/tiktok-123.png",
-            proof_sha256="c" * 64,
         )
         self.assertEqual(proof.pk, proof_replay.pk)
         first.publication.refresh_from_db()
@@ -665,7 +660,7 @@ class ReleaseGateDomainTests(TestCase):
         self.assertEqual(RuleEvaluationResult.objects.count(), 0)
         self.assertEqual(ReleaseGateRecord.objects.count(), 0)
 
-    def test_v1_service_unauthorized_publisher_and_invalid_proof_leave_no_partial_fact(self):
+    def test_v1_service_unauthorized_publisher_and_link_only_proof(self):
         unauthorized = Principal.objects.create_user(username="unauthorized-publisher")
         original_publication_count = Publication.objects.count()
         original_event_count = PublicationEvent.objects.count()
@@ -696,11 +691,41 @@ class ReleaseGateDomainTests(TestCase):
                 publication=ready.publication,
                 publisher_principal=self.publisher,
                 command_id=uuid.uuid4(),
-                external_url="https://example.com/published",
-                proof_reference="",
-                proof_sha256="d" * 64,
             )
         self.assertEqual(ready.publication.events.count(), before_proof)
+
+        for forbidden_file_proof in (
+            {"proof_reference": "proofs/legacy.png"},
+            {"proof_sha256": "d" * 64},
+            {"proof_reference": "proofs/legacy.png", "proof_sha256": "d" * 64},
+        ):
+            with self.subTest(forbidden_file_proof=forbidden_file_proof):
+                with self.assertRaises(ValidationError):
+                    ready.publication.append_event(
+                        event_type=PublicationEvent.EventType.MANUAL_PUBLISHED_RECORDED,
+                        release_gate=ready.gate,
+                        command_id=uuid.uuid4(),
+                        payload_hash=canonical_sha256(forbidden_file_proof),
+                        expected_state_version=ready.publication.state_version,
+                        actor_principal=self.publisher,
+                        acting_role=self.publisher.role,
+                        permission_grant=self.publish_grant,
+                        recorded_by_principal=self.publisher,
+                        external_url="https://example.com/published",
+                        **forbidden_file_proof,
+                    )
+                self.assertEqual(ready.publication.events.count(), before_proof)
+
+        proof = record_manual_publication_proof(
+            publication=ready.publication,
+            publisher_principal=self.publisher,
+            command_id=uuid.uuid4(),
+            external_url="https://example.com/published",
+        )
+        self.assertEqual(proof.external_url, "https://example.com/published")
+        self.assertEqual(proof.proof_reference, "")
+        self.assertEqual(proof.proof_sha256, "")
+        self.assertEqual(ready.publication.events.count(), before_proof + 1)
 
     def test_v1_service_hierarchical_publish_deny_overrides_allow_without_partial_facts(self):
         PermissionGrant.objects.create(

@@ -52,14 +52,14 @@
                 {% for field in action_form.visible_fields %}<div class="field-row"><label for="{{ field.id_for_label }}">分配给哪位执行人员</label>{{ field }}{{ field.errors }}</div>{% endfor %}<button class="button button-primary" type="submit">确认分配</button>
             </form>
         {% elif action_kind == "start" %}
-            <h3>确认开始执行</h3><p class="action-explanation">点击后任务进入“执行中”，届时才能上传交付文件并填写 DoD。</p>
+            <h3>确认开始执行</h3><p class="action-explanation">点击后任务进入“执行中”，届时才能提交交付链接并填写 DoD。</p>
             <form action="{% url 'dashboard:task-action' task.id 'start' %}" method="post">{% csrf_token %}{{ action_form.command_id }}{{ action_form.expected_state_version }}<button class="button button-primary" type="submit">开始执行</button></form>
         {% elif action_kind == "resume-work" %}
-            <h3>审核要求修改，恢复制作新版本</h3><p class="action-explanation">旧文件、旧 DoD 和旧 Submission 会原样保留。恢复后请上传一份新的文件版本，并重新逐项填写 DoD。</p>
+            <h3>审核要求修改，恢复制作新版本</h3><p class="action-explanation">旧链接、旧 DoD 和旧 Submission 会原样保留。恢复后请提交新的内容链接，并重新逐项填写 DoD。</p>
             <form action="{% url 'dashboard:task-action' task.id 'resume-work' %}" method="post">{% csrf_token %}{{ action_form.command_id }}{{ action_form.expected_state_version }}<button class="button button-primary" type="submit">恢复制作</button></form>
-        {% elif action_kind == "upload" %}
-            <h3>上传本次交付，并逐项确认是否完成</h3><p class="action-explanation">系统会计算文件大小和 SHA-256，并封存精确版本。选择“确认完整交付并送审”才会进入人工审核；选择“尚未准备好”会保留本次结果，但不会送审。</p>
-            <form class="task-action-form" action="{% url 'dashboard:task-action' task.id 'upload' %}" method="post" enctype="multipart/form-data">
+        {% elif action_kind == "deliver" %}
+            <h3>提交本次交付链接，并逐项确认是否完成</h3><p class="action-explanation">系统会把链接作为不可变交付版本封存。链接变化必须创建新版本并重新送审；选择“尚未准备好”会保留本次结果，但不会送审。</p>
+            <form class="task-action-form" action="{% url 'dashboard:task-action' task.id 'deliver' %}" method="post">
                 {% csrf_token %}{{ action_form.command_id }}{{ action_form.expected_state_version }}{{ action_form.non_field_errors }}
                 {% for field in action_form.visible_fields %}
                 <div class="field-row">
@@ -80,7 +80,7 @@
         {% if withdraw_form %}
         <div class="secondary-action-block">
             <h3>刚才提交错了？</h3>
-            <p class="action-explanation">审核人还没有给出结论时，你可以撤回并修改。旧文件不会消失，重新提交时系统会保存为新版本。</p>
+            <p class="action-explanation">审核人还没有给出结论时，你可以撤回并修改。旧链接版本不会消失，重新提交时系统会保存为新版本。</p>
             <form class="task-action-form" action="{% url 'dashboard:task-action' task.id 'withdraw' %}" method="post">
                 {% csrf_token %}{{ withdraw_form.command_id }}{{ withdraw_form.expected_state_version }}{{ withdraw_form.non_field_errors }}
                 {% for field in withdraw_form.visible_fields %}<div class="field-row">{{ field.label_tag }}{{ field }}{{ field.errors }}{% if field.help_text %}<small>{{ field.help_text }}</small>{% endif %}</div>{% endfor %}

@@ -1,5 +1,7 @@
 # Delivery Evidence and Deployment Gates
 
+> File, proof, object-storage, and media-backup gates are superseded by [V1 Link-Only Errata — 2026-08-20](05-LINK-ONLY-ERRATA-2026-08-20.md).
+
 This file defines the mandatory evidence and gates for the frozen minimum loop. It adds no business function.
 
 ## 1. Confirmed direction

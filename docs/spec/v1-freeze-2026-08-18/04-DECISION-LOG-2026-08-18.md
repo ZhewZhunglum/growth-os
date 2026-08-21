@@ -1,5 +1,7 @@
 # Decision Log - 2026-08-18 Development Meeting
 
+> The object-storage portion of this historical decision is superseded by [V1 Link-Only Errata — 2026-08-20](05-LINK-ONLY-ERRATA-2026-08-20.md).
+
 Source: `C:\Users\admin\Desktop\AI 視圖：独立站破千万的視像會議 2026年8月18日.pdf`
 
 The exported PDF visually omitted most of the page body. The decisions below were recovered from its embedded meeting-mind-map image. If the original Feishu view contains collapsed nodes or comments, those remain outside this record.

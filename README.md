@@ -149,20 +149,19 @@ Open `http://127.0.0.1:8000/`, or change `WEB_PORT` locally if that port is in u
 
 The container waits for PostgreSQL with a bounded retry, then runs migrations,
 collects static files and finally starts Gunicorn. WhiteNoise serves versioned
-static assets from the container; Local user-uploaded media uses the `media_data`
-volume. This Compose topology is a single-web-instance bootstrap environment.
+static assets from the container. Growth OS V1 does not accept or store uploaded
+files, so only PostgreSQL data requires a persistent volume. This Compose
+topology is a single-web-instance bootstrap environment.
 Before adding multiple web replicas, migrations must move into a one-off release
 job so several instances cannot race the same schema change.
 
-Local deliberately keeps Django's filesystem storage. Staging and Production
-instead fail closed unless `MEDIA_STORAGE_BACKEND=cos` selects the private
-Tencent COS adapter and supplies an explicit BucketName-APPID, region, and
-read-only `TENCENT_COS_SECRET_ID_FILE` / `TENCENT_COS_SECRET_KEY_FILE` mounts.
-The adapter uploads over HTTPS with a private object ACL, returns the actual COS
-object key chosen by `storage.save()`, and refuses to construct public media
-URLs. Database rows continue to store only that object key. Deployment must
-still verify the bucket ACL and bucket policy are private; source configuration
-alone is not evidence that the live bucket is private.
+Content delivery is link-first in every environment. An immutable
+`ContentAssetVersion` stores an external URL rather than file bytes. A changed
+link creates a new version and must be submitted and reviewed again; existing
+review and release-gate records remain bound to the exact version they approved.
+Publication proof records an external publication URL or platform content ID.
+Growth OS is not a file asset store, and V1 requires no separate content-storage
+backend or related credentials.
 
 ## Staging / production boundary
 
@@ -185,7 +184,8 @@ Before a staging or production start:
   Compose network and has no TLS listener; provide its password through the
   read-only `POSTGRES_PASSWORD_FILE` mount;
 - configure backups and prove restore time before launch. The named Docker
-  volume is persistence, not a backup.
+  volume is persistence, not a backup; database backups must be encrypted and
+  copied to an access-controlled destination off the application host.
 
 The `/health/` endpoint is exempt from Django's HTTPS redirect so Docker can
 check the private HTTP listener. It returns database reachability plus a small,
@@ -240,9 +240,9 @@ PostgreSQL/Staging evidence is still required before release.
 ## Deployment handoff checklist
 
 The infrastructure owner still needs to supply the cloud account, region,
-domain, HTTPS certificate path, IAM identities, secret-manager references,
-managed database or volume backup plan, monitoring destination and rollback
-procedure. The frozen production objectives are **RPO no greater than 1 hour**
+domain, HTTPS certificate path, deployment identity, secret-manager references,
+managed PostgreSQL and off-host database backup plan, monitoring destination
+and rollback procedure. The frozen production objectives are **RPO no greater than 1 hour**
 and **RTO no greater than 4 hours**. They are acceptance limits, not averages,
 and must be demonstrated in a restore rehearsal before Production launch.
 

@@ -24,7 +24,7 @@ COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY . /app
-RUN mkdir -p /app/staticfiles /app/media && chown -R growthos:growthos /app
+RUN mkdir -p /app/staticfiles && chown -R growthos:growthos /app
 
 USER growthos
 

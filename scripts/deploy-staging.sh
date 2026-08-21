@@ -84,9 +84,6 @@ require_value POSTGRES_DB
 require_value POSTGRES_USER
 require_value SECRETS_DIR
 require_value DEPLOY_BACKUP_DIR
-require_value MEDIA_STORAGE_BACKEND
-require_value TENCENT_COS_BUCKET
-require_value TENCENT_COS_REGION
 require_digest_image POSTGRES_IMAGE
 require_digest_image NGINX_IMAGE
 
@@ -116,15 +113,14 @@ esac
 case "$STAGING_HOSTNAME" in
     *[!a-z0-9.-]*|.*|*.) fail "STAGING_HOSTNAME must be a lowercase bare DNS hostname, without a scheme, path, or port." ;;
 esac
-[ "$MEDIA_STORAGE_BACKEND" = "cos" ] || fail "Staging media storage must be the versioned COS backend."
 [ -d "$SECRETS_DIR" ] || fail "SECRETS_DIR does not exist."
 [ "$(stat -c '%a' "$SECRETS_DIR")" = "700" ] || fail "SECRETS_DIR must have host mode 0700."
 
-for secret_name in django_secret_key postgres_password app_postgres_password tencent_cos_secret_id tencent_cos_secret_key tls_fullchain.pem tls_privkey.pem
+for secret_name in django_secret_key postgres_password app_postgres_password tls_fullchain.pem tls_privkey.pem
 do
     [ -s "$SECRETS_DIR/$secret_name" ] || fail "Required Secret file is missing or empty: $secret_name"
 done
-for secret_name in django_secret_key postgres_password app_postgres_password tencent_cos_secret_id tencent_cos_secret_key
+for secret_name in django_secret_key postgres_password app_postgres_password
 do
     secret_mode=$(stat -c '%a' "$SECRETS_DIR/$secret_name")
     case "$secret_mode" in
@@ -168,8 +164,8 @@ from django.db.models import Q
 
 from accounts.models import Principal
 
-if settings.ENVIRONMENT != "staging" or settings.MEDIA_STORAGE_BACKEND != "cos":
-    raise SystemExit("UPGRADE_ENVIRONMENT_NOT_STAGING_COS")
+if settings.ENVIRONMENT != "staging":
+    raise SystemExit("UPGRADE_ENVIRONMENT_NOT_STAGING")
 expected = {
     sys.argv[1]: Principal.Role.OWNER,
     sys.argv[2]: Principal.Role.OPERATIONS_ADMIN,
@@ -244,51 +240,34 @@ print(f"Staging sessions invalidated: {deleted}")
 '
 }
 
-verify_all_cos_references() {
+verify_link_only_content_versions() {
     compose exec -T web python -c '
-import hashlib
-from django.conf import settings
-from django.core.files.storage import default_storage
 from contentops.models import ContentAssetVersion
-from releasegate.models import PublicationEvent
 
-if settings.ENVIRONMENT != "staging" or settings.MEDIA_STORAGE_BACKEND != "cos":
-    raise SystemExit("COS_REFERENCE_GATE_WRONG_ENVIRONMENT")
-
-expected = {}
-for version in ContentAssetVersion.objects.exclude(object_key="").iterator():
-    candidate = (int(version.byte_size), version.content_sha256)
-    previous = expected.get(version.object_key)
-    if previous is not None and previous != candidate:
-        raise SystemExit("COS_REFERENCE_CONFLICTING_ASSET_EXPECTATIONS")
-    expected[version.object_key] = candidate
-for event in PublicationEvent.objects.exclude(proof_reference="").iterator():
-    previous = expected.get(event.proof_reference)
-    candidate = (previous[0] if previous else None, event.proof_sha256)
-    if previous is not None and previous[1] != event.proof_sha256:
-        raise SystemExit("COS_REFERENCE_CONFLICTING_PROOF_EXPECTATIONS")
-    expected[event.proof_reference] = candidate
-
-for ordinal, (object_key, (expected_size, expected_hash)) in enumerate(expected.items(), start=1):
-    try:
-        if not default_storage.exists(object_key):
-            raise RuntimeError("missing")
-        if expected_size is not None and default_storage.size(object_key) != expected_size:
-            raise RuntimeError("size")
-        digest = hashlib.sha256()
-        with default_storage.open(object_key, "rb") as stored_file:
-            while True:
-                chunk = stored_file.read(1024 * 1024)
-                if not chunk:
-                    break
-                digest.update(chunk)
-        if digest.hexdigest() != expected_hash:
-            raise RuntimeError("hash")
-    except BaseException as error:
-        raise SystemExit(
-            f"COS_REFERENCE_VERIFICATION_FAILED_AT_ORDINAL_{ordinal}_{type(error).__name__}"
-        ) from None
-print(f"Existing COS object size/hash gate: PASS ({len(expected)} references)")
+invalid_count = 0
+sample_ids = []
+total = 0
+for version in ContentAssetVersion.objects.only(
+    "id", "mime_type", "metadata", "object_key"
+).iterator():
+    total += 1
+    metadata = version.metadata
+    if (
+        version.mime_type != "text/uri-list"
+        or not isinstance(metadata, dict)
+        or metadata.get("source") != "external-url"
+        or not version.object_key.startswith(("http://", "https://"))
+    ):
+        invalid_count += 1
+        if len(sample_ids) < 5:
+            sample_ids.append(str(version.pk))
+if invalid_count:
+    rendered_ids = ",".join(sample_ids)
+    raise SystemExit(
+        "LINK_ONLY_CONTENT_VERSION_GATE_FAILED: "
+        f"invalid_count={invalid_count}; sample_ids={rendered_ids}"
+    )
+print(f"Link-only ContentAssetVersion gate: PASS ({total} versions)")
 '
 }
 
@@ -297,8 +276,6 @@ verify_bootstrap_zero_state() {
 from django.contrib.sessions.models import Session
 from django.db.models import Q
 from accounts.models import Principal
-from contentops.models import ContentAssetVersion
-from releasegate.models import PublicationEvent
 
 counts = {
     "active_human_principals": Principal.objects.filter(
@@ -309,13 +286,11 @@ counts = {
         Q(is_staff=True) | Q(is_superuser=True),
     ).count(),
     "sessions": Session.objects.count(),
-    "content_asset_object_references": ContentAssetVersion.objects.exclude(object_key="").count(),
-    "publication_proof_references": PublicationEvent.objects.exclude(proof_reference="").count(),
 }
 if any(counts.values()):
     rendered = ", ".join(f"{name}={value}" for name, value in counts.items())
     raise SystemExit(f"BOOTSTRAP_BASELINE_NOT_SANITIZED: {rendered}")
-print("Bootstrap identity/session/media-reference gate: PASS (all counts zero)")
+print("Bootstrap identity/session gate: PASS (all counts zero)")
 '
 }
 
@@ -376,15 +351,11 @@ assert Path("/run/compare/postgres_password").read_bytes() == Path("/run/compare
 docker run --rm --network none --read-only \
     --mount "type=bind,src=$SECRETS_DIR/django_secret_key,dst=/run/secrets/django_secret_key,readonly" \
     --mount "type=bind,src=$SECRETS_DIR/app_postgres_password,dst=/run/secrets/postgres_password,readonly" \
-    --mount "type=bind,src=$SECRETS_DIR/tencent_cos_secret_id,dst=/run/secrets/tencent_cos_secret_id,readonly" \
-    --mount "type=bind,src=$SECRETS_DIR/tencent_cos_secret_key,dst=/run/secrets/tencent_cos_secret_key,readonly" \
     --entrypoint python "$image_reference" -c '
 from pathlib import Path
 paths = (
     "/run/secrets/django_secret_key",
     "/run/secrets/postgres_password",
-    "/run/secrets/tencent_cos_secret_id",
-    "/run/secrets/tencent_cos_secret_key",
 )
 assert all(Path(path).read_bytes() for path in paths)
 '
@@ -401,8 +372,8 @@ then
     [ "$current_health" = "healthy" ] \
         || fail "The current loopback web container must be healthy for pre-migration upgrade verification."
     verify_exact_staging_staff_and_grants
+    verify_link_only_content_versions
     invalidate_all_sessions
-    verify_all_cos_references
     echo "Pre-migration upgrade data gate: PASS"
 fi
 
@@ -515,16 +486,15 @@ done
 [ "${health_status:-missing}" = "healthy" ] || fail "The new web container did not become healthy in time."
 
 # The replacement web remains loopback-only. Bootstrap retains the strict zero
-# legacy-data gate. Upgrade revalidates the exact live identities/Grants,
-# invalidates sessions again, and rereads every referenced COS object after the
-# migration before the edge may return.
+# legacy-data gate. Upgrade revalidates the exact live identities/Grants and
+# invalidates sessions again before the edge may return.
+verify_link_only_content_versions
 if [ "$deploy_mode" = "bootstrap" ]
 then
     verify_bootstrap_zero_state
 else
     verify_exact_staging_staff_and_grants
     invalidate_all_sessions
-    verify_all_cos_references
     echo "Post-migration upgrade data gate: PASS"
 fi
 

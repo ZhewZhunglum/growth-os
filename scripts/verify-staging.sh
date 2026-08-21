@@ -104,10 +104,7 @@ published_port=$(docker port "$web_container" 8000/tcp 2>/dev/null || true)
 db_published_ports=$(docker port "$db_container" 2>/dev/null || true)
 [ -z "$db_published_ports" ] || fail "PostgreSQL unexpectedly has a host-published port."
 
-media_mount=$(docker inspect "$web_container" --format '{{range .Mounts}}{{if eq .Destination "/app/media"}}{{.Destination}}{{end}}{{end}}')
-[ -z "$media_mount" ] || fail "A forbidden /app/media runtime volume is mounted."
-
-for secret_destination in /run/secrets/django_secret_key /run/secrets/postgres_password /run/secrets/tencent_cos_secret_id /run/secrets/tencent_cos_secret_key
+for secret_destination in /run/secrets/django_secret_key /run/secrets/postgres_password
 do
     secret_writable=$(docker inspect "$web_container" --format "{{range .Mounts}}{{if eq .Destination \"$secret_destination\"}}{{.RW}}{{end}}{{end}}")
     [ "$secret_writable" = "false" ] || fail "Secret mount is absent or writable: $secret_destination"
@@ -121,8 +118,6 @@ done
 container_environment=$(docker inspect "$web_container" --format '{{range .Config.Env}}{{println .}}{{end}}')
 printf '%s\n' "$container_environment" | grep -q '^DJANGO_SECRET_KEY=' && fail "DJANGO_SECRET_KEY was embedded in the container configuration."
 printf '%s\n' "$container_environment" | grep -q '^POSTGRES_PASSWORD=' && fail "POSTGRES_PASSWORD was embedded in the container configuration."
-printf '%s\n' "$container_environment" | grep -q '^TENCENT_COS_SECRET_ID=' && fail "The COS Secret ID was embedded in the container configuration."
-printf '%s\n' "$container_environment" | grep -q '^TENCENT_COS_SECRET_KEY=' && fail "The COS Secret key was embedded in the container configuration."
 
 compose exec -T web python -c '
 from django.conf import settings
@@ -139,72 +134,41 @@ compose exec -T web python manage.py migrate --check
 compose exec -T web python manage.py check
 compose exec -T web python manage.py check --deploy
 
-# This explicit verifier performs one bounded live COS probe: authenticated
-# write/read/delete plus an unsigned direct GET that must fail closed. The
-# object key and payload are random and non-sensitive; no credential is logged.
 compose exec -T web python -c '
-import sys
-import uuid
-from urllib.error import HTTPError
-from urllib.parse import quote
-from urllib.request import Request, urlopen
+from contentops.models import ContentAssetVersion
 
-from django.conf import settings
-from django.core.files.base import ContentFile
-from django.core.files.storage import default_storage
-
-nonce = uuid.uuid4().hex
-requested_key = f"staging-verification/cos-private-probe/{nonce}.txt"
-cleanup_key = requested_key
-payload = f"growth-os-private-probe:{nonce}".encode("ascii")
-probe_error = None
-cleanup_error = None
-
-try:
-    cleanup_key = default_storage.save(requested_key, ContentFile(payload))
-    with default_storage.open(cleanup_key, "rb") as stored_file:
-        if stored_file.read() != payload:
-            raise RuntimeError("authenticated COS read-back did not match")
-
-    encoded_key = quote(cleanup_key, safe="/")
-    anonymous_url = (
-        f"https://{settings.TENCENT_COS_BUCKET}.cos."
-        f"{settings.TENCENT_COS_REGION}.myqcloud.com/{encoded_key}"
+invalid_count = 0
+sample_ids = []
+total = 0
+for version in ContentAssetVersion.objects.only(
+    "id", "mime_type", "metadata", "object_key"
+).iterator():
+    total += 1
+    metadata = version.metadata
+    if (
+        version.mime_type != "text/uri-list"
+        or not isinstance(metadata, dict)
+        or metadata.get("source") != "external-url"
+        or not version.object_key.startswith(("http://", "https://"))
+    ):
+        invalid_count += 1
+        if len(sample_ids) < 5:
+            sample_ids.append(str(version.pk))
+if invalid_count:
+    rendered_ids = ",".join(sample_ids)
+    raise SystemExit(
+        "LINK_ONLY_CONTENT_VERSION_GATE_FAILED: "
+        f"invalid_count={invalid_count}; sample_ids={rendered_ids}"
     )
-    request = Request(anonymous_url, method="GET", headers={"User-Agent": "growth-os-staging-verifier"})
-    try:
-        with urlopen(request, timeout=15) as response:
-            anonymous_status = int(response.status)
-            response.read(1)
-    except HTTPError as error:
-        anonymous_status = int(error.code)
-        error.close()
-    if anonymous_status not in {403, 404}:
-        raise RuntimeError(f"anonymous COS GET returned forbidden status {anonymous_status}")
-except BaseException as error:
-    probe_error = error
-finally:
-    try:
-        default_storage.delete(cleanup_key)
-        if default_storage.exists(cleanup_key):
-            raise RuntimeError("authenticated COS cleanup did not remove the probe object")
-    except BaseException as error:
-        cleanup_error = error
-
-if cleanup_error is not None:
-    raise SystemExit(f"COS privacy probe cleanup failed ({type(cleanup_error).__name__}).")
-if probe_error is not None:
-    raise SystemExit(f"COS privacy probe failed ({type(probe_error).__name__}).")
-print("COS private write/read/anonymous-denial/delete probe: PASS")
+print(f"Link-only ContentAssetVersion gate: PASS ({total} versions)")
 '
+
 compose exec -T nginx nginx -t
 
 nginx_configuration=$(compose exec -T nginx nginx -T 2>/dev/null)
-printf '%s\n' "$nginx_configuration" | grep -Fq 'client_max_body_size 110m;' || fail "Nginx upload allowance is not 110 MB."
 printf '%s\n' "$nginx_configuration" | grep -Fq 'limit_req zone=login_per_ip burst=5 nodelay;' || fail "Login rate limiting is absent."
 printf '%s\n' "$nginx_configuration" | grep -Fq 'proxy_set_header Host $server_name;' || fail "The upstream Host header is not overwritten."
 printf '%s\n' "$nginx_configuration" | grep -Fq 'proxy_set_header X-Forwarded-For $remote_addr;' || fail "Forwarding headers are not overwritten at the edge."
-printf '%s\n' "$nginx_configuration" | grep -Fq 'location ^~ /media/' || fail "The public /media denial rule is absent."
 server_block_count=$(printf '%s\n' "$nginx_configuration" | grep -Ec '^[[:space:]]*server[[:space:]]*\{')
 [ "$server_block_count" = "2" ] || fail "Nginx has an unexpected additional virtual host."
 
@@ -225,9 +189,6 @@ redirect_result=$(curl --silent --show-error --output /dev/null --max-time 20 --
 
 unexpected_host_result=$(curl --silent --show-error --output /dev/null --max-time 20 --header 'Host: localhost' --write-out '%{http_code} %{redirect_url}' "http://127.0.0.1/")
 [ "$unexpected_host_result" = "308 https://${STAGING_HOSTNAME}/" ] || fail "The default HTTP virtual host did not canonicalize Host: localhost exactly."
-
-media_status=$(curl --silent --show-error --output /dev/null --max-time 20 --write-out '%{http_code}' "https://${STAGING_HOSTNAME}/media/codex-verification-probe")
-[ "$media_status" = "404" ] || fail "The public /media path did not fail closed with 404."
 
 security_headers=$(curl --fail --silent --show-error --head --max-time 20 "https://${STAGING_HOSTNAME}/accounts/login/")
 printf '%s\n' "$security_headers" | tr -d '\r' | grep -iq '^x-content-type-options: nosniff$' || fail "The live nosniff header is absent."

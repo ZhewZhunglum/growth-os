@@ -217,54 +217,13 @@ STATIC_URL = "static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
 STATICFILES_DIRS = [BASE_DIR / "static"]
 
-MEDIA_STORAGE_BACKEND = os.getenv(
-    "MEDIA_STORAGE_BACKEND", "filesystem" if IS_LOCAL else ""
-).strip().lower()
-if IS_LOCAL:
-    if MEDIA_STORAGE_BACKEND != "filesystem":
-        raise ImproperlyConfigured(
-            "Local media storage must use MEDIA_STORAGE_BACKEND=filesystem."
-        )
-    DEFAULT_MEDIA_STORAGE = {"BACKEND": "django.core.files.storage.FileSystemStorage"}
-    TENCENT_COS_BUCKET = ""
-    TENCENT_COS_REGION = ""
-    TENCENT_COS_SECRET_ID = ""
-    TENCENT_COS_SECRET_KEY = ""
-else:
-    if MEDIA_STORAGE_BACKEND != "cos":
-        raise ImproperlyConfigured(
-            "Staging and Production require explicit MEDIA_STORAGE_BACKEND=cos."
-        )
-    TENCENT_COS_BUCKET = os.getenv("TENCENT_COS_BUCKET", "").strip()
-    TENCENT_COS_REGION = os.getenv("TENCENT_COS_REGION", "").strip()
-    if not TENCENT_COS_BUCKET or not TENCENT_COS_REGION:
-        raise ImproperlyConfigured(
-            "TENCENT_COS_BUCKET and TENCENT_COS_REGION must be supplied for private COS storage."
-        )
-    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*-[0-9]+", TENCENT_COS_BUCKET):
-        raise ImproperlyConfigured(
-            "TENCENT_COS_BUCKET must use the BucketName-APPID format."
-        )
-    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", TENCENT_COS_REGION):
-        raise ImproperlyConfigured("TENCENT_COS_REGION is invalid.")
-    TENCENT_COS_SECRET_ID = secret_env_or_file(
-        "TENCENT_COS_SECRET_ID", required=True, file_only=True
-    )
-    TENCENT_COS_SECRET_KEY = secret_env_or_file(
-        "TENCENT_COS_SECRET_KEY", required=True, file_only=True
-    )
-    DEFAULT_MEDIA_STORAGE = {"BACKEND": "growth_os.storage_backends.TencentCOSPrivateStorage"}
-
 STORAGES = {
-    "default": DEFAULT_MEDIA_STORAGE,
     "staticfiles": {
         "BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage"
         if not IS_LOCAL
         else "django.contrib.staticfiles.storage.StaticFilesStorage"
     },
 }
-MEDIA_URL = "media/"
-MEDIA_ROOT = Path(os.getenv("MEDIA_ROOT", BASE_DIR / "media"))
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 LOGIN_URL = "login"
@@ -299,15 +258,6 @@ LOGGING = {
         "standard": {"format": "%(asctime)s %(levelname)s %(name)s %(message)s"},
     },
     "handlers": {"console": {"class": "logging.StreamHandler", "formatter": "standard"}},
-    "loggers": {
-        # COS INFO logs include full private object keys and request headers.
-        # Keep failures visible without copying asset identifiers into the
-        # general application log stream.
-        "qcloud_cos": {
-            "handlers": ["console"],
-            "level": "WARNING",
-            "propagate": False,
-        },
-    },
+    "loggers": {},
     "root": {"handlers": ["console"], "level": os.getenv("LOG_LEVEL", "INFO")},
 }

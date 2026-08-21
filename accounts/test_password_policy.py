@@ -23,8 +23,6 @@ class PasswordPolicySettingsTests(SimpleTestCase):
                 "settings-test-only-A7x!Q2m#R9v$K4p%T8s&N6d*L3c-W5z"
             ),
             "POSTGRES_PASSWORD_FILE": "settings-test-password",
-            "TENCENT_COS_SECRET_ID_FILE": "settings-test-id",
-            "TENCENT_COS_SECRET_KEY_FILE": "settings-test-key",
         }
         environment: dict[str, str] = {}
         for name, value in secret_values.items():
@@ -40,10 +38,6 @@ class PasswordPolicySettingsTests(SimpleTestCase):
             "DJANGO_SECRET_KEY_FILE",
             "POSTGRES_PASSWORD",
             "POSTGRES_PASSWORD_FILE",
-            "TENCENT_COS_SECRET_ID",
-            "TENCENT_COS_SECRET_ID_FILE",
-            "TENCENT_COS_SECRET_KEY",
-            "TENCENT_COS_SECRET_KEY_FILE",
         ):
             process_environment.pop(name, None)
         process_environment.update(
@@ -56,14 +50,6 @@ class PasswordPolicySettingsTests(SimpleTestCase):
                 "POSTGRES_HOST": "127.0.0.1",
             }
         )
-        if environment != "local":
-            process_environment.update(
-                {
-                    "MEDIA_STORAGE_BACKEND": "cos",
-                    "TENCENT_COS_BUCKET": "settings-test-1234567890",
-                    "TENCENT_COS_REGION": "ap-beijing",
-                }
-            )
         if minimum is None:
             process_environment.pop("PASSWORD_MIN_LENGTH", None)
         else:
@@ -120,10 +106,6 @@ class PasswordPolicySettingsTests(SimpleTestCase):
             "DJANGO_SECRET_KEY_FILE",
             "POSTGRES_PASSWORD",
             "POSTGRES_PASSWORD_FILE",
-            "TENCENT_COS_SECRET_ID",
-            "TENCENT_COS_SECRET_ID_FILE",
-            "TENCENT_COS_SECRET_KEY",
-            "TENCENT_COS_SECRET_KEY_FILE",
         ):
             process_environment.pop(name, None)
         process_environment.update(
@@ -134,9 +116,6 @@ class PasswordPolicySettingsTests(SimpleTestCase):
                 "POSTGRES_DB": "settings_test",
                 "POSTGRES_USER": "settings_test",
                 "POSTGRES_HOST": "127.0.0.1",
-                "MEDIA_STORAGE_BACKEND": "cos",
-                "TENCENT_COS_BUCKET": "settings-test-1234567890",
-                "TENCENT_COS_REGION": "ap-beijing",
                 "TEST_PASSWORD": "            ",
             }
         )

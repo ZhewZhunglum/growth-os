@@ -2,20 +2,20 @@
 
 This runbook is the reproducible path for the frozen V1 Staging candidate. It
 does not authorize a Production launch. A reachable page is not release
-evidence: the immutable revision, PostgreSQL behavior, object storage, negative
-smoke cases and isolated recovery rehearsal must all pass first.
+evidence: the immutable revision, PostgreSQL behavior, link-only content flow,
+negative smoke cases and isolated recovery rehearsal must all pass first.
 
 ## 1. Required boundary
 
-- Use a dedicated Staging host, database volume, private COS bucket, credentials
-  and DNS name. Never connect Staging to Production data.
+- Use a dedicated Staging host, database volume, credentials and DNS name.
+  Never connect Staging to Production data.
 - Public traffic enters Nginx on ports 80 and 443. Port 80 only redirects to
   HTTPS. Django is additionally published on `127.0.0.1:18000` for host-local
   diagnosis and is never exposed by the firewall.
-- Nginx overwrites forwarding headers, rate-limits the login endpoint, accepts
-  uploads up to 110 MB, and returns 404 for every public `/media/` URL.
-- Uploaded media uses COS. There is no `/app/media` volume in the Staging
-  topology.
+- Nginx overwrites forwarding headers and rate-limits the login endpoint.
+- V1 accepts no file uploads. Immutable content versions store external URLs;
+  publication proof stores an external URL and/or platform content ID. The
+  runtime persists only database state and requires no content-storage service.
 - All application deployments use a clean checkout at one exact 40-character
   Git SHA and a separately approved immutable registry digest. The pulled
   repository digest, OCI revision label and `/health/` revision must agree.
@@ -71,9 +71,6 @@ POSTGRES_DB=<staging-database-name>
 POSTGRES_USER=<staging-database-user>
 SECRETS_DIR=<absolute-protected-secret-directory>
 DEPLOY_BACKUP_DIR=<absolute-protected-backup-directory>
-MEDIA_STORAGE_BACKEND=cos
-TENCENT_COS_BUCKET=<staging-bucket-identifier>
-TENCENT_COS_REGION=<staging-region>
 # Required only while initializing the new Compose database volume from the
 # audited old candidate. Remove these after the first verified restore:
 # STAGING_INITIAL_DUMP=<absolute-path-to-custom-format-baseline-dump>
@@ -94,8 +91,6 @@ Provision these exact files under the configured `SECRETS_DIR`:
 django_secret_key
 postgres_password
 app_postgres_password
-tencent_cos_secret_id
-tencent_cos_secret_key
 tls_fullchain.pem
 tls_privkey.pem
 ```
@@ -103,8 +98,7 @@ tls_privkey.pem
 The directory should be mode `0700`; every credential and private-key file
 should be mode `0400` or `0600`. File-backed Compose Secrets are read-only bind
 mounts and retain host ownership on Docker Compose, so `django_secret_key`,
-`app_postgres_password`, `tencent_cos_secret_id`, and
-`tencent_cos_secret_key` must be owned by the numeric UID of the immutable
+`app_postgres_password` must be owned by the numeric UID of the immutable
 image's non-root `growthos` user. `postgres_password` is a separate copy of the
 same approved database password and must be owned by the immutable PostgreSQL
 image's `postgres` UID. This split avoids making one file readable by two
@@ -135,14 +129,10 @@ test "$growthos_gid" = "$GROWTHOS_GID"
 test "$postgres_uid" = "$POSTGRES_UID"
 test "$postgres_gid" = "$POSTGRES_GID"
 sudo chown "$growthos_uid:$growthos_gid" "$SECRETS_DIR/django_secret_key" \
-  "$SECRETS_DIR/app_postgres_password" \
-  "$SECRETS_DIR/tencent_cos_secret_id" \
-  "$SECRETS_DIR/tencent_cos_secret_key"
+  "$SECRETS_DIR/app_postgres_password"
 sudo chown "$postgres_uid:$postgres_gid" "$SECRETS_DIR/postgres_password"
 sudo chmod 0600 "$SECRETS_DIR/django_secret_key" \
-  "$SECRETS_DIR/app_postgres_password" "$SECRETS_DIR/postgres_password" \
-  "$SECRETS_DIR/tencent_cos_secret_id" \
-  "$SECRETS_DIR/tencent_cos_secret_key"
+  "$SECRETS_DIR/app_postgres_password" "$SECRETS_DIR/postgres_password"
 ```
 
 If the deploy stops at either readability check, no migration has run. Correct
@@ -150,11 +140,12 @@ ownership while retaining mode `0400` or `0600`, then rerun the same command.
 Do not change the TLS private-key owner merely to satisfy the application
 container; only Nginx consumes it.
 
-The current storage backend has no configurable deployment prefix. Staging must
-therefore use its own dedicated private COS bucket; sharing a Production bucket
-under an operator-agreed prefix is not supported. The COS identity must have
-least privilege restricted to that one Staging bucket, with no account
-administration permissions or access to any Production bucket.
+Content records are link-only. A changed deliverable URL must create a new
+immutable `ContentAssetVersion` and pass submission and review again; never edit
+an already submitted version in place. Review and release-gate rows remain bound
+to that exact version, while publication-proof URL/content-ID facts remain
+immutable. Operators must use Staging-safe external references and must not
+place credentials in URLs.
 
 ## 5. DNS, firewall and TLS
 
@@ -287,15 +278,16 @@ Later deployments use the already initialized new volume.
 
 The baseline must be a separately audited, Staging-only export. Before approving
 it, inventory all Principals, Django staff/superuser flags, Grants, sessions,
-and file/proof object references. It must contain no Production data, shared or
-legacy active human identity, staff/superuser identity, live session, or media
-reference. Rotating `django_secret_key` alone is not accepted as identity
-sanitization. After restore, the deploy script repeats these counts and stops
-with the web service still loopback-only if any count is non-zero. If an old
-volume or any database object reference became non-empty after the earlier
-audit, stop: migrate each object explicitly to the dedicated private COS bucket
-with authenticated hash/read-back and ACL verification, or produce a new
-audited baseline. Never leave database pointers to absent COS objects.
+and externally referenced content/proof rows. It must contain no Production
+data, shared or legacy active human identity, staff/superuser identity, or live
+session. Rotating `django_secret_key` alone is not accepted as identity
+sanitization. After restore, the deploy script repeats the identity and session
+counts and stops with the web service still loopback-only if any forbidden count
+is non-zero. It also rejects every `ContentAssetVersion` that is not an explicit
+link manifest (`text/uri-list`, `metadata.source=external-url`, and an `http://`
+or `https://` object key), so an old file-backed record cannot silently become a
+broken link. External URLs and platform content IDs are database references;
+the deployment does not copy, fetch, hash or otherwise certify remote bytes.
 
 For the first sanitized import, keep `STAGING_DEPLOY_MODE=bootstrap` and run:
 
@@ -308,7 +300,7 @@ application digest, checks its registry digest and OCI revision label, starts
 PostgreSQL, creates a mode-0600 pre-migration custom-format backup and checksum,
 runs the one-off migration job, then replaces only the loopback-bound web
 service. Bootstrap requires that no candidate web container already exists and
-repeats the fail-closed zero active-human/session/media-reference gate. It does
+repeats the fail-closed zero active-human/session gate. It does
 **not** start Nginx, delete the prior image, or merge the PR.
 
 If the pre-migration backup fails or is empty, the migration does not run. Copy
@@ -329,14 +321,14 @@ STAGING_UPGRADE_QUIESCE_CONFIRMATION=<exact-40-character-reviewed-sha> \
 Upgrade fails before migration unless the current loopback web is healthy,
 the exact three configured active HUMAN accounts and exact bounded Grants pass
 the locked provisioning dry run, the exact committed Operator PUBLISH Grant is
-present, and no staff/superuser exists. It invalidates every Django session,
-then streams every referenced `ContentAssetVersion` and publication proof from
-the dedicated COS bucket and checks existence, recorded byte size where
-available, and SHA-256. Only then does it back up, migrate once and replace web.
-It repeats the exact identity/Grant, zero-session and full COS size/hash gates
-against the new code after migration. Existing valid history is retained; an
-upgrade never requires media references to be empty. Any failed pre/post check
-leaves Nginx stopped and the candidate unexposed.
+present, no staff/superuser exists, and every existing content version passes
+the link-only gate. It invalidates every Django session, then applies the
+database integrity checks, backs up, migrates once and replaces web. It repeats
+the exact identity/Grant, zero-session, and link-only gates against the new code
+after migration. Bootstrap runs the same link-only gate after restore and
+migration. Existing immutable link and proof history is retained; the deployment
+never fetches external content as a release prerequisite. Any failed pre/post
+check leaves Nginx stopped and the candidate unexposed.
 
 ## 7. Provision acceptance-test staff while still loopback-only
 
@@ -344,8 +336,8 @@ This section is bootstrap-only. Do not recreate, rotate or silently extend the
 three accounts during `upgrade`; the upgrade gates verify their existing exact
 identities and Grants.
 
-Do this only after bootstrap has reported zero old identities, sessions and
-media references, and after confirming that the sealed Product, contract,
+Do this only after bootstrap has reported zero old identities and sessions, and
+after confirming that the sealed Product, contract,
 ChannelAccount, Staging binding and OPEN CapabilityState are present. The
 candidate still has no public Nginx at this point. The five non-secret
 `STAGING_*` identity/context values in the protected config are the frozen
@@ -435,9 +427,8 @@ This command requires the exact three config-bound active HUMAN Principals,
 their exact roles, internal usable credentials, no staff/superuser flags, no
 fourth active human, no sessions, successful transactionally locked
 provisioning dry-run verification, and an already-committed exact bounded
-Operator PUBLISH Grant. Bootstrap additionally requires zero media references;
-upgrade relies on the just-completed full COS size/hash post-migration gate and
-retains valid history. The exposure command also repeats the running digest, loopback
+Operator PUBLISH Grant. Existing immutable external-link history is retained
+without fetching remote content. The exposure command also repeats the running digest, loopback
 binding, health, certificate, rendered-template, and no-extra-vhost checks
 before binding 80/443. It performs no migration.
 
@@ -447,19 +438,16 @@ Immediately run the verifier using the same exact SHA:
 sh scripts/verify-staging.sh <exact-40-character-reviewed-sha>
 ```
 
-It verifies, without printing Secrets (and creates only one random, tiny COS
-probe object that its `finally` cleanup removes through authenticated storage):
+It verifies, without printing Secrets or creating external content:
 
 - the approved application registry digest, running image ID and matching OCI
   revision label;
-- application binding at `127.0.0.1:18000` and absence of `/app/media`;
+- application binding at `127.0.0.1:18000`;
 - read-only Secret mounts and absence of plaintext Secret environment entries;
 - explicit Staging mode, password minimum of 12, PostgreSQL engine and version;
-- no pending migration, Django checks, deploy checks and Nginx syntax;
-- authenticated COS write/read, anonymous direct GET denied with 403/404, and
-  authenticated deletion verified even on probe failure;
-- 110 MB body limit, login throttling, overwritten forwarding headers and
-  denied `/media/` route;
+- no pending migration, Django checks, deploy checks, link-only content-version
+  records and Nginx syntax;
+- login throttling and overwritten forwarding headers;
 - trusted HTTPS, exact port-80 canonical redirects (including `Host:
   localhost`), healthy database and exact `/health/` SHA.
 
@@ -490,28 +478,25 @@ rollback window on the approved, time-boxed schedule (normally no more than 24
 hours). Record the old project name, container IDs, image digests and volume
 names; stop and disable every old web/database container so
 `restart: unless-stopped` cannot bring it back. Do not use
-`docker compose down -v`, and do not delete the old database/media volumes here. Retain those stopped
+`docker compose down -v`, and do not delete the old data volumes here. Retain those stopped
 volumes under the explicit data-retention decision, access-control them, and
 dispose of them only through a later approved destruction change. This removes
-the old environment, filesystem-storage and credential attack surface without
+the old environment and obsolete credential attack surface without
 destroying the rollback evidence.
 
 ## 10. Backup and isolated recovery rehearsal
 
 The pre-migration dump and an hourly `pg_dump` are temporary Staging safeguards,
 not the frozen Production recovery design. Before promotion, PostgreSQL must
-have encrypted base backups plus continuous WAL/PITR with archive delay no more
-than 15 minutes and an isolated recovery window of at least 14 days. Monitor
-backup success, WAL delay, capacity and restore failures, with Owner/Admin
-alerts before the one-hour RPO can be exceeded. COS objects and append-only
-audit logs also need encrypted, independently writable-denied copies no later
-than one hour after creation; audit export should target 15 minutes.
-
-Application object keys include the full content SHA-256, so different bytes
-never target the same key. COS's `x-cos-forbid-overwrite` is additional defense
-when bucket versioning is disabled; the application does not rely on it when a
-recovery/versioning policy makes that header ineffective. The live bucket ACL
-and policy must remain private in either mode.
+have encrypted base backups plus continuous WAL/PITR copied to an
+access-controlled destination off the database and application host, with
+archive delay no more than 15 minutes and an isolated recovery window of at
+least 14 days. A Docker volume or dump retained only on the candidate host is
+not a backup. Monitor backup success, WAL delay, capacity, off-host replication
+and restore failures, with Owner/Admin alerts before the one-hour RPO can be
+exceeded. Database backups cover Growth OS audit records and external-link
+metadata; the remote content behind those links remains outside Growth OS's
+recovery boundary.
 
 Run restoration under a different Compose project name and on a separate host,
 VM, or isolated Docker volume. Never restore over the candidate database. A
@@ -522,11 +507,10 @@ typical isolated rehearsal is:
 3. Verify the dump checksum before `pg_restore`.
 4. Restore with `pg_restore --clean --if-exists --no-owner --no-acl` into the
    isolated database.
-5. Restore the COS test objects into a separate isolated private bucket.
-6. Start the exact application image against the restored resources.
-7. Run `/health/`, record counts/checksums for acceptance records, and download
-   representative objects through the approved application path.
-8. Record the recovered point and finish time.
+5. Start the exact application image against the restored database.
+6. Run `/health/`, record counts/checksums for acceptance records, and inspect
+   representative content-version and publication-proof link rows.
+7. Record the recovered point and finish time.
 
 The rehearsal passes only if measured data loss is at most one hour and service
 recovery is at most four hours. Store the commands, sanitized output, timing,
@@ -563,19 +547,19 @@ schema.
 If a migration is not backward-compatible, stop new writes, take another dump,
 restore the pre-migration backup into an isolated replacement database, verify
 it, and only then switch the old image to that restored database. Never overwrite
-the current database or dedicated COS bucket in place. Record the failed SHA,
+the current database in place. Record the failed SHA,
 reason, database decision, operator, start/end time and verification evidence.
 
 ## 12. Promotion gate
 
 Keep the PR unmerged and label the environment `staging-candidate` until all of
 the following exist: the approved `(Git SHA, repository digest)` and matching
-running/health evidence; zero-count pre-edge identity/session/media-reference
-evidence; complete COS/config versioning; a live authenticated COS write/read,
-anonymous-denial and authenticated-cleanup probe; PostgreSQL full and
-concurrency passes; structured positive/negative smoke evidence; certificate
-renewal evidence; documented retirement of the old stack; encrypted
-PITR/COS/audit backup and alerting evidence; and an isolated recovery rehearsal
-with RPO no greater than one hour and RTO no greater than four hours. Production
+running/health evidence; zero-count pre-edge identity/session evidence;
+link-only content and publication-proof acceptance evidence; PostgreSQL full
+and concurrency passes; structured positive/negative smoke evidence;
+certificate renewal evidence; documented retirement of the old stack;
+encrypted off-host PostgreSQL PITR backup and alerting evidence; and an isolated
+recovery rehearsal with RPO no greater than one hour and RTO no greater than
+four hours. Production
 requires a separate approved deployment decision and Production-specific
-Secrets, domain, database, storage and HSTS validation.
+Secrets, domain, database backup and HSTS validation.

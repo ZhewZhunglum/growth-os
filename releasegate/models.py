@@ -1075,8 +1075,10 @@ class PublicationEventManager(ImmutableManager):
                     raise ValidationError("Current context changed; return to GATE_PENDING and evaluate a new Gate.")
                 if actor_principal.pk != release_gate.publisher_principal_id or permission_grant.pk != release_gate.publisher_grant_id:
                     raise ValidationError("Publication proof must name the Gate's exact Publisher and Grant.")
-                if not (external_publication_id or external_url) or not proof_reference or not proof_sha256:
-                    raise ValidationError("Manual publication requires external ID/URL and exact proof reference/hash.")
+                if not (external_publication_id or external_url):
+                    raise ValidationError("Manual publication requires an external ID or URL.")
+                if proof_reference or proof_sha256:
+                    raise ValidationError("V1 manual publication records cannot store file proof fields.")
             previous = current.events.order_by("-event_sequence").first()
             event = self.model(
                 publication=current, event_type=event_type, release_gate=release_gate,
@@ -1142,6 +1144,13 @@ class PublicationEvent(ImmutableFact):
 
     def clean(self):
         super().clean()
+        if (
+            self.event_type == self.EventType.MANUAL_PUBLISHED_RECORDED
+            and (self.proof_reference or self.proof_sha256)
+        ):
+            raise ValidationError(
+                {"proof_reference": "V1 manual publication records cannot store file proof fields."}
+            )
         if self.event_sequence == 1 and self.previous_event_id:
             raise ValidationError("The first PublicationEvent cannot have a previous event.")
         if self.event_sequence > 1 and (

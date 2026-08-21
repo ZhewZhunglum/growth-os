@@ -33,7 +33,6 @@ from .models import (
     canonical_sha256,
     release_context_hash,
     required_policy_versions_for_contract,
-    validate_sha256,
 )
 
 
@@ -449,23 +448,18 @@ def record_manual_publication_proof(
     command_id: uuid.UUID,
     external_url: str = "",
     external_publication_id: str = "",
-    proof_reference: str,
-    proof_sha256: str,
 ) -> PublicationEvent:
-    """Append external proof only; this function never publishes externally."""
+    """Append an external URL/content-ID proof; never publish externally."""
 
     try:
         command_id = uuid.UUID(str(command_id))
     except (TypeError, ValueError, AttributeError) as exc:
         raise ValidationError({"command_id": "A valid UUID command_id is required."}) from exc
-    validate_sha256(proof_sha256)
     payload_hash = _payload(
         "manual-publication-proof",
         publication_id=str(publication.pk),
         external_url=external_url,
         external_publication_id=external_publication_id,
-        proof_reference=proof_reference,
-        proof_sha256=proof_sha256,
     )
     existing = PublicationEvent.objects.filter(command_id=command_id).first()
     if existing is not None:
@@ -508,6 +502,4 @@ def record_manual_publication_proof(
         recorded_by_principal=publisher,
         external_publication_id=external_publication_id,
         external_url=external_url,
-        proof_reference=proof_reference,
-        proof_sha256=proof_sha256,
     )

@@ -7,7 +7,7 @@
 <section class="section-heading"><div><p class="eyebrow">审核已通过</p><h2>等待门禁或发布证明</h2></div><span class="section-note">{{ tasks|length }} 项</span></section>
 <section class="task-list">
     {% for task in tasks %}
-    <article class="task-card"><header class="task-card-header"><div><p class="task-meta">{{ task.product.name }}</p><h3>{{ task.title }}</h3></div><span class="task-state task-state-approved">{{ task.current_state|task_state_zh }}</span></header><div class="task-section"><span class="task-label">下一步</span><p>选择账号和运行环境进行门禁检查；通过后请到平台人工发布，再回来上传证明。</p></div><footer class="task-card-footer"><span>系统不会替你点击平台发布按钮</span><a class="button button-primary" href="{% url 'dashboard:release-detail' task.id %}">打开发布流程</a></footer></article>
+    <article class="task-card"><header class="task-card-header"><div><p class="task-meta">{{ task.product.name }}</p><h3>{{ task.title }}</h3></div><span class="task-state task-state-approved">{{ task.current_state|task_state_zh }}</span></header><div class="task-section"><span class="task-label">下一步</span><p>选择账号和运行环境进行门禁检查；通过后请到平台人工发布，再回来登记网址或内容 ID。</p></div><footer class="task-card-footer"><span>系统不会替你点击平台发布按钮</span><a class="button button-primary" href="{% url 'dashboard:release-detail' task.id %}">打开发布流程</a></footer></article>
     {% empty %}<article class="empty-state task-empty-state"><span class="empty-number">00</span><div><h3>当前没有可处理的发布任务</h3><p>你现在不需要做任何操作。</p></div></article>{% endfor %}
 </section>
 {% endblock %}

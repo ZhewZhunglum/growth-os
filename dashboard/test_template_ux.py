@@ -77,7 +77,7 @@ class DashboardTemplateUXTests(SimpleTestCase):
         self.assertIn("我已完成的审核", html)
         self.assertIn("还没有已完成的审核记录", html)
 
-    def test_review_history_detail_is_read_only_and_names_exact_asset_version(self):
+    def test_review_history_detail_is_read_only_and_hides_link_without_permission(self):
         principal = SimpleNamespace(display_name="审核人员", username="reviewer")
         product = SimpleNamespace(name="PUKO")
         task = SimpleNamespace(title="审核历史测试", description="只读说明", product=product)
@@ -90,10 +90,10 @@ class DashboardTemplateUXTests(SimpleTestCase):
         )
         asset_version = SimpleNamespace(
             version_number=3,
-            mime_type="text/plain",
+            mime_type="text/uri-list",
             content_sha256="a" * 64,
-            object_key="controlled/task/asset-v3.txt",
-            metadata={"original_filename": "asset-v3.txt"},
+            object_key="https://docs.example.com/private/asset-v3",
+            metadata={"source": "external-url"},
         )
 
         html = render_to_string(
@@ -104,10 +104,13 @@ class DashboardTemplateUXTests(SimpleTestCase):
                 "submission": submission,
                 "review": review,
                 "asset_version": asset_version,
+                "is_link_delivery": True,
+                "can_view_asset": False,
             },
         )
 
         self.assertIn("只读记录", html)
-        self.assertIn("asset-v3.txt", html)
+        self.assertNotIn(asset_version.object_key, html)
         self.assertIn("a" * 64, html)
+        self.assertIn("当前审核权限已失效", html)
         self.assertNotIn("<form", html)

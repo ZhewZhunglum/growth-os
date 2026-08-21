@@ -137,10 +137,6 @@ class DeploymentIdentitySettingsTests(SimpleTestCase):
             "DJANGO_SECRET_KEY_FILE",
             "POSTGRES_PASSWORD",
             "POSTGRES_PASSWORD_FILE",
-            "TENCENT_COS_SECRET_ID",
-            "TENCENT_COS_SECRET_ID_FILE",
-            "TENCENT_COS_SECRET_KEY",
-            "TENCENT_COS_SECRET_KEY_FILE",
         ):
             process_environment.pop(name, None)
         process_environment.update(
@@ -153,9 +149,6 @@ class DeploymentIdentitySettingsTests(SimpleTestCase):
                 "POSTGRES_DB": "growth_os_test",
                 "POSTGRES_USER": "growth_os_test",
                 "POSTGRES_HOST": "127.0.0.1",
-                "MEDIA_STORAGE_BACKEND": "cos",
-                "TENCENT_COS_BUCKET": "settings-test-1234567890",
-                "TENCENT_COS_REGION": "ap-beijing",
             }
         )
         with tempfile.TemporaryDirectory() as secret_directory:
@@ -164,8 +157,6 @@ class DeploymentIdentitySettingsTests(SimpleTestCase):
                     "staging-test-only-A7x!Q2m#R9v$K4p%T8s&N6d*L3c-W5z-X9Z"
                 ),
                 "POSTGRES_PASSWORD_FILE": "test-only-not-a-real-secret",
-                "TENCENT_COS_SECRET_ID_FILE": "settings-test-id",
-                "TENCENT_COS_SECRET_KEY_FILE": "settings-test-key",
             }
             for name, value in secret_values.items():
                 path = Path(secret_directory) / name.lower()
@@ -180,7 +171,8 @@ class DeploymentIdentitySettingsTests(SimpleTestCase):
                         "print(configured.SECURE_SSL_REDIRECT); "
                         "print(configured.SESSION_COOKIE_SECURE); "
                         "print(configured.CSRF_COOKIE_SECURE); "
-                        "print(hasattr(configured, 'SECURE_HSTS_SECONDS'))"
+                        "print(hasattr(configured, 'SECURE_HSTS_SECONDS')); "
+                        "print('default' in configured.STORAGES)"
                     ),
                 ],
                 cwd=self.PROJECT_ROOT,
@@ -191,5 +183,14 @@ class DeploymentIdentitySettingsTests(SimpleTestCase):
             )
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.splitlines(), ["True", "True", "True", "False"])
+        self.assertEqual(
+            result.stdout.splitlines(),
+            [
+                "True",
+                "True",
+                "True",
+                "False",
+                "False",
+            ],
+        )
 
