@@ -397,6 +397,91 @@ class ExternalEvidenceItem(ImmutableFact):
             raise ValidationError({"provenance_sha256": "Evidence provenance hash mismatch."})
 
 
+class EvidenceInvalidationEvent(ImmutableFact):
+    """Append-only removal of evidence from future Daily Operations decisions.
+
+    The original evidence is deliberately left untouched so any already-made
+    decision keeps its exact provenance.  User-facing queries exclude an item
+    after this event, while historical links continue to resolve.
+    """
+
+    evidence_item = models.OneToOneField(
+        ExternalEvidenceItem,
+        on_delete=models.PROTECT,
+        related_name="invalidation_event",
+    )
+    product = models.ForeignKey(
+        "products.Product",
+        on_delete=models.PROTECT,
+        related_name="evidence_invalidation_events",
+    )
+    command_id = models.UUIDField(unique=True)
+    payload_hash = models.CharField(max_length=64)
+    reason = models.TextField()
+    invalidated_by_principal = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="evidence_invalidations_created",
+    )
+    acting_role = models.CharField(max_length=24, choices=ActingRole.choices)
+    permission_grant = models.ForeignKey(
+        "accounts.PermissionGrant",
+        on_delete=models.PROTECT,
+        related_name="evidence_invalidation_events",
+    )
+    invalidated_at = models.DateTimeField(default=timezone.now)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def payload(self) -> dict[str, Any]:
+        return {
+            "evidence_item_id": str(self.evidence_item_id),
+            "product_id": str(self.product_id),
+            "reason": self.reason,
+        }
+
+    def clean(self):
+        super().clean()
+        if not self.reason.strip():
+            raise ValidationError({"reason": "A plain-language removal reason is required."})
+        if self.evidence_item_id and self.product_id:
+            batch_product_id = str(self.evidence_item.collection_run.query_spec.get("product_id", ""))
+            if batch_product_id != str(self.product_id):
+                raise ValidationError({"product": "Evidence removal must keep the exact batch product."})
+        if self.permission_grant_id and self.invalidated_by_principal_id:
+            grant = self.permission_grant
+            if grant.principal_id != self.invalidated_by_principal_id:
+                raise ValidationError({"permission_grant": "The grant must belong to the removing Principal."})
+            if grant.action != "EDIT" or grant.effect != "ALLOW":
+                raise ValidationError({"permission_grant": "Evidence removal requires an ALLOW EDIT grant."})
+            if grant.scope_kind == "PRODUCT" and grant.product_id != self.product_id:
+                raise ValidationError({"permission_grant": "The EDIT grant must cover the exact product."})
+            if grant.scope_kind not in {"GLOBAL", "PRODUCT"}:
+                raise ValidationError({"permission_grant": "Evidence removal requires GLOBAL or PRODUCT scope."})
+            if self.acting_role != self.invalidated_by_principal.role:
+                raise ValidationError({"acting_role": "The acting role must match the removing Principal."})
+            if not grant.is_current:
+                raise ValidationError({"permission_grant": "Evidence removal requires a current active grant."})
+            from accounts.authorization import resolve_authorization
+            from accounts.models import PermissionGrant
+
+            decision = resolve_authorization(
+                principal=self.invalidated_by_principal,
+                acting_role=self.acting_role,
+                action=PermissionGrant.Action.EDIT,
+                scope_kind=PermissionGrant.ScopeKind.PRODUCT,
+                product=self.product,
+            )
+            if not decision.allowed or decision.grant is None or decision.grant.pk != grant.pk:
+                raise ValidationError(
+                    {"permission_grant": "The exact grant must be the current fail-closed authorization decision."}
+                )
+        expected = canonical_sha256(self.payload())
+        if not self.payload_hash:
+            self.payload_hash = expected
+        elif self.payload_hash != expected:
+            raise ValidationError({"payload_hash": "Evidence removal payload hash mismatch."})
+
+
 class EvidenceArtifactLink(ImmutableFact):
     evidence_item = models.ForeignKey(
         ExternalEvidenceItem, on_delete=models.PROTECT, related_name="artifact_links"

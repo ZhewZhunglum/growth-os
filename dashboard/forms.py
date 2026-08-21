@@ -4,6 +4,7 @@ import uuid
 
 from django import forms
 from django.core import signing
+from django.utils.translation import get_language
 
 from accounts.models import Principal
 from core.ids import uuid7
@@ -16,6 +17,76 @@ CHECK_CHOICES = (
     (TaskCheckRun.Result.PASS, "通过（PASS）"),
     (TaskCheckRun.Result.BLOCKED, "阻塞（BLOCKED）"),
 )
+
+CHECK_CHOICES_EN = (
+    ("", "Select a result"),
+    (TaskCheckRun.Result.PASS, "Pass"),
+    (TaskCheckRun.Result.BLOCKED, "Not ready"),
+)
+
+
+def _is_english() -> bool:
+    return str(get_language() or "zh-hans").lower().startswith("en")
+
+
+FORM_TEXT = {
+    "product_profile_version": ("产品配置版本", "Product profile version"),
+    "contract_version": ("任务合同版本", "Task contract version"),
+    "title": ("任务名称", "Task name"),
+    "description": ("为什么做 / 任务说明", "Purpose / task instructions"),
+    "assignee": ("分配给哪位执行负责人", "Assign to"),
+    "external_url": ("本次交付链接", "Delivery link"),
+    "submission_note": ("交付说明", "Delivery note"),
+}
+
+FORM_HELP = {
+    "description": (
+        "请用自然语言说明背景和目标；具体 DoR/DoD 来自所选合同。",
+        "Explain the context and goal in plain language. Readiness and delivery checks come from the selected contract.",
+    ),
+    "external_url": (
+        "必填。请填写可供审核和发布人员打开的内容链接。链接变化时需提交新版本。",
+        "Required. Add a link that reviewers and publishers can open. Submit a new version whenever the link changes.",
+    ),
+}
+
+CLASS_FORM_TEXT = {
+    "CancelTaskForm": {
+        "reason": ("取消原因", "Reason for cancellation"),
+        "confirm": ("确认取消这份草稿", "I confirm that this draft should be cancelled"),
+    },
+    "WithdrawSubmissionForm": {
+        "reason": ("撤回原因", "Reason for withdrawal"),
+        "confirm": ("确认撤回并重新修改", "I confirm that I want to withdraw and revise this submission"),
+    },
+}
+
+CLASS_FORM_HELP = {
+    "CancelTaskForm": {
+        "reason": (
+            "任务不会被删除；系统会保留审计记录，并从 Today 主列表隐藏。",
+            "The task is not deleted. Its audit history remains, and it is hidden from the main Today list.",
+        ),
+    },
+    "WithdrawSubmissionForm": {
+        "reason": (
+            "仅在审核人尚未作出结论时可撤回；旧版本仍会保留。",
+            "You can withdraw only before a reviewer decides. The previous version remains in history.",
+        ),
+    },
+}
+
+
+def _localize_form(form: forms.Form) -> None:
+    if not _is_english():
+        return
+    labels = {**FORM_TEXT, **CLASS_FORM_TEXT.get(form.__class__.__name__, {})}
+    help_texts = {**FORM_HELP, **CLASS_FORM_HELP.get(form.__class__.__name__, {})}
+    for name, field in form.fields.items():
+        if name in labels:
+            field.label = labels[name][1]
+        if name in help_texts:
+            field.help_text = help_texts[name][1]
 
 TASK_CREATE_TOKEN_SALT = "growth-os.dashboard.task-create.v1"
 
@@ -74,6 +145,10 @@ class TaskCreateForm(forms.Form):
             "product_profile_version__version_number",
             "version_number",
         )
+        if _is_english():
+            self.fields["product_profile_version"].empty_label = "Select a sealed product profile"
+            self.fields["contract_version"].empty_label = "Select the matching task contract"
+        _localize_form(self)
 
     def clean_task_id(self):
         task_id = self.cleaned_data["task_id"]
@@ -124,6 +199,7 @@ class CommandForm(forms.Form):
         initial.setdefault("command_id", uuid.uuid4())
         initial.setdefault("expected_state_version", state_version)
         super().__init__(*args, **kwargs)
+        _localize_form(self)
 
 
 class CriteriaCommandForm(CommandForm):
@@ -137,9 +213,13 @@ class CriteriaCommandForm(CommandForm):
             required = criterion.get("required", True)
             self.fields[f"{self.field_prefix}{key}"] = forms.ChoiceField(
                 label=criterion_label(criterion, "Unnamed criterion"),
-                choices=CHECK_CHOICES,
+                choices=CHECK_CHOICES_EN if _is_english() else CHECK_CHOICES,
                 required=True,
-                help_text="必填" if required else "可选项也需要如实记录结果",
+                help_text=(
+                    ("Required" if required else "Record an accurate result for optional items too")
+                    if _is_english()
+                    else ("必填" if required else "可选项也需要如实记录结果")
+                ),
             )
 
     def result_rows(self, *, evidence: dict | None = None) -> list[dict]:
@@ -168,6 +248,8 @@ class AssignmentForm(CommandForm):
     def __init__(self, *args, operators, state_version: int, **kwargs):
         super().__init__(*args, state_version=state_version, **kwargs)
         self.fields["assignee"].queryset = operators
+        if _is_english():
+            self.fields["assignee"].empty_label = "Select an operator"
 
 
 class StartWorkForm(CommandForm):

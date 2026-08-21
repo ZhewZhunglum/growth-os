@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 from datetime import timedelta
 
-from django.core.exceptions import ImproperlyConfigured, ValidationError
+from django.core.exceptions import ImproperlyConfigured, PermissionDenied, ValidationError
 from django.test import TestCase
 from django.utils import timezone
 
@@ -18,6 +18,7 @@ from dailyops.services import (
     ingest_manual_link,
     propose_daily_analysis,
     run_automatic_collection,
+    run_platform_collection,
     start_daily_batch,
 )
 from integrations.connectors.types import (
@@ -74,6 +75,9 @@ class StaticSevenPlatformRunner:
                     reason="Test browser worker is intentionally not paired",
                 )
         return ConnectorBatchResult(results)
+
+    def run_one(self, request):
+        return self.run({platform: request for platform in Platform}).results[request.platform]
 
 
 class NoNetworkTransport:
@@ -142,6 +146,69 @@ class DailyCollectionServiceTests(TestCase):
         )
         return batch_key
 
+    def _deny_platform_collection(self, platform: Platform) -> None:
+        now = timezone.now()
+        PermissionGrant.objects.create(
+            principal=self.owner,
+            scope_kind=PermissionGrant.ScopeKind.PLATFORM,
+            platform_code=platform.value,
+            action=PermissionGrant.Action.COLLECT_READ_ONLY,
+            effect=PermissionGrant.Effect.DENY,
+            risk_level=PermissionGrant.RiskLevel.LOW,
+            valid_from=now - timedelta(minutes=1),
+            valid_until=now + timedelta(days=1),
+            granted_by_principal=self.owner,
+        )
+
+    def test_platform_connector_is_never_called_before_collection_authorization(self):
+        batch_key = self._batch()
+        self._deny_platform_collection(Platform.PINTEREST)
+        runner = StaticSevenPlatformRunner()
+        base_runtime = build_daily_operations_runtime()
+        runtime = DailyOperationsRuntime(
+            ai_provider=base_runtime.ai_provider,
+            connectors=runner,
+            live_ai_enabled=False,
+            ai_model=base_runtime.ai_model,
+        )
+
+        with self.assertRaisesMessage(PermissionDenied, "DENY_GRANT"):
+            run_platform_collection(
+                batch_key=batch_key,
+                product=self.product,
+                command_id=uuid.uuid4(),
+                platform=Platform.PINTEREST,
+                principal=self.owner,
+                acting_role=self.owner.role,
+                runtime=runtime,
+            )
+
+        self.assertEqual(runner.calls, 0)
+
+    def test_seven_platform_connector_is_never_called_when_any_platform_is_denied(self):
+        batch_key = self._batch()
+        self._deny_platform_collection(Platform.PINTEREST)
+        runner = StaticSevenPlatformRunner()
+        base_runtime = build_daily_operations_runtime()
+        runtime = DailyOperationsRuntime(
+            ai_provider=base_runtime.ai_provider,
+            connectors=runner,
+            live_ai_enabled=False,
+            ai_model=base_runtime.ai_model,
+        )
+
+        with self.assertRaisesMessage(PermissionDenied, "DENY_GRANT"):
+            run_automatic_collection(
+                batch_key=batch_key,
+                product=self.product,
+                command_id=uuid.uuid4(),
+                principal=self.owner,
+                acting_role=self.owner.role,
+                runtime=runtime,
+            )
+
+        self.assertEqual(runner.calls, 0)
+
     def test_default_runtime_records_seven_fail_closed_attempts_and_fallback(self):
         batch_key = self._batch()
         command_id = uuid.uuid4()
@@ -161,6 +228,37 @@ class DailyCollectionServiceTests(TestCase):
         )
         self.assertTrue(all(run.result_summary["fallback"] == "CSV_OR_MANUAL" for run in result.runs))
         self.assertEqual(CollectionRun.objects.filter(batch_key=batch_key).count(), 14)
+
+    def test_progressive_collection_persists_one_platform_and_replays_safely(self):
+        batch_key = self._batch()
+        command_id = uuid.uuid4()
+        first = run_platform_collection(
+            batch_key=batch_key,
+            product=self.product,
+            command_id=command_id,
+            platform=Platform.PINTEREST,
+            principal=self.owner,
+            acting_role=self.owner.role,
+        )
+        replay = run_platform_collection(
+            batch_key=batch_key,
+            product=self.product,
+            command_id=command_id,
+            platform=Platform.PINTEREST,
+            principal=self.owner,
+            acting_role=self.owner.role,
+        )
+
+        self.assertTrue(first.created)
+        self.assertFalse(replay.created)
+        self.assertEqual(first.run.source.platform_code, Platform.PINTEREST.value)
+        self.assertEqual(
+            CollectionRun.objects.filter(
+                batch_key=batch_key,
+                query_spec__automatic_command_id=str(command_id),
+            ).count(),
+            1,
+        )
 
     def test_fake_api_and_browser_results_persist_provenance_and_replay_without_second_call(self):
         batch_key = self._batch()

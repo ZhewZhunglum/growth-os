@@ -7,7 +7,7 @@ from django.contrib import messages
 from django.contrib.auth.decorators import login_required
 from django.core.exceptions import ObjectDoesNotExist, PermissionDenied, ValidationError
 from django.db import transaction
-from django.db.models import F, Prefetch, Q
+from django.db.models import F
 from django.http import Http404, HttpRequest, HttpResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.views.decorators.http import require_POST
@@ -28,8 +28,9 @@ from dashboard.forms import (
 )
 from intelligence.models import TaskCompilationContext
 from products.models import ProductProfileVersion
-from releasegate.models import Publication
 from workflow.models import Task, TaskAssignment, TaskCheckRun, TaskStateEvent
+
+from dashboard.action_center import build_action_center
 
 
 EXTERNAL_URL_MIME_TYPE = "text/uri-list"
@@ -224,86 +225,25 @@ def _detail_context(
 
 @login_required
 def home(request: HttpRequest) -> HttpResponse:
-    tasks = list(
-        Task.objects.filter(
-            Q(current_assignee_principal=request.user) | Q(created_by_principal=request.user)
-        )
-        .exclude(current_state=Task.State.CANCELLED)
-        .select_related("product", "contract_version", "current_assignee_principal")
-        .prefetch_related(
-            Prefetch(
-                "check_runs",
-                queryset=TaskCheckRun.objects.filter(check_kind=TaskCheckRun.Kind.DOR).order_by(
-                    "-attempt_number"
-                ),
-                to_attr="dor_runs",
-            ),
-            Prefetch(
-                "check_runs",
-                queryset=TaskCheckRun.objects.filter(check_kind=TaskCheckRun.Kind.DOD).order_by(
-                    "-attempt_number"
-                ),
-                to_attr="dod_runs",
-            ),
-        )
-        .distinct()
-        .order_by("-updated_at", "title")
-    )
+    action_center = build_action_center(request.user)
+    tasks = list(action_center.tasks)
     for task in tasks:
         _decorate_task(task)
-    active_states = {
-        Task.State.READY,
-        Task.State.ASSIGNED,
-        Task.State.IN_PROGRESS,
-        Task.State.HUMAN_REWORK,
-    }
     can_create_task = _editable_profiles(request.user).exists()
-    # These are permission-filtered work queues, not extra employee roles.
-    # Import locally to keep the task workspace independent from the review/
-    # release view module during app startup.
-    from dashboard.review_views import (
-        _allowed_accounts,
-        _can_complete,
-        _can_review_submission,
-    )
-    pending_review_count = 0
-    for review_task in Task.objects.filter(current_state=Task.State.UNDER_REVIEW).select_related(
-        "product"
-    ):
-        review_submission = review_task.submissions.order_by("-submission_number").first()
-        if review_submission is not None and _can_review_submission(
-            request.user, review_task, review_submission
-        ):
-            pending_review_count += 1
-
-    pending_publish_count = 0
-    pending_complete_count = 0
-    for release_task in Task.objects.filter(current_state=Task.State.APPROVED).select_related(
-        "product"
-    ):
-        latest_submission = release_task.submissions.order_by("-submission_number").first()
-        has_manual_publication_proof = bool(
-            latest_submission
-            and latest_submission.publications.filter(
-                status=Publication.Status.MANUAL_PUBLISHED_RECORDED
-            ).exists()
-        )
-        if _allowed_accounts(request.user, release_task).exists() and not has_manual_publication_proof:
-            pending_publish_count += 1
-        if _can_complete(request.user, release_task):
-            pending_complete_count += 1
     return render(
         request,
         "dashboard/home.html",
         {
             "tasks": tasks,
             "task_count": len(tasks),
-            "active_task_count": sum(task.current_state in active_states for task in tasks),
             "blocked_task_count": sum(task.current_state == Task.State.BLOCKED for task in tasks),
             "can_create_task": can_create_task,
-            "pending_review_count": pending_review_count,
-            "pending_publish_count": pending_publish_count,
-            "pending_complete_count": pending_complete_count,
+            "action_center": action_center,
+            # Keep these stable context keys for review/release slice tests and
+            # any internal links that already consume them.
+            "pending_review_count": action_center.pending_review_count,
+            "pending_publish_count": action_center.pending_publish_count,
+            "pending_complete_count": action_center.pending_complete_count,
         },
     )
 

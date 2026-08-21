@@ -3,6 +3,7 @@ import uuid
 from datetime import timedelta
 from unittest.mock import MagicMock, patch
 
+from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError
 from django.test import TestCase
@@ -154,7 +155,8 @@ class DashboardTests(TestCase):
         self.client.force_login(self.user)
         response = self.client.get(reverse("dashboard:home"))
         self.assertContains(response, "PUKO Growth OS")
-        self.assertContains(response, "今天没有分配给你的任务")
+        self.assertContains(response, "现在没有执行任务")
+        self.assertContains(response, "今天的待办已经清空")
         self.assertEqual(response.context["task_count"], 0)
 
     def test_user_only_sees_tasks_assigned_to_or_created_by_them(self):
@@ -170,20 +172,55 @@ class DashboardTests(TestCase):
         self.assertNotIn(hidden.id, visible_ids)
         self.assertNotContains(response, "Another user's task")
 
-    def test_task_card_explains_status_checks_dod_and_release_gate(self):
+    def test_task_row_leads_with_plain_next_action_and_hides_technical_detail(self):
         self.make_task(owner=self.user, assignee=self.user)
         self.client.force_login(self.user)
 
         response = self.client.get(reverse("dashboard:home"))
 
         self.assertContains(response, "Write a clear Quora answer")
-        self.assertContains(response, "执行中")
-        self.assertContains(response, "为什么做")
-        self.assertContains(response, "尚未检查", count=1)
-        self.assertContains(response, "Use plain, natural language")
-        self.assertContains(response, "Human review must pass")
-        self.assertContains(response, "实际发布仍需人工审核和最终门禁校验")
-        self.assertNotContains(response, "Open admin setup")
+        self.assertContains(response, "进行中")
+        self.assertContains(response, "继续并提交")
+        self.assertNotContains(response, "开工检查（DoR）")
+        self.assertNotContains(response, "交付检查（DoD）")
+        self.assertNotContains(response, "合同版本")
+
+    def test_creator_does_not_see_work_that_is_currently_assigned_to_someone_else(self):
+        delegated = self.make_task(
+            owner=self.user,
+            title="Delegated work",
+            assignee=self.other_user,
+        )
+
+        self.client.force_login(self.user)
+        response = self.client.get(reverse("dashboard:home"))
+
+        self.assertNotIn(delegated.pk, {task.pk for task in response.context["tasks"]})
+        self.assertNotContains(response, "Delegated work")
+
+    def test_assigned_task_disappears_immediately_after_edit_grant_is_revoked(self):
+        assigned = self.make_task(
+            owner=self.other_user,
+            title="Permission filtered work",
+            assignee=self.user,
+        )
+        PermissionGrant.objects.filter(
+            principal=self.user,
+            product=assigned.product,
+            action=PermissionGrant.Action.EDIT,
+        ).update(
+            grant_status=PermissionGrant.GrantStatus.REVOKED,
+            revoked_at=timezone.now(),
+            revoked_by_principal=self.other_user,
+            revocation_reason="Access removed before inbox refresh.",
+        )
+
+        self.client.force_login(self.user)
+        response = self.client.get(reverse("dashboard:home"))
+
+        self.assertEqual(response.context["task_count"], 0)
+        self.assertNotContains(response, "Permission filtered work")
+        self.assertEqual(response.context["action_center"].total_count, 0)
 
 
 class ControlledTaskUiTests(TestCase):
@@ -323,6 +360,20 @@ class ControlledTaskUiTests(TestCase):
         self.client.force_login(self.outsider)
         hidden = self.client.get(reverse("dashboard:task-detail", args=[self.task.pk]))
         self.assertEqual(hidden.status_code, 404)
+
+    def test_task_detail_core_controls_switch_fully_to_english(self):
+        self.client.cookies[settings.LANGUAGE_COOKIE_NAME] = "en"
+        self.client.force_login(self.owner)
+        response = self.client.get(reverse("dashboard:task-detail", args=[self.task.pk]))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Task details")
+        self.assertContains(response, "Confirm each item: is this task ready to start?")
+        self.assertContains(response, "Save readiness check")
+        self.assertContains(response, "Select a result")
+        self.assertNotContains(response, "逐项确认")
+        self.assertNotContains(response, "保存开工检查结果")
+        self.assertNotContains(response, "请选择结果")
 
     def test_draft_cancel_hides_task_from_today_but_preserves_audited_record(self):
         self.client.force_login(self.owner)

@@ -24,7 +24,6 @@ from dailyops.runtime import (
 from dailyops.services import (
     accept_daily_analysis,
     compile_channel_plan_task,
-    create_channel_plan,
     create_initiative_from_opportunity,
     ensure_default_sources,
     propose_daily_analysis,
@@ -539,22 +538,29 @@ class FullDailyOperationsVerticalFlowTests(TestCase):
             expected_version=0,
             reason="Owner approved the initiative.",
         )
-        plan = create_channel_plan(
+        plan = ChannelPlan.objects.create(
             initiative=initiative,
-            platform=Platform.TIKTOK,
-            command_id=uuid.uuid4(),
+            channel_account=self.account,
+            plan_key=f"{initiative.initiative_key}-tiktok",
+            platform_code=Platform.TIKTOK.value,
             plan_date=timezone.localdate(),
             goal={"title": "Answer the afternoon-focus demand signal"},
             content_requirements={
                 "task_title": "Create one link-only TikTok deliverable",
                 "task_description": "Draft externally, save only a stable version link, and request review.",
-                "environment_code": self.environment.environment_code,
-                "capability_code": CapabilityState.MANUAL_PUBLISH,
+                "environment_code": "legacy-wrong-environment",
+                "capability_code": "LEGACY_WRONG_CAPABILITY",
             },
-            principal=self.owner,
-            acting_role=self.owner.role,
-            channel_account=self.account,
+            creation_command_id=uuid.uuid4(),
+            creation_payload_hash="1" * 64,
+            created_by_principal=self.owner,
+            created_under_grant=self.owner_grants[PermissionGrant.Action.EDIT],
+            updated_by_principal=self.owner,
         )
+        # Simulate a plan created by the earlier UI, where a user could type
+        # arbitrary runtime codes.  Compilation must ignore those legacy
+        # strings, resolve the one exact current binding fail-closed, and keep
+        # the historical plan payload untouched for audit.
         plan = self._transition_intelligence(
             transition_channel_plan,
             aggregate=plan,
@@ -574,6 +580,15 @@ class FullDailyOperationsVerticalFlowTests(TestCase):
         self.assertEqual(context.channel_plan_id, plan.pk)
         self.assertEqual(context.product_profile_version_id, self.profile.pk)
         self.assertEqual(context.capability_state_id, self.capability.pk)
+        plan.refresh_from_db()
+        self.assertEqual(
+            plan.content_requirements["environment_code"],
+            "legacy-wrong-environment",
+        )
+        self.assertEqual(
+            plan.content_requirements["capability_code"],
+            "LEGACY_WRONG_CAPABILITY",
+        )
 
         # Execute the compiled Task with an explicit assignee and a link-only
         # immutable ContentAssetVersion; no media bytes are uploaded.

@@ -1,97 +1,385 @@
 {% extends "base.html" %}
-{% load ui_i18n %}
-{% block title %}Daily 批次 · {{ product.name }}{% endblock %}
-{% block page_title %}{% ui 'Daily Operations 批次' 'Daily Operations batch' %}{% endblock %}
+{% load static ui_i18n %}
+{% block title %}{% ui '今日运营' "Today's run" %} · {{ product.name }}{% endblock %}
+{% block page_title %}{% ui '今日运营' "Today's run" %}{% endblock %}
 {% block content %}
-<a class="back-link" href="{% url 'dailyops:home' %}">← {% ui '返回 Daily Operations' 'Back to Daily Operations' %}</a>
-<section class="task-detail-hero">
-  <div><p class="eyebrow">{{ product.name }} · {{ product.market_code }}/{{ product.language_code }}</p><h2>{{ query }}</h2><p>{% ui '批次' 'Batch' %} {{ batch_key }}。{% ui '每一步都保留真实来源；AI 结果只是提案，必须由人接受。' 'Every step retains its real source. AI output is only a proposal and requires human acceptance.' %}</p></div>
-  <div class="detail-status-stack"><span class="task-state">{{ evidence|length }} {% ui '条证据' 'evidence items' %}</span><small>{% ui '七个平台逐个核对' 'Check all seven platforms' %}</small></div>
-</section>
+<style>
+  /* Keep finished work out of the way; its step dot remains available above. */
+  .daily-stage.is-complete:not(.is-manually-open) { display: none; }
+</style>
+<div class="daily-page daily-flow" id="daily-flow"
+     data-current-step="{{ current_step }}">
+  <a class="back-link" href="{% url 'dailyops:home' %}">← {% ui '返回机会与计划' 'Back to opportunities' %}</a>
 
-<section class="section-heading config-heading"><div><p class="eyebrow">{% ui '第 2 步' 'Step 2' %}</p><h2>{% ui '七个平台采集状态' 'Seven-platform collection status' %}</h2></div><span class="section-note">{% ui '没有文件上传' 'No file uploads' %}</span></section>
-<article class="detail-panel action-panel" style="margin-bottom:18px">
-  <h3>{% ui '尝试自动 / API / 浏览器采集' 'Try automatic / API / browser collection' %}</h3>
-  <p class="muted">{% ui '系统只使用已经明确配置的只读 API 或已配对浏览器。缺少配置时会安全停止，不会猜接口、不会付费；下方 CSV 和人工链接始终保留作兜底。' 'Only explicitly configured read-only APIs or paired browser workers are used. Missing configuration stops safely: no guessed endpoint and no paid call. CSV and manual-link fallbacks remain available below.' %}</p>
-  <form method="post" action="{% url 'dailyops:automatic-collect' product.id batch_key %}">{% csrf_token %}<input type="hidden" name="command_id" value="{{ command_id }}"><button class="button button-primary" type="submit">{% ui '安全尝试七个平台采集' 'Safely try all seven platforms' %}</button></form>
-</article>
-<section class="task-list">
-{% for card in platform_cards %}
-  <article class="task-card" id="platform-{{ card.platform.value }}">
-    <header class="task-card-header">
-      <div><p class="task-meta">{{ card.platform.value }}</p><h3>{{ card.name }}</h3></div>
-      <span class="task-state task-state-{% if card.state == 'PRESENT' %}approved{% elif card.state == 'MISSING' %}blocked{% endif %}">{{ card.state_name }}</span>
-    </header>
-    <div class="task-section"><span class="task-label">{% ui '下一步' 'Next step' %}</span><p>{{ card.next_step }}</p></div>
-    {% if card.evidence %}
-      <div class="criteria-block"><span class="task-label">{% ui '已保存的原始来源' 'Saved original sources' %}</span><ul>{% for item in card.evidence %}<li>{% if item.external_url %}<a class="inline-link" href="{{ item.external_url }}" target="_blank" rel="noopener">{{ item.title|default:item.external_url }}</a>{% else %}{{ item.title|default:item.external_content_id }}{% endif %}</li>{% endfor %}</ul></div>
-    {% endif %}
-    <details class="criteria-block"><summary><strong>{% ui '查看每次采集尝试' 'View every collection attempt' %}</strong></summary><ul>{% for run in card.runs %}<li>{{ run.created_at }} · {% ui '运行结果' 'Run result' %} {{ run.status }} · {% ui '数据状态' 'Availability' %} {{ run.availability_state }}{% if run.error_code %} · {{ run.error_code }}{% endif %}</li>{% empty %}<li>{% ui '还没有运行记录（UNAVAILABLE）' 'No run record yet (UNAVAILABLE)' %}</li>{% endfor %}</ul></details>
-    <div class="detail-columns" style="margin-top:14px">
-      <details class="detail-panel"><summary><strong>{% ui '粘贴单条链接或内容 ID' 'Paste one link or content ID' %}</strong></summary>
-        <form class="config-form" method="post" action="{% url 'dailyops:evidence-manual' product.id batch_key card.platform.value %}" style="margin-top:14px">
-          {% csrf_token %}{{ card.manual_form.as_p }}<button class="button button-primary" type="submit">{% ui '保存这条证据' 'Save evidence' %}</button>
-        </form>
-      </details>
-      <details class="detail-panel"><summary><strong>{% ui '粘贴 CSV 文本' 'Paste CSV text' %}</strong></summary>
-        <form class="config-form" method="post" action="{% url 'dailyops:evidence-csv' product.id batch_key card.platform.value %}" style="margin-top:14px">
-          {% csrf_token %}{{ card.csv_form.as_p }}<button class="button button-primary" type="submit">{% ui '检查并保存 CSV' 'Check and save CSV' %}</button>
-        </form>
-      </details>
+  <header class="daily-run-heading">
+    <div>
+      <p class="eyebrow">{{ product.name }}</p>
+      <h2>{{ query|default:"—" }}</h2>
     </div>
-  </article>
-{% endfor %}
-</section>
+    <span class="status-pill"><span></span>{% ui '人工确认模式' 'Human confirmation mode' %}</span>
+  </header>
 
-<section class="section-heading config-heading"><div><p class="eyebrow">{% ui '第 3 步' 'Step 3' %}</p><h2>{% ui '分析提案与人工决定' 'Analysis proposal and human decision' %}</h2></div></section>
-<article class="detail-panel action-panel">
-{% if not evidence %}
-  <h3>{% ui '还不能分析' 'Analysis is not ready' %}</h3><p class="muted">{% ui '至少先保存一条有真实来源的证据。系统不会用空数据编一个结论。' 'Save at least one evidence item with a real source. The system will not invent a conclusion from empty data.' %}</p>
-{% elif not proposal %}
-  <h3>{% ui '生成离线提案' 'Generate offline proposal' %}</h3><p class="muted">{% ui '当前使用 Dry-run/Fake，不联网、不付费。结果只是一份待人检查的建议。' 'Dry-run/Fake mode is active: no network and no paid call. The result is only a suggestion for human review.' %}</p>
-  <form method="post" action="{% url 'dailyops:analysis-propose' product.id batch_key %}">{% csrf_token %}<input type="hidden" name="command_id" value="{{ command_id }}"><button class="button button-primary" type="submit">{% ui '生成分析提案（不是批准）' 'Generate proposal (not approval)' %}</button></form>
-{% else %}
-  <span class="task-state task-state-blocked">AI / Dry-run {% ui '提案' 'proposal' %}</span>
-  <h3>{{ proposal.value.topic_label }}</h3><p>{{ proposal.value.summary }}</p>
-  <dl class="submission-summary"><dt>{% ui '建议' 'Recommendation' %}</dt><dd>{{ proposal.value.recommendation }}</dd><dt>{% ui '可信度' 'Confidence' %}</dt><dd>{{ proposal.value.confidence }}</dd><dt>{% ui '证据数' 'Evidence count' %}</dt><dd>{{ proposal.value.evidence_ids|length }}</dd></dl>
-  {% if not opportunity %}
-  <form method="post" action="{% url 'dailyops:analysis-accept' product.id batch_key proposal.id %}" style="margin-top:18px">{% csrf_token %}<input type="hidden" name="command_id" value="{{ command_id }}"><button class="button button-primary" type="submit">{% ui '我已看过，接受为 Opportunity' 'Reviewed: accept as Opportunity' %}</button></form>
-  {% else %}<p class="read-only-note">{% ui '人工已接受；Opportunity 已单独创建，AI 没有直接进入执行。' 'A human accepted this proposal. A separate Opportunity was created; AI did not enter execution directly.' %}</p>{% endif %}
-{% endif %}
-</article>
+  <nav class="daily-stepper" aria-label="{% ui '今日工作进度' "Today's workflow progress" %}">
+    <a class="daily-step is-complete" href="{% url 'dailyops:home' %}"><span>1</span><small>{% ui '确定问题' 'Question' %}</small></a>
+    <button class="daily-step" type="button" data-go-step="2"><span>2</span><small>{% ui '找线索' 'Collect' %}</small></button>
+    <button class="daily-step" type="button" data-go-step="3"><span>3</span><small>{% ui '看建议' 'Analyze' %}</small></button>
+    <button class="daily-step" type="button" data-go-step="4"><span>4</span><small>{% ui '选方向' 'Decide' %}</small></button>
+    <button class="daily-step" type="button" data-go-step="5"><span>5</span><small>{% ui '开项目' 'Initiative' %}</small></button>
+    <button class="daily-step" type="button" data-go-step="6"><span>6</span><small>{% ui '排任务' 'Plan' %}</small></button>
+    <button class="daily-step" type="button" data-go-step="7"><span>7</span><small>{% ui '去执行' 'Execute' %}</small></button>
+  </nav>
 
-{% if opportunity %}
-<section class="section-heading config-heading"><div><p class="eyebrow">{% ui '第 4 步' 'Step 4' %}</p><h2>{% ui 'Opportunity 人工状态' 'Human Opportunity status' %}</h2></div><span class="task-state">{{ opportunity.current_state }}</span></section>
-<article class="detail-panel"><h3>{{ opportunity.title }}</h3><p>{{ opportunity.recommendation }}</p>
-  {% if opportunity.current_state == 'PROPOSED' or opportunity.current_state == 'TRIAGED' %}
-  <form class="config-form" method="post" action="{% url 'dailyops:opportunity-transition' opportunity.id %}" style="margin-top:16px">{% csrf_token %}<input type="hidden" name="command_id" value="{{ command_id }}"><input type="hidden" name="expected_version" value="{{ opportunity.state_version }}"><label for="opp-to">人工决定</label><select id="opp-to" name="to_state">{% if opportunity.current_state == 'PROPOSED' %}<option value="TRIAGED">先完成初步判断</option>{% else %}<option value="APPROVED">批准进入计划</option>{% endif %}<option value="REJECTED">拒绝，不继续</option></select><label for="opp-reason">决定理由</label><textarea id="opp-reason" name="reason" rows="2" required></textarea><button class="button button-primary" type="submit">保存人工决定</button></form>
-  {% elif opportunity.current_state == 'APPROVED' and not initiative %}
-  <form method="post" action="{% url 'dailyops:initiative-create' opportunity.id %}">{% csrf_token %}<input type="hidden" name="command_id" value="{{ command_id }}"><button class="button button-primary" type="submit">创建 Initiative</button></form>
-  {% endif %}
-</article>
-{% endif %}
+  <p class="daily-current-hint" id="daily-current-hint" aria-live="polite"></p>
 
-{% if initiative %}
-<section class="section-heading config-heading"><div><p class="eyebrow">{% ui '第 5 步' 'Step 5' %}</p><h2>Initiative</h2></div><span class="task-state">{{ initiative.current_state }}</span></section>
-<article class="detail-panel"><h3>{{ initiative.title }}</h3><p>{{ initiative.objective }}</p>
-  {% if initiative.current_state == 'PROPOSED' or initiative.current_state == 'APPROVED' %}
-  <form class="config-form" method="post" action="{% url 'dailyops:initiative-transition' initiative.id %}" style="margin-top:16px">{% csrf_token %}<input type="hidden" name="command_id" value="{{ command_id }}"><input type="hidden" name="expected_version" value="{{ initiative.state_version }}"><input type="hidden" name="to_state" value="{% if initiative.current_state == 'PROPOSED' %}APPROVED{% else %}ACTIVE{% endif %}"><label for="init-reason">决定理由</label><textarea id="init-reason" name="reason" rows="2" required></textarea><button class="button button-primary" type="submit">{% if initiative.current_state == 'PROPOSED' %}批准 Initiative{% else %}启动 Initiative{% endif %}</button></form>
-  {% endif %}
-</article>
+  <details class="daily-stage{% if current_step > 2 %} is-complete{% endif %}" data-step="2"{% if not evidence %} open{% endif %}>
+    <summary>
+      <span class="daily-stage-index">2</span>
+      <span><small>{% ui '找线索' 'Collect signals' %}</small><strong>{% ui '查看七个平台有没有值得做的内容' 'Check seven platforms for useful signals' %}</strong></span>
+      <span class="daily-stage-status" data-stage-status></span>
+    </summary>
+    <div class="daily-stage-body">
+      <div class="daily-collect-toolbar">
+        <div>
+          <h3>{% ui '七个平台采集' 'Seven-platform collection' %}</h3>
+          <p>{% ui '按顺序检查每个平台；没有接口的会明确提示你改用浏览器或手动补录。' 'Each platform is checked in order. If no connection is available, the system clearly asks for browser or manual input.' %}</p>
+        </div>
+        <form id="daily-collect-form" method="post" action="{% url 'dailyops:automatic-collect' product.id batch_key %}">
+          {% csrf_token %}<input type="hidden" name="command_id" value="{{ command_id }}">
+          <button class="button button-primary" id="daily-collect-all" type="button">{% ui '开始检查 7 个平台' 'Check all 7 platforms' %}</button>
+        </form>
+      </div>
 
-{% if initiative.current_state == 'APPROVED' or initiative.current_state == 'ACTIVE' %}
-<section class="section-heading config-heading"><div><p class="eyebrow">{% ui '第 6 步' 'Step 6' %}</p><h2>{% ui '按平台建立 ChannelPlan' 'Create a ChannelPlan for each platform' %}</h2></div></section>
-<article class="detail-panel action-panel"><form class="config-form" method="post" action="{% url 'dailyops:plan-create' initiative.id %}">{% csrf_token %}{{ plan_form.as_p }}<button class="button button-primary" type="submit">创建 ChannelPlan</button></form></article>
-{% endif %}
+      <div class="daily-progress" id="daily-progress" hidden>
+        <div class="daily-progress-copy"><strong id="daily-progress-label">{% ui '准备开始…' 'Getting ready…' %}</strong><span id="daily-progress-count">0 / 7</span></div>
+        <div class="daily-progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="7" aria-valuenow="0"><span id="daily-progress-bar"></span></div>
+      </div>
 
-{% for plan in plans %}
-<article class="task-card" style="margin-top:14px"><header class="task-card-header"><div><p class="task-meta">{{ plan.platform_code }} · {{ plan.channel_account.display_name }}</p><h3>{{ plan.goal.title }}</h3></div><span class="task-state">{{ plan.current_state }}</span></header>
-  {% if plan.compiled_context %}<footer class="task-card-footer"><span>已经生成真实任务</span><a class="button button-primary" href="{% url 'dashboard:task-detail' plan.compiled_context.task.id %}">打开任务</a></footer>
-  {% elif plan.current_state == 'DRAFT' or plan.current_state == 'READY' %}
-  <form class="config-form" method="post" action="{% url 'dailyops:plan-transition' plan.id %}" style="margin-top:14px">{% csrf_token %}<input type="hidden" name="command_id" value="{{ command_id }}"><input type="hidden" name="expected_version" value="{{ plan.state_version }}"><input type="hidden" name="to_state" value="{% if plan.current_state == 'DRAFT' %}READY{% else %}ACTIVE{% endif %}"><label>决定理由</label><textarea name="reason" rows="2" required></textarea><button class="button button-primary" type="submit">{% if plan.current_state == 'DRAFT' %}确认计划已准备好{% else %}启动计划{% endif %}</button></form>
-  {% endif %}
-  {% if plan.current_state == 'READY' or plan.current_state == 'ACTIVE' %}<form method="post" action="{% url 'dailyops:plan-compile' plan.id %}" style="margin-top:12px">{% csrf_token %}<input type="hidden" name="command_id" value="{{ command_id }}"><input type="hidden" name="task_id" value="{{ task_id }}"><button class="button button-primary" type="submit">生成真实执行任务</button></form>{% endif %}
-</article>
-{% endfor %}
-{% endif %}
+      <div class="daily-platform-list" id="daily-platform-list">
+      {% for card in platform_cards %}
+        <article class="daily-platform-row" data-collect-url="{% url 'dailyops:platform-collect' product.id batch_key card.platform.value %}" data-platform-name="{% if card.platform.value == 'SHOPIFY' %}{% ui 'Shopify / 独立站' 'Shopify store' %}{% elif card.platform.value == 'GOOGLE_SEARCH' %}{% ui 'Google 搜索' 'Google Search' %}{% else %}{{ card.name }}{% endif %}">
+          <span class="daily-platform-position">{{ forloop.counter }}</span>
+          <div class="daily-platform-main">
+            <strong>{% if card.platform.value == 'SHOPIFY' %}{% ui 'Shopify / 独立站' 'Shopify store' %}{% elif card.platform.value == 'GOOGLE_SEARCH' %}{% ui 'Google 搜索' 'Google Search' %}{% else %}{{ card.name }}{% endif %}</strong>
+            <small class="daily-platform-note">
+              {% if card.evidence %}{% ui '已有可用线索' 'Useful signals saved' %}
+              {% elif card.state == 'BLOCKED' %}{% ui '需要浏览器或手动补录' 'Browser or manual input needed' %}
+              {% elif card.state == 'UNAVAILABLE' %}{% ui '当前没有可用连接' 'No connection available' %}
+              {% else %}{% ui '还没有线索' 'No signals yet' %}{% endif %}
+            </small>
+          </div>
+          <span class="task-state daily-platform-state{% if card.evidence %} task-state-approved{% elif card.state == 'BLOCKED' or card.state == 'UNAVAILABLE' %} task-state-blocked{% endif %}">
+            {% if card.evidence %}{% ui '已找到' 'Found' %}
+            {% elif card.state == 'BLOCKED' %}{% ui '需补录' 'Needs input' %}
+            {% elif card.state == 'UNAVAILABLE' %}{% ui '不可用' 'Unavailable' %}
+            {% else %}{% ui '未检查' 'Not checked' %}{% endif %}
+          </span>
+          {% if card.evidence %}
+          <details class="daily-platform-evidence">
+            <summary>{% ui '查看线索' 'View signals' %} ({{ card.evidence|length }})</summary>
+            <ul>
+            {% for item in card.evidence %}
+              <li>
+                <span>{% if item.external_url %}<a class="inline-link" href="{{ item.external_url }}" target="_blank" rel="noopener">{{ item.title|default:item.external_url }}</a>{% else %}{{ item.title|default:item.external_content_id }}{% endif %}</span>
+                <form method="post" action="{% url 'dailyops:evidence-invalidate' product.id batch_key item.id %}">
+                  {% csrf_token %}<input type="hidden" name="command_id" value="{{ item.invalidation_command_id }}"><input type="hidden" name="reason" value="{% ui '录入错误，不再用于后续分析。' 'Entered by mistake; exclude from future analysis.' %}">
+                  <button class="daily-text-button" type="submit">{% ui '移除' 'Remove' %}</button>
+                </form>
+              </li>
+            {% endfor %}
+            </ul>
+          </details>
+          {% endif %}
+          <details class="daily-platform-history">
+            <summary>{% ui '检查记录' 'Attempts' %}</summary>
+            <ul>{% for run in card.runs %}<li>{{ run.created_at|date:"Y-m-d H:i" }} · {% if run.availability_state == 'PRESENT' %}{% ui '找到数据' 'Data found' %}{% elif run.availability_state == 'BLOCKED' %}{% ui '被阻止' 'Blocked' %}{% elif run.availability_state == 'MISSING' %}{% ui '没有数据' 'No data' %}{% else %}{% ui '不可用' 'Unavailable' %}{% endif %}</li>{% empty %}<li>{% ui '还没有检查过' 'Not checked yet' %}</li>{% endfor %}</ul>
+          </details>
+        </article>
+      {% endfor %}
+      </div>
+
+      <div class="daily-fallback-grid">
+        <details class="daily-fallback-card"{% if not evidence %} open{% endif %}>
+          <summary><strong>{% ui 'AI 没找到？手动补一条' 'Nothing found? Add one manually' %}</strong><small>{% ui '粘贴链接，系统自动识别平台' 'Paste a link and the platform is detected' %}</small></summary>
+          <form class="config-form" method="post" action="{% url 'dailyops:evidence-manual-unified' product.id batch_key %}">
+            {% csrf_token %}
+            {{ manual_form.command_id }}{{ manual_form.collected_at }}{{ manual_form.external_url }}{{ manual_form.external_content_id }}
+            {{ manual_form.non_field_errors }}
+            <label><span>{% ui '链接或内容名称 / ID' 'Link, content name, or ID' %}</span>{{ manual_form.reference }}{{ manual_form.reference.errors }}</label>
+            <label><span>{% ui '平台（链接识别不了时再选）' 'Platform (only if the link cannot be detected)' %}</span>{{ manual_form.platform }}{{ manual_form.platform.errors }}</label>
+            <label><span>{% ui '标题（可不填）' 'Title (optional)' %}</span>{{ manual_form.title }}{{ manual_form.title.errors }}</label>
+            <label><span>{% ui '补充说明（可不填）' 'Notes (optional)' %}</span>{{ manual_form.content_text }}{{ manual_form.content_text.errors }}</label>
+            <button class="button button-primary" type="submit">{% ui '补录这条线索' 'Add this signal' %}</button>
+          </form>
+        </details>
+        <details class="daily-fallback-card">
+          <summary><strong>{% ui '批量粘贴 CSV' 'Paste a CSV batch' %}</strong><small>{% ui '高级选项' 'Advanced option' %}</small></summary>
+          <form class="config-form" method="post" action="{% url 'dailyops:evidence-csv-unified' product.id batch_key %}">
+            {% csrf_token %}{{ csv_form.command_id }}{{ csv_form.non_field_errors }}
+            <label><span>{% ui '平台' 'Platform' %}</span>{{ csv_form.platform }}{{ csv_form.platform.errors }}</label>
+            <label><span>{% ui 'CSV 内容' 'CSV content' %}</span>{{ csv_form.csv_text }}{{ csv_form.csv_text.errors }}</label>
+            <button class="button button-secondary" type="submit">{% ui '检查并补录' 'Check and add' %}</button>
+          </form>
+        </details>
+      </div>
+    </div>
+  </details>
+
+  <details class="daily-stage{% if current_step > 3 %} is-complete{% endif %}" data-step="3"{% if evidence and not opportunity %} open{% endif %}>
+    <summary>
+      <span class="daily-stage-index">3</span>
+      <span><small>{% ui '看建议' 'Review suggestion' %}</small><strong>{% ui '让系统整理线索，由你决定是否采用' 'Let the system summarize; you decide whether to use it' %}</strong></span>
+      <span class="daily-stage-status" data-stage-status></span>
+    </summary>
+    <div class="daily-stage-body">
+      {% if not evidence %}
+      <div class="daily-locked"><strong>{% ui '先完成上一步' 'Finish the previous step first' %}</strong><p>{% ui '至少先保存一条真实线索，系统才会整理建议。' 'Save at least one real signal before generating a suggestion.' %}</p></div>
+      {% elif not proposal %}
+      <div class="daily-action-card"><div><h3>{% ui '整理成一个可执行建议' 'Turn signals into one actionable suggestion' %}</h3><p>{% ui '当前是离线测试，不联网、不付费。生成的只是建议，不会自动执行。' 'This is an offline test: no network and no paid call. The result is a suggestion and will not execute automatically.' %}</p></div>
+        <form method="post" action="{% url 'dailyops:analysis-propose' product.id batch_key %}">{% csrf_token %}<input type="hidden" name="command_id" value="{{ command_id }}"><button class="button button-primary" type="submit">{% ui '生成一个建议' 'Generate a suggestion' %}</button></form>
+      </div>
+      {% else %}
+      <article class="daily-proposal-card">
+        <span class="status-pill">{% ui '待你决定' 'Your decision' %}</span>
+        <h3>{{ proposal.value.topic_label }}</h3><p>{{ proposal.value.summary }}</p>
+        <div class="daily-proposal-meta"><span>{% ui '系统建议' 'Recommendation' %}: {{ proposal.value.recommendation }}</span><span>{% ui '参考线索' 'Signals used' %}: {{ proposal.value.evidence_ids|length }}</span></div>
+        {% if not initiative or initiative.current_state != 'ACTIVE' %}
+        <form method="post" action="{% url 'dailyops:analysis-accept-and-start' product.id batch_key proposal.id %}">{% csrf_token %}<input type="hidden" name="command_id" value="{{ owner_start_command_id }}"><button class="button button-primary" type="submit">{% ui '采用建议并建立执行项目' 'Use suggestion and start execution project' %}</button></form>
+        {% else %}<p class="read-only-note">{% ui '建议已采用，执行项目已经启动。' 'Suggestion accepted and execution project started.' %}</p>{% endif %}
+      </article>
+      {% endif %}
+    </div>
+  </details>
+
+  <details class="daily-stage{% if current_step > 4 %} is-complete{% endif %}" data-step="4"{% if opportunity and not initiative %} open{% endif %}>
+    <summary>
+      <span class="daily-stage-index">4</span>
+      <span><small>{% ui '选方向' 'Choose direction' %}</small><strong>{% ui '确认这件事值得进入计划' 'Confirm this is worth planning' %}</strong></span>
+      <span class="daily-stage-status" data-stage-status></span>
+    </summary>
+    <div class="daily-stage-body">
+    <details class="daily-advanced-actions">
+      <summary>{% ui '高级：分步处理方向' 'Advanced: handle direction step by step' %}</summary>
+    {% if opportunity %}
+      <article class="daily-action-card daily-action-card-stacked">
+        <div><h3>{{ opportunity.title }}</h3><p>{{ opportunity.recommendation }}</p></div>
+        {% if opportunity.current_state == 'PROPOSED' or opportunity.current_state == 'TRIAGED' %}
+        <form class="config-form daily-decision-form" method="post" action="{% url 'dailyops:opportunity-transition' opportunity.id %}">
+          {% csrf_token %}<input type="hidden" name="command_id" value="{{ command_id }}"><input type="hidden" name="expected_version" value="{{ opportunity.state_version }}">
+          <label><span>{% ui '你的决定' 'Your decision' %}</span><select name="to_state">{% if opportunity.current_state == 'PROPOSED' %}<option value="TRIAGED">{% ui '完成初步判断' 'Complete initial review' %}</option>{% else %}<option value="APPROVED">{% ui '确认值得做' 'Confirm it is worth doing' %}</option>{% endif %}<option value="REJECTED">{% ui '不做这个方向' 'Do not pursue' %}</option></select></label>
+          <label><span>{% ui '一句话说明原因' 'Reason in one sentence' %}</span><textarea name="reason" rows="2" required></textarea></label>
+          <button class="button button-primary" type="submit">{% ui '保存决定' 'Save decision' %}</button>
+        </form>
+        {% elif opportunity.current_state == 'APPROVED' and not initiative %}
+        <form method="post" action="{% url 'dailyops:initiative-create' opportunity.id %}">{% csrf_token %}<input type="hidden" name="command_id" value="{{ command_id }}"><button class="button button-primary" type="submit">{% ui '建立执行项目' 'Create execution initiative' %}</button></form>
+        {% else %}<span class="status-pill">{% ui_daily_state opportunity.current_state %}</span>{% endif %}
+      </article>
+    {% else %}<div class="daily-locked"><strong>{% ui '先采用一个选题' 'Choose an idea first' %}</strong></div>{% endif %}
+    </details>
+    </div>
+  </details>
+
+  <details class="daily-stage{% if current_step > 5 %} is-complete{% endif %}" data-step="5"{% if initiative and not plans %} open{% endif %}>
+    <summary>
+      <span class="daily-stage-index">5</span>
+      <span><small>{% ui '开项目' 'Start initiative' %}</small><strong>{% ui '把方向变成一项执行项目' 'Turn the direction into an execution initiative' %}</strong></span>
+      <span class="daily-stage-status" data-stage-status></span>
+    </summary>
+    <div class="daily-stage-body">
+    <details class="daily-advanced-actions">
+      <summary>{% ui '高级：分步批准项目' 'Advanced: approve project step by step' %}</summary>
+    {% if initiative %}
+      <article class="daily-action-card daily-action-card-stacked">
+        <div><h3>{{ initiative.title }}</h3><p>{{ initiative.objective }}</p></div>
+        {% if initiative.current_state == 'PROPOSED' or initiative.current_state == 'APPROVED' %}
+        <form class="config-form daily-decision-form" method="post" action="{% url 'dailyops:initiative-transition' initiative.id %}">
+          {% csrf_token %}<input type="hidden" name="command_id" value="{{ command_id }}"><input type="hidden" name="expected_version" value="{{ initiative.state_version }}"><input type="hidden" name="to_state" value="{% if initiative.current_state == 'PROPOSED' %}APPROVED{% else %}ACTIVE{% endif %}">
+          <label><span>{% ui '一句话说明原因' 'Reason in one sentence' %}</span><textarea name="reason" rows="2" required></textarea></label>
+          <button class="button button-primary" type="submit">{% if initiative.current_state == 'PROPOSED' %}{% ui '批准这个项目' 'Approve initiative' %}{% else %}{% ui '开始安排任务' 'Start planning work' %}{% endif %}</button>
+        </form>
+        {% else %}<span class="status-pill"><span></span>{% ui_daily_state initiative.current_state %}</span>{% endif %}
+      </article>
+    {% else %}<div class="daily-locked"><strong>{% ui '先完成方向确认' 'Confirm the direction first' %}</strong></div>{% endif %}
+    </details>
+    </div>
+  </details>
+
+  <details class="daily-stage{% if current_step > 6 %} is-complete{% endif %}" data-step="6">
+    <summary>
+      <span class="daily-stage-index">6</span>
+      <span><small>{% ui '排任务' 'Plan work' %}</small><strong>{% ui '选择平台账号并生成执行任务' 'Choose an account and create execution work' %}</strong></span>
+      <span class="daily-stage-status" data-stage-status></span>
+    </summary>
+    <div class="daily-stage-body">
+    {% if initiative.current_state == 'APPROVED' or initiative.current_state == 'ACTIVE' %}
+      <article class="daily-plan-builder">
+        <h3>{% ui '安排平台任务' 'Plan platform work' %}</h3>
+        <form class="config-form" method="post" action="{% url 'dailyops:plan-create' initiative.id %}">
+          {% csrf_token %}{{ plan_form.command_id }}{{ plan_form.non_field_errors }}
+          <div class="daily-form-grid">
+            <label><span>{% ui '执行平台' 'Platform' %}</span>{{ plan_form.platform }}{{ plan_form.platform.errors }}</label>
+            {% if plan_form.channel_account.is_hidden %}{{ plan_form.channel_account }}{% else %}<label><span>{% ui '具体账号' 'Account' %}</span>{{ plan_form.channel_account }}{{ plan_form.channel_account.errors }}</label>{% endif %}
+            <label><span>{% ui '执行日期' 'Work date' %}</span>{{ plan_form.plan_date }}{{ plan_form.plan_date.errors }}</label>
+            <label class="daily-form-wide"><span>{% ui '任务标题' 'Task title' %}</span>{{ plan_form.task_title }}{{ plan_form.task_title.errors }}</label>
+            <label class="daily-form-wide"><span>{% ui '要做什么' 'What needs to be done' %}</span>{{ plan_form.task_description }}{{ plan_form.task_description.errors }}</label>
+          </div>
+          <p class="daily-inline-help">{% ui '运行环境和发布能力由系统根据所选账号自动核对，你不需要填写代码。' 'The system checks the runtime environment and publishing capability for the selected account; no code is required.' %}</p>
+          <button class="button button-primary" type="submit">{% ui '安排平台任务' 'Create channel plan' %}</button>
+        </form>
+      </article>
+
+      <div class="daily-plan-list">
+      {% for plan in plans %}
+        <article class="daily-plan-card{% if not plan.compiled_context %} daily-plan-needs-work{% endif %}">
+          <header><div><p class="task-meta">{{ plan.channel_account.display_name }}</p><h3>{{ plan.goal.title }}</h3></div><span class="task-state">{% ui_daily_state plan.current_state %}</span></header>
+          {% if plan.compiled_context %}
+          <div class="daily-task-ready"><span>{% ui '执行任务已生成' 'Execution task created' %}</span><a class="button button-primary" href="{% url 'dashboard:task-detail' plan.compiled_context.task.id %}">{% ui '查看执行任务' 'View execution task' %}</a></div>
+          {% else %}
+          <form method="post" action="{% url 'dailyops:plan-confirm-and-compile' plan.id %}">{% csrf_token %}<input type="hidden" name="command_id" value="{{ plan.owner_flow_command_id }}"><input type="hidden" name="task_id" value="{{ plan.owner_flow_task_id }}"><button class="button button-primary" type="submit">{% ui '确认平台安排并生成执行任务' 'Confirm platform plan and create task' %}</button></form>
+          <details class="daily-advanced-actions">
+            <summary>{% ui '高级：分步确认和生成' 'Advanced: confirm and compile step by step' %}</summary>
+          {% if plan.current_state == 'DRAFT' or plan.current_state == 'READY' %}
+          <form class="config-form daily-decision-form" method="post" action="{% url 'dailyops:plan-transition' plan.id %}">
+            {% csrf_token %}<input type="hidden" name="command_id" value="{{ command_id }}"><input type="hidden" name="expected_version" value="{{ plan.state_version }}"><input type="hidden" name="to_state" value="{% if plan.current_state == 'DRAFT' %}READY{% else %}ACTIVE{% endif %}">
+            <label><span>{% ui '一句话说明原因' 'Reason in one sentence' %}</span><textarea name="reason" rows="2" required></textarea></label>
+            <button class="button button-primary" type="submit">{% if plan.current_state == 'DRAFT' %}{% ui '确认计划可以执行' 'Mark plan ready' %}{% else %}{% ui '启动这个计划' 'Activate plan' %}{% endif %}</button>
+          </form>
+          {% endif %}
+          {% if plan.current_state == 'READY' or plan.current_state == 'ACTIVE' %}{% if not plan.compiled_context %}<form method="post" action="{% url 'dailyops:plan-compile' plan.id %}">{% csrf_token %}<input type="hidden" name="command_id" value="{{ command_id }}"><input type="hidden" name="task_id" value="{{ task_id }}"><button class="button button-primary" type="submit">{% ui '生成执行任务' 'Create execution task' %}</button></form>{% endif %}{% endif %}
+          </details>
+          {% endif %}
+        </article>
+      {% empty %}<p class="daily-inline-help">{% ui '还没有安排平台任务。' 'No platform work has been planned yet.' %}</p>{% endfor %}
+      </div>
+    {% else %}<div class="daily-locked"><strong>{% ui '先启动执行项目' 'Start the initiative first' %}</strong></div>{% endif %}
+    </div>
+  </details>
+
+  <details class="daily-stage" data-step="7">
+    <summary>
+      <span class="daily-stage-index">7</span>
+      <span><small>{% ui '去执行' 'Execute' %}</small><strong>{% ui '执行人完成任务，审核与发布分别确认' 'Complete the task; review and publish remain separate' %}</strong></span>
+      <span class="daily-stage-status" data-stage-status></span>
+    </summary>
+    <div class="daily-stage-body">
+      <div class="daily-ready-list">
+      {% for plan in plans %}{% if plan.compiled_context %}
+        <a class="daily-ready-link" href="{% url 'dashboard:task-detail' plan.compiled_context.task.id %}"><span><strong>{{ plan.compiled_context.task.title }}</strong><small>{{ plan.channel_account.display_name }}</small></span><span>→</span></a>
+      {% endif %}{% empty %}{% endfor %}
+      </div>
+      {% if not plans %}<div class="daily-locked"><strong>{% ui '先安排并生成一项执行任务' 'Plan and create an execution task first' %}</strong></div>{% endif %}
+    </div>
+  </details>
+</div>
+
+<script src="{% static 'js/dailyops_collection.js' %}"></script>
+<script>
+(() => {
+  const flow = document.getElementById('daily-flow');
+  if (!flow) return;
+  const isEnglish = document.documentElement.lang.startsWith('en');
+  const t = (zh, en) => isEnglish ? en : zh;
+
+  const current = Number.parseInt(flow.dataset.currentStep, 10);
+  if (!Number.isInteger(current) || current < 2 || current > 7) return;
+
+  const stepLabels = {
+    2: t('现在：先找一条真正有用的线索。', 'Now: find at least one useful signal.'),
+    3: t('现在：查看系统整理的建议，并决定是否采用。', 'Now: review the suggestion and decide whether to use it.'),
+    4: t('现在：确认这个方向是否值得继续。', 'Now: confirm whether this direction is worth pursuing.'),
+    5: t('现在：批准并启动执行项目。', 'Now: approve and start the initiative.'),
+    6: t('现在：安排平台账号并生成执行任务。', 'Now: choose a platform account and create execution work.'),
+    7: t('下一步已经交给执行人；审核与发布仍由不同权限分别确认。', 'The next action belongs to the assignee; review and publish remain separately authorized.')
+  };
+  document.getElementById('daily-current-hint').textContent = stepLabels[current];
+
+  document.querySelectorAll('.daily-step[data-go-step]').forEach((button) => {
+    const step = Number(button.dataset.goStep);
+    button.classList.toggle('is-complete', step < current);
+    button.classList.toggle('is-current', step === current);
+    button.classList.toggle('is-upcoming', step > current);
+    button.addEventListener('click', () => {
+      const stage = document.querySelector(`.daily-stage[data-step="${step}"]`);
+      if (!stage) return;
+      if (step < current) stage.classList.add('is-manually-open');
+      stage.open = true;
+      stage.scrollIntoView({behavior: 'smooth', block: 'start'});
+    });
+  });
+  document.querySelectorAll('.daily-stage').forEach((stage) => {
+    const step = Number(stage.dataset.step);
+    stage.classList.toggle('is-current', step === current);
+    stage.classList.toggle('is-complete', step < current);
+    stage.classList.toggle('is-upcoming', step > current);
+    stage.open = step === current;
+    const status = stage.querySelector('[data-stage-status]');
+    if (status) status.textContent = step < current ? t('已完成', 'Done') : step === current ? t('现在做', 'Do now') : t('稍后', 'Later');
+  });
+
+  const reference = document.getElementById('id_reference');
+  if (reference) reference.placeholder = t('粘贴链接；没有链接时填内容名称或 ID', 'Paste a link, or enter a content name or ID');
+  const title = document.getElementById('id_title');
+  if (title) title.placeholder = t('系统会自动使用链接作为名称', 'The link will be used if left blank');
+  const platformLabels = {
+    '': t('让系统从链接识别', 'Detect from link'),
+    PINTEREST: 'Pinterest', QUORA: 'Quora', TIKTOK: 'TikTok',
+    SHOPIFY: t('Shopify / 独立站', 'Shopify store'),
+    GOOGLE_SEARCH: 'Google Search',
+    GOOGLE_SEARCH_CONSOLE: 'Google Search Console',
+    GOOGLE_ANALYTICS_4: 'Google Analytics 4'
+  };
+  document.querySelectorAll('select[name="platform"] option').forEach((option) => {
+    if (Object.prototype.hasOwnProperty.call(platformLabels, option.value)) option.textContent = platformLabels[option.value];
+  });
+
+  const collectButton = document.getElementById('daily-collect-all');
+  if (!collectButton) return;
+  collectButton.addEventListener('click', async () => {
+    if (collectButton.disabled) return;
+    const form = document.getElementById('daily-collect-form');
+    const rows = Array.from(document.querySelectorAll('.daily-platform-row[data-collect-url]'));
+    const progress = document.getElementById('daily-progress');
+    const progressLabel = document.getElementById('daily-progress-label');
+    const progressCount = document.getElementById('daily-progress-count');
+    const progressBar = document.getElementById('daily-progress-bar');
+    const track = progress.querySelector('[role="progressbar"]');
+    collectButton.disabled = true;
+    progress.hidden = false;
+    await window.DailyOpsCollection.runSequentially(rows, async (row) => {
+      const name = row.dataset.platformName;
+      const state = row.querySelector('.daily-platform-state');
+      progressLabel.textContent = t(`正在检查 ${name}…`, `Checking ${name}…`);
+      state.textContent = t('检查中', 'Checking');
+      state.classList.remove('task-state-approved', 'task-state-blocked');
+      const body = new FormData();
+      body.append('csrfmiddlewaretoken', form.querySelector('[name="csrfmiddlewaretoken"]').value);
+      body.append('command_id', form.querySelector('[name="command_id"]').value);
+      const response = await fetch(row.dataset.collectUrl, {method: 'POST', body, credentials: 'same-origin', headers: {'X-Requested-With': 'XMLHttpRequest'}});
+      const data = await response.json();
+      if (!response.ok || !data.ok) throw new Error(data.message || t('检查失败', 'Check failed'));
+      return data;
+    }, ({item: row, completed, total, result}) => {
+      const state = row.querySelector('.daily-platform-state');
+      if (result.status === 'fulfilled') {
+        const data = result.value;
+        if (data.created_count > 0 || data.availability === 'PRESENT') {
+          state.textContent = t('已找到', 'Found');
+          state.classList.add('task-state-approved');
+        } else {
+          state.textContent = t('需补录', 'Needs input');
+          state.classList.add('task-state-blocked');
+        }
+      } else {
+        state.textContent = t('检查失败', 'Failed');
+        state.classList.add('task-state-blocked');
+        row.title = result.reason instanceof Error ? result.reason.message : String(result.reason);
+      }
+      progressCount.textContent = `${completed} / ${total}`;
+      progressBar.style.width = `${(completed / total) * 100}%`;
+      track.setAttribute('aria-valuenow', String(completed));
+    });
+    progressLabel.textContent = t('七个平台检查完成，正在刷新结果…', 'All seven checks finished. Refreshing results…');
+    window.setTimeout(() => window.location.reload(), 650);
+  });
+})();
+</script>
 {% endblock %}

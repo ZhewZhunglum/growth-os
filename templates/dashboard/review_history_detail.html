@@ -1,43 +1,43 @@
 {% extends "base.html" %}
-{% load dashboard_display %}
-{% block title %}审核记录 {{ task.title }} · PUKO Growth OS{% endblock %}
-{% block page_title %}已完成审核记录{% endblock %}
+{% load dashboard_display ui_i18n %}
+{% block title %}{% ui '审核记录' 'Review record' %} {{ task.title }} · PUKO Growth OS{% endblock %}
+{% block page_title %}{% ui '已完成审核记录' 'Completed review record' %}{% endblock %}
 {% block content %}
-<a class="back-link" href="{% url 'dashboard:review-queue' %}">← 返回内容审核</a>
+<a class="back-link" href="{% url 'dashboard:review-queue' %}">← {% ui '返回内容审核' 'Back to reviews' %}</a>
 <section class="task-detail-hero">
     <div>
-        <p class="eyebrow">只读记录 · 第 {{ submission.submission_number }} 次提交</p>
+        <p class="eyebrow">{% ui '只读记录' 'Read-only record' %} · {% ui '第' 'Submission' %} {{ submission.submission_number }} {% ui '次提交' '' %}</p>
         <h2>{{ task.title }}</h2>
-        <p>{{ task.description|default:"暂无背景说明" }}</p>
+        <p>{% if task.description %}{{ task.description }}{% else %}{% ui '暂无背景说明' 'No background provided' %}{% endif %}</p>
     </div>
     <div class="detail-status-stack">
-        <span class="task-state">{{ review.decision|review_decision_zh }}</span>
-        <small>本页不能修改审核事实</small>
+        <span class="task-state">{% ui_review_decision review.decision %}</span>
+        <small>{% ui '本页不能修改审核事实' 'Review facts cannot be changed here' %}</small>
     </div>
 </section>
-<section class="detail-summary-grid" aria-label="审核事实">
-    <article><span class="task-label">产品</span><p>{{ task.product.name }}</p></article>
-    <article><span class="task-label">审核人员</span><p>{{ review.reviewer_principal.display_name|default:review.reviewer_principal.username }}</p></article>
-    <article><span class="task-label">审核时间</span><p>{{ review.decided_at }}</p></article>
-    <article><span class="task-label">审核结论</span><p>{{ review.decision|review_decision_zh }}</p></article>
+<section class="detail-summary-grid" aria-label="{% ui '审核事实' 'Review facts' %}">
+    <article><span class="task-label">{% ui '产品' 'Product' %}</span><p>{{ task.product.name }}</p></article>
+    <article><span class="task-label">{% ui '审核人员' 'Reviewer' %}</span><p>{{ review.reviewer_principal.display_name|default:review.reviewer_principal.username }}</p></article>
+    <article><span class="task-label">{% ui '审核时间' 'Reviewed at' %}</span><p>{{ review.decided_at }}</p></article>
+    <article><span class="task-label">{% ui '审核结论' 'Decision' %}</span><p>{% ui_review_decision review.decision %}</p></article>
 </section>
 <section class="detail-columns">
     <article class="detail-panel">
-        <p class="eyebrow">精确交付版本</p><h3>资产版本 v{{ asset_version.version_number }}</h3>
+        <p class="eyebrow">{% ui '精确交付版本' 'Exact delivery version' %}</p><h3>{% ui '资产版本' 'Asset version' %} v{{ asset_version.version_number }}</h3>
         <dl class="submission-summary">
-            <dt>资产版本</dt><dd>v{{ asset_version.version_number }}</dd>
-            <dt>版本清单类型</dt><dd>{{ asset_version.mime_type }}</dd>
-            <dt>链接 SHA-256</dt><dd class="hash-value">{{ asset_version.content_sha256 }}</dd>
-            {% if can_view_asset and is_link_delivery %}<dt>封存链接</dt><dd class="hash-value">{{ asset_version.object_key }}</dd>{% endif %}
-            <dt>封存时间</dt><dd>{{ submission.sealed_at }}</dd>
+            <dt>{% ui '资产版本' 'Asset version' %}</dt><dd>v{{ asset_version.version_number }}</dd>
+            <dt>{% ui '版本清单类型' 'Manifest type' %}</dt><dd>{{ asset_version.mime_type }}</dd>
+            <dt>{% ui '链接 SHA-256' 'Link SHA-256' %}</dt><dd class="hash-value">{{ asset_version.content_sha256 }}</dd>
+            {% if can_view_asset and is_link_delivery %}<dt>{% ui '封存链接' 'Sealed link' %}</dt><dd class="hash-value">{{ asset_version.object_key }}</dd>{% endif %}
+            <dt>{% ui '封存时间' 'Sealed at' %}</dt><dd>{{ submission.sealed_at }}</dd>
         </dl>
-        {% if can_view_asset and is_link_delivery %}<a class="button" href="{{ asset_version.object_key }}" target="_blank" rel="noopener noreferrer">打开当时审核的内容</a>{% elif can_view_asset %}<p class="read-only-note">V1 已停止支持该旧文件交付。</p>{% else %}<p class="read-only-note">当前审核权限已失效，因此只能查看历史摘要，不能再打开交付链接。</p>{% endif %}
+        {% if can_view_asset and is_link_delivery %}<a class="button" href="{{ asset_version.object_key }}" target="_blank" rel="noopener noreferrer">{% ui '打开当时审核的内容' 'Open the reviewed delivery' %}</a>{% elif can_view_asset %}<p class="read-only-note">{% ui 'V1 已停止支持该旧文件交付。' 'V1 no longer supports this legacy file delivery.' %}</p>{% else %}<p class="read-only-note">{% ui '当前审核权限已失效，因此只能查看历史摘要，不能再打开交付链接。' 'Your current review access is no longer valid, so you can view only the history summary and cannot reopen the delivery link.' %}</p>{% endif %}
     </article>
     <article class="detail-panel read-only-panel">
-        <p class="eyebrow">不可变人工结论</p><h3>{{ review.decision|review_decision_zh }}</h3>
-        <span class="task-label">审核说明</span>
-        <p class="review-rationale">{{ review.rationale|default:"未填写审核说明"|linebreaksbr }}</p>
-        <p class="read-only-note">该结论、提交批次和精确链接版本仅供查看，不能在本页修改或重新提交。</p>
+        <p class="eyebrow">{% ui '不可变人工结论' 'Immutable human decision' %}</p><h3>{% ui_review_decision review.decision %}</h3>
+        <span class="task-label">{% ui '审核说明' 'Review notes' %}</span>
+        <p class="review-rationale">{% if review.rationale %}{{ review.rationale|linebreaksbr }}{% else %}{% ui '未填写审核说明' 'No review notes' %}{% endif %}</p>
+        <p class="read-only-note">{% ui '该结论、提交批次和精确链接版本仅供查看，不能在本页修改或重新提交。' 'The decision, submission, and exact link version are read only and cannot be changed or resubmitted here.' %}</p>
     </article>
 </section>
 {% endblock %}

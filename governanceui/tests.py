@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import timedelta
 from decimal import Decimal
 
+from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.test import TestCase, override_settings
 from django.urls import reverse
@@ -110,6 +111,24 @@ class GovernanceUIFlowTests(TestCase):
         response = self.client.get(reverse("governanceui:home"))
         self.assertEqual(response.status_code, 200)
         self.assertContains(response, "问题与规则治理")
+
+    def test_governance_home_and_issue_form_switch_fully_to_english(self):
+        self.client.cookies[settings.LANGUAGE_COOKIE_NAME] = "en"
+        self.client.force_login(self.owner)
+
+        home = self.client.get(reverse("governanceui:home"))
+        self.assertContains(home, "Issues and rules")
+        self.assertContains(home, "Report issue")
+        self.assertContains(home, "New rule definition")
+        self.assertNotContains(home, "上报问题")
+        self.assertNotContains(home, "新建规则定义")
+
+        issue_form = self.client.get(reverse("governanceui:issue-create"))
+        self.assertContains(issue_form, "Issue code")
+        self.assertContains(issue_form, "Issue type")
+        self.assertContains(issue_form, "Severity")
+        self.assertNotContains(issue_form, "问题编号")
+        self.assertNotContains(issue_form, "问题类型")
 
     def test_admin_can_create_definition_idempotently_but_operator_cannot(self):
         payload = {

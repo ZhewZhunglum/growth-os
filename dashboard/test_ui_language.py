@@ -54,10 +54,15 @@ class PresentationLanguageTests(TestCase):
             {"language": "en", "next": reverse("dashboard:home")},
         )
         response = self.client.get(reverse("dashboard:home"))
-        self.assertContains(response, "Daily Operations")
-        self.assertContains(response, "Team & access")
-        self.assertContains(response, "Product & runtime setup")
+        self.assertContains(response, "Opportunities")
+        self.assertContains(response, "My work")
+        self.assertContains(response, "Team")
+        self.assertContains(response, "Settings")
         self.assertContains(response, "Sign out")
+        self.assertContains(response, "Language Owner")
+        self.assertContains(response, "Owner")
+        self.assertNotContains(response, "Evidence to task")
+        self.assertNotContains(response, "Coming later")
 
     def test_daily_team_and_configuration_main_labels_switch_to_english(self):
         self.client.force_login(self.user)
@@ -67,8 +72,8 @@ class PresentationLanguageTests(TestCase):
         )
 
         response = self.client.get(reverse("dailyops:home"))
-        self.assertContains(response, "Start with real external signals")
-        self.assertContains(response, "Create seven-platform checklist")
+        self.assertContains(response, "Start today's run")
+        self.assertContains(response, "Finish setup")
 
         response = self.client.get(reverse("dashboard:team-members"))
         self.assertContains(response, "Staff accounts and live permissions")

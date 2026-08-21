@@ -34,6 +34,7 @@ from intelligence.models import (
     AssessmentMethod,
     AvailabilityState,
     ChannelPlan,
+    ChannelPlanStateEvent,
     CollectionRun,
     DecisionState,
     DemandAssessment,
@@ -41,6 +42,7 @@ from intelligence.models import (
     EvidenceArtifactLink,
     ExternalEvidenceItem,
     Initiative,
+    InitiativeStateEvent,
     ProductOpportunity,
     ProductTopicFit,
     ProductTopicFitAssessment,
@@ -53,7 +55,13 @@ from intelligence.models import (
     TopicEvidenceLink,
     canonical_sha256,
 )
-from intelligence.services import record_collection_run
+from intelligence.exceptions import CommandReplayConflict
+from intelligence.services import (
+    record_collection_run,
+    transition_channel_plan,
+    transition_initiative,
+    transition_opportunity,
+)
 from products.models import Product
 from releasegate.models import AccountEnvironmentBinding, CapabilityState
 from workflow.models import Task, TaskContractVersion
@@ -104,6 +112,32 @@ class AutomaticCollectionResult:
     evidence: tuple[ExternalEvidenceItem, ...]
     created_count: int
     created: bool
+
+
+@dataclass(frozen=True, slots=True)
+class PlatformCollectionResult:
+    command_id: uuid.UUID
+    platform: Platform
+    run: CollectionRun
+    evidence: tuple[ExternalEvidenceItem, ...]
+    created_count: int
+    created: bool
+
+
+@dataclass(frozen=True, slots=True)
+class StartedExecutionProjectResult:
+    """The separate immutable facts produced by the Owner shortcut."""
+
+    opportunity: ProductOpportunity
+    initiative: Initiative
+
+
+@dataclass(frozen=True, slots=True)
+class ConfirmedPlanTaskResult:
+    """An activated plan plus its exact sealed task compilation result."""
+
+    channel_plan: ChannelPlan
+    compilation: CompiledTaskResult
 
 
 def _source_key(platform: Platform, mode: AcquisitionMode) -> str:
@@ -598,6 +632,17 @@ def run_automatic_collection(
     reviewed runtime to perform external reads.
     """
 
+    # Authorization must be resolved before constructing or invoking any
+    # connector.  Otherwise an EDIT-only caller could trigger a browser/API
+    # request (and potentially a paid provider) before persistence rejects it.
+    for platform in PLATFORMS:
+        require_authorization(
+            principal=principal,
+            acting_role=acting_role,
+            action=PermissionGrant.Action.COLLECT_READ_ONLY,
+            scope_kind=PermissionGrant.ScopeKind.PLATFORM,
+            platform_code=platform.value,
+        )
     initial_runs = batch_runs(batch_key=batch_key, product=product)
     replay = _automatic_replay(
         command_id=command_id,
@@ -703,11 +748,182 @@ def run_automatic_collection(
     )
 
 
+def _platform_collection_replay(
+    *,
+    command_id: uuid.UUID,
+    batch_key: uuid.UUID,
+    product: Product,
+    platform: Platform,
+) -> PlatformCollectionResult | None:
+    run = (
+        CollectionRun.objects.filter(operation_key=_automatic_operation_id(command_id, platform))
+        .select_related("source")
+        .first()
+    )
+    if run is None:
+        return None
+    if (
+        run.batch_key != batch_key
+        or run.source.platform_code != platform.value
+        or str(run.query_spec.get("product_id", "")) != str(product.pk)
+        or str(run.query_spec.get("automatic_command_id", "")) != str(command_id)
+    ):
+        raise ValidationError("This platform collection command was already used for another payload.")
+    evidence = tuple(
+        ExternalEvidenceItem.objects.filter(collection_run=run)
+        .select_related("source", "collection_run")
+        .order_by("observed_at", "id")
+    )
+    return PlatformCollectionResult(
+        command_id=command_id,
+        platform=platform,
+        run=run,
+        evidence=evidence,
+        created_count=0,
+        created=False,
+    )
+
+
+def run_platform_collection(
+    *,
+    batch_key: uuid.UUID,
+    product: Product,
+    command_id: uuid.UUID,
+    platform: Platform,
+    principal: Principal,
+    acting_role: str,
+    runtime: DailyOperationsRuntime | None = None,
+) -> PlatformCollectionResult:
+    """Run and persist one platform so the UI can show honest progress."""
+
+    # Keep the external side effect behind the exact live collection grant.
+    # This is deliberately before replay lookup and runtime construction so a
+    # revoked/denied caller cannot use an old command or trigger a connector.
+    require_authorization(
+        principal=principal,
+        acting_role=acting_role,
+        action=PermissionGrant.Action.COLLECT_READ_ONLY,
+        scope_kind=PermissionGrant.ScopeKind.PLATFORM,
+        platform_code=platform.value,
+    )
+    initial_runs = batch_runs(batch_key=batch_key, product=product)
+    replay = _platform_collection_replay(
+        command_id=command_id,
+        batch_key=batch_key,
+        product=product,
+        platform=platform,
+    )
+    if replay is not None:
+        return replay
+    requests = _connector_request_map(
+        command_id=command_id,
+        batch_key=batch_key,
+        product=product,
+        runs=initial_runs,
+    )
+    runtime = runtime or build_daily_operations_runtime()
+    result = runtime.connectors.run_one(requests[platform])
+    request = requests[platform]
+    if result.platform is not platform or result.operation_key != request.operation_key:
+        raise ValidationError("Connector result does not bind the exact platform operation.")
+    started_at = timezone.now()
+    completed_at = timezone.now()
+
+    with transaction.atomic():
+        tuple(
+            CollectionRun.objects.select_for_update()
+            .filter(batch_key=batch_key)
+            .values_list("pk", flat=True)
+        )
+        replay = _platform_collection_replay(
+            command_id=command_id,
+            batch_key=batch_key,
+            product=product,
+            platform=platform,
+        )
+        if replay is not None:
+            return replay
+        source_mode = (
+            result.mode
+            if result.mode in {AcquisitionMode.API, AcquisitionMode.BROWSER}
+            else PRIMARY_MODE[platform]
+        )
+        source = _latest_source(platform, source_mode)
+        normalized_items = ()
+        if result.status in {ConnectorRunStatus.SUCCEEDED, ConnectorRunStatus.PARTIAL}:
+            if not result.items:
+                raise ValidationError("A successful or partial connector result must contain evidence items.")
+            normalized_items = _normalize_connector_items(
+                result=result,
+                request=request,
+                source=source,
+                principal=principal,
+                observed_at=completed_at,
+            )
+        run_status, availability = _collection_state(result)
+        query_spec = dict(initial_runs[0].query_spec)
+        query_spec.update(
+            {
+                "automatic_command_id": str(command_id),
+                "connector_operation_key": request.operation_key,
+                "connector_status": result.status.value,
+                "connector_mode": result.mode.value if result.mode else "",
+                "connector_provider": result.provider or "",
+            }
+        )
+        outcome = record_collection_run(
+            source=source,
+            batch_key=batch_key,
+            attempt_number=_next_attempt(batch_key=batch_key, source=source),
+            operation_key=_automatic_operation_id(command_id, platform),
+            query_spec=query_spec,
+            status=run_status,
+            availability_state=availability,
+            started_at=started_at,
+            completed_at=completed_at,
+            result_summary={
+                "connector_status": result.status.value,
+                "mode": result.mode.value if result.mode else "",
+                "provider": result.provider or "",
+                "items": len(normalized_items),
+                "reason": result.reason[:2_000],
+                "retryable": result.retryable,
+                "provenance": [dict(value) for value in result.provenance],
+                "fallback": "CSV_OR_MANUAL" if not normalized_items else "",
+            },
+            error_code="" if normalized_items else f"CONNECTOR_{result.status.value}",
+            principal=principal,
+            acting_role=acting_role,
+        )
+        evidence: list[ExternalEvidenceItem] = []
+        created_count = 0
+        for item in normalized_items:
+            persisted, created = _persist_ingested_evidence(
+                run=outcome.run,
+                source=source,
+                item=item,
+                principal=principal,
+            )
+            evidence.append(persisted)
+            created_count += int(created)
+    return PlatformCollectionResult(
+        command_id=command_id,
+        platform=platform,
+        run=outcome.run,
+        evidence=tuple(evidence),
+        created_count=created_count,
+        created=True,
+    )
+
+
 def _batch_evidence(*, batch_key: uuid.UUID, product: Product) -> tuple[ExternalEvidenceItem, ...]:
     runs = batch_runs(batch_key=batch_key, product=product)
     run_ids = [run.pk for run in runs]
     return tuple(
-        ExternalEvidenceItem.objects.filter(collection_run_id__in=run_ids)
+        ExternalEvidenceItem.objects.filter(
+            collection_run_id__in=run_ids,
+            invalidation_event__isnull=True,
+        )
         .select_related("source", "collection_run")
         # UUIDv7 creation order keeps the first item a stable version anchor
         # even when a later CSV contains an older observed_at timestamp.
@@ -1061,6 +1277,18 @@ def create_channel_plan(
 ) -> ChannelPlan:
     if initiative.current_state not in {Initiative.State.APPROVED, Initiative.State.ACTIVE}:
         raise ValidationError("Channel planning requires an approved Initiative.")
+    # Runtime environment and capability are system-owned facts.  Discard the
+    # legacy form keys so callers cannot choose or spoof deployment context.
+    requested_requirements = dict(content_requirements or {})
+    for system_owned_key in (
+        "environment_code",
+        "capability_code",
+        "runtime_binding_id",
+        "runtime_environment_code",
+        "capability_state_id",
+        "resolved_capability_code",
+    ):
+        requested_requirements.pop(system_owned_key, None)
     existing = ChannelPlan.objects.filter(creation_command_id=command_id).first()
     payload = {
         "initiative_id": str(initiative.pk),
@@ -1068,27 +1296,29 @@ def create_channel_plan(
         "channel_account_id": str(getattr(channel_account, "pk", "")),
         "plan_date": plan_date.isoformat(),
         "goal": goal,
-        "content_requirements": content_requirements,
+        "content_requirements": requested_requirements,
     }
     payload_hash = canonical_sha256(payload)
     if existing:
         if existing.creation_payload_hash != payload_hash:
             raise ValidationError("ChannelPlan command was replayed with different input.")
         return existing
-    if channel_account is not None and channel_account.platform_code != platform.value:
-        raise ValidationError("ChannelAccount belongs to another platform.")
-    if channel_account is not None:
-        if channel_account.status != channel_account.Status.ACTIVE:
-            raise ValidationError("ChannelAccount is not active.")
-        require_authorization(
-            principal=principal,
-            acting_role=acting_role,
-            action=PermissionGrant.Action.COLLECT_READ_ONLY,
-            scope_kind=PermissionGrant.ScopeKind.ACCOUNT,
-            product=initiative.product,
-            platform_code=channel_account.platform_code,
-            account_ref=channel_account.account_code,
-        )
+    if channel_account is None:
+        raise ValidationError("请先选择一个与执行平台匹配的账号。")
+    if channel_account.platform_code != platform.value:
+        raise ValidationError("所选账号与执行平台不匹配。")
+    if channel_account.status != channel_account.Status.ACTIVE:
+        raise ValidationError("所选账号当前不可用。")
+    require_authorization(
+        principal=principal,
+        acting_role=acting_role,
+        action=PermissionGrant.Action.COLLECT_READ_ONLY,
+        scope_kind=PermissionGrant.ScopeKind.ACCOUNT,
+        product=initiative.product,
+        platform_code=channel_account.platform_code,
+        account_ref=channel_account.account_code,
+    )
+    binding, capability = _resolve_current_plan_runtime(channel_account)
     grant = require_authorization(
         principal=principal,
         acting_role=acting_role,
@@ -1096,6 +1326,13 @@ def create_channel_plan(
         scope_kind=PermissionGrant.ScopeKind.PRODUCT,
         product=initiative.product,
     )
+    resolved_requirements = {
+        **requested_requirements,
+        "runtime_binding_id": str(binding.pk),
+        "runtime_environment_code": binding.runtime_environment.environment_code,
+        "capability_state_id": str(capability.pk),
+        "resolved_capability_code": capability.capability_code,
+    }
     return ChannelPlan.objects.create(
         initiative=initiative,
         channel_account=channel_account,
@@ -1103,7 +1340,7 @@ def create_channel_plan(
         platform_code=platform.value,
         plan_date=plan_date,
         goal=goal,
-        content_requirements=content_requirements,
+        content_requirements=resolved_requirements,
         creation_command_id=command_id,
         creation_payload_hash=payload_hash,
         created_by_principal=principal,
@@ -1112,40 +1349,57 @@ def create_channel_plan(
     )
 
 
-def _current_capability_for_plan(plan: ChannelPlan) -> CapabilityState:
-    if not plan.channel_account_id:
-        raise ValidationError("Choose the exact ChannelAccount before compiling this plan.")
-    now = timezone.now()
-    environment_code = str(plan.content_requirements.get("environment_code", "")).strip()
+def _resolve_current_plan_runtime(
+    channel_account,
+    *,
+    at=None,
+) -> tuple[AccountEnvironmentBinding, CapabilityState]:
+    """Resolve one exact current binding and its manual-publish capability.
+
+    There is deliberately no ``.first()`` fallback: zero matches are an
+    incomplete setup and multiple matches are ambiguous, so both fail closed.
+    """
+
+    at = at or timezone.now()
     bindings = (
         AccountEnvironmentBinding.objects.select_related("runtime_environment")
         .filter(
-            channel_account_id=plan.channel_account_id,
+            channel_account_id=channel_account.pk,
             status=AccountEnvironmentBinding.Status.ACTIVE,
-            valid_from__lte=now,
+            valid_from__lte=at,
             runtime_environment__status="ACTIVE",
         )
-        .filter(Q(valid_until__isnull=True) | Q(valid_until__gt=now))
+        .filter(Q(valid_until__isnull=True) | Q(valid_until__gt=at))
+        .order_by("runtime_environment__environment_code", "-binding_version", "id")
     )
-    if environment_code:
-        bindings = bindings.filter(runtime_environment__environment_code=environment_code)
-    current_bindings = [binding for binding in bindings if binding.is_current_at(now)]
-    if len(current_bindings) != 1:
-        raise ValidationError("Plan must resolve to exactly one current Account/Environment binding.")
+    current_bindings = [binding for binding in bindings if binding.is_current_at(at)]
+    if not current_bindings:
+        raise ValidationError("这个账号当前没有可用的运行环境，请先完成账号与环境配置。")
+    if len(current_bindings) > 1:
+        raise ValidationError("这个账号同时连接了多个运行环境，系统不能安全猜选；请先只保留一个当前绑定。")
     binding = current_bindings[0]
-    capability_code = str(
-        plan.content_requirements.get("capability_code", CapabilityState.MANUAL_PUBLISH)
-    ).strip()
     capability = (
         CapabilityState.objects.filter(
             account_environment_binding=binding,
-            capability_code=capability_code,
+            capability_code=CapabilityState.MANUAL_PUBLISH,
         )
         .order_by("-state_version")
         .first()
     )
-    if capability is None or not capability.is_current_open_at(now):
-        raise ValidationError("The plan's current exact Capability is not OPEN.")
+    if capability is None:
+        raise ValidationError("这个账号当前没有人工发布能力配置，请先完成运行配置。")
+    if not capability.is_current_open_at(at):
+        raise ValidationError("这个账号当前不能人工发布，请先检查账号能力状态。")
+    return binding, capability
+
+
+def _current_capability_for_plan(plan: ChannelPlan) -> CapabilityState:
+    if not plan.channel_account_id:
+        raise ValidationError("Choose the exact ChannelAccount before compiling this plan.")
+    # Older plans may contain user-entered environment_code/capability_code
+    # values.  They remain untouched for audit, but are never trusted during
+    # compilation; the exact current binding is resolved fail-closed instead.
+    _, capability = _resolve_current_plan_runtime(plan.channel_account)
     return capability
 
 
@@ -1259,3 +1513,187 @@ def compile_channel_plan_task(
         permission_grant=task.created_under_grant,
     )
     return CompiledTaskResult(task, context, created)
+
+
+def _flow_command(command_id: uuid.UUID, step: str) -> uuid.UUID:
+    """Derive a stable command for each immutable step of one UI action."""
+
+    return uuid.uuid5(command_id, step)
+
+
+@transaction.atomic
+def accept_analysis_and_start_execution_project(
+    *,
+    proposal: SignalAssessment,
+    product: Product,
+    command_id: uuid.UUID,
+    principal: Principal,
+    acting_role: str,
+) -> StartedExecutionProjectResult:
+    """Compress Owner planning clicks without compressing audit facts.
+
+    The shortcut deliberately stops at an ACTIVE Initiative.  Operator
+    submission, Admin review, release gating and publication confirmation are
+    not part of this transaction and remain independently authorized actions.
+    """
+
+    # Serialize two browser tabs accepting the same immutable proposal.  The
+    # nested services still perform their own exact authorization checks.
+    locked_proposal = SignalAssessment.objects.select_for_update().get(pk=proposal.pk)
+    opportunity = accept_daily_analysis(
+        proposal=locked_proposal,
+        product=product,
+        principal=principal,
+        acting_role=acting_role,
+    )
+
+    if opportunity.current_state == ProductOpportunity.State.PROPOSED:
+        opportunity = transition_opportunity(
+            opportunity_id=opportunity.pk,
+            to_state=ProductOpportunity.State.TRIAGED,
+            expected_version=opportunity.state_version,
+            command_id=_flow_command(command_id, "owner-opportunity-triaged"),
+            reason="Owner accepted the exact evidence-backed suggestion for planning.",
+            principal=principal,
+            acting_role=acting_role,
+        ).aggregate
+    if opportunity.current_state == ProductOpportunity.State.TRIAGED:
+        opportunity = transition_opportunity(
+            opportunity_id=opportunity.pk,
+            to_state=ProductOpportunity.State.APPROVED,
+            expected_version=opportunity.state_version,
+            command_id=_flow_command(command_id, "owner-opportunity-approved"),
+            reason="Owner confirmed this direction should enter execution.",
+            principal=principal,
+            acting_role=acting_role,
+        ).aggregate
+    if opportunity.current_state != ProductOpportunity.State.APPROVED:
+        raise ValidationError("This suggestion is no longer eligible to start an execution project.")
+
+    initiative_command = _flow_command(command_id, "owner-initiative-created")
+    anchored_initiative = Initiative.objects.filter(creation_command_id=initiative_command).first()
+    initiative = Initiative.objects.select_for_update().filter(opportunity=opportunity).first()
+    if anchored_initiative is not None and (
+        initiative is None or anchored_initiative.pk != initiative.pk
+    ):
+        raise CommandReplayConflict(
+            "The command ID was already used to start another execution project."
+        )
+    if initiative is None:
+        initiative = create_initiative_from_opportunity(
+            opportunity=opportunity,
+            command_id=initiative_command,
+            principal=principal,
+            acting_role=acting_role,
+        )
+    elif (
+        initiative.current_state == Initiative.State.ACTIVE
+        and initiative.creation_command_id != initiative_command
+        and not InitiativeStateEvent.objects.filter(
+            initiative=initiative,
+            command_id__in=(
+                _flow_command(command_id, "owner-initiative-approved"),
+                _flow_command(command_id, "owner-initiative-active"),
+            ),
+        ).exists()
+    ):
+        # There is nothing left for this new command to do, so do not pretend
+        # that it created or approved an already-active historical project.
+        raise ValidationError("This execution project is already active.")
+
+    if initiative.current_state == Initiative.State.PROPOSED:
+        initiative = transition_initiative(
+            initiative_id=initiative.pk,
+            to_state=Initiative.State.APPROVED,
+            expected_version=initiative.state_version,
+            command_id=_flow_command(command_id, "owner-initiative-approved"),
+            reason="Owner approved the project created from the exact opportunity.",
+            principal=principal,
+            acting_role=acting_role,
+        ).aggregate
+    if initiative.current_state == Initiative.State.APPROVED:
+        initiative = transition_initiative(
+            initiative_id=initiative.pk,
+            to_state=Initiative.State.ACTIVE,
+            expected_version=initiative.state_version,
+            command_id=_flow_command(command_id, "owner-initiative-active"),
+            reason=(
+                "Owner started planning work; submission, review, release gate "
+                "and publication remain separate."
+            ),
+            principal=principal,
+            acting_role=acting_role,
+        ).aggregate
+    if initiative.current_state != Initiative.State.ACTIVE:
+        raise ValidationError("This execution project cannot be started from its current state.")
+    return StartedExecutionProjectResult(opportunity=opportunity, initiative=initiative)
+
+
+@transaction.atomic
+def confirm_channel_plan_and_compile_task(
+    *,
+    channel_plan: ChannelPlan,
+    task_id: uuid.UUID,
+    command_id: uuid.UUID,
+    principal: Principal,
+    acting_role: str,
+) -> ConfirmedPlanTaskResult:
+    """Confirm one plan and compile one task while retaining every event."""
+
+    plan = ChannelPlan.objects.select_for_update().select_related("initiative__product").get(
+        pk=channel_plan.pk
+    )
+    require_authorization(
+        principal=principal,
+        acting_role=acting_role,
+        action=PermissionGrant.Action.EDIT,
+        scope_kind=PermissionGrant.ScopeKind.PRODUCT,
+        product=plan.initiative.product,
+    )
+    compilation_command = _flow_command(command_id, "owner-channel-plan-compiled")
+    replay = TaskCompilationContext.objects.filter(
+        compilation_command_id=compilation_command
+    ).select_related("task", "channel_plan").first()
+    if replay is not None:
+        if replay.channel_plan_id != plan.pk or replay.task_id != task_id:
+            raise CommandReplayConflict(
+                "The command ID was already used with another plan or task ID."
+            )
+        return ConfirmedPlanTaskResult(
+            channel_plan=plan,
+            compilation=CompiledTaskResult(replay.task, replay, False),
+        )
+    if plan.compilation_contexts.exists():
+        raise ValidationError("This platform plan already has an execution task.")
+
+    if plan.current_state == ChannelPlan.State.DRAFT:
+        plan = transition_channel_plan(
+            channel_plan_id=plan.pk,
+            to_state=ChannelPlan.State.READY,
+            expected_version=plan.state_version,
+            command_id=_flow_command(command_id, "owner-channel-plan-ready"),
+            reason="Owner confirmed the exact account, date and delivery requirements.",
+            principal=principal,
+            acting_role=acting_role,
+        ).aggregate
+    if plan.current_state == ChannelPlan.State.READY:
+        plan = transition_channel_plan(
+            channel_plan_id=plan.pk,
+            to_state=ChannelPlan.State.ACTIVE,
+            expected_version=plan.state_version,
+            command_id=_flow_command(command_id, "owner-channel-plan-active"),
+            reason="Owner activated this platform plan for task compilation.",
+            principal=principal,
+            acting_role=acting_role,
+        ).aggregate
+    if plan.current_state != ChannelPlan.State.ACTIVE:
+        raise ValidationError("This platform plan cannot generate a task from its current state.")
+
+    compilation = compile_channel_plan_task(
+        channel_plan=plan,
+        task_id=task_id,
+        command_id=compilation_command,
+        principal=principal,
+        acting_role=acting_role,
+    )
+    return ConfirmedPlanTaskResult(channel_plan=plan, compilation=compilation)

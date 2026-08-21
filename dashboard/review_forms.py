@@ -3,10 +3,51 @@ from __future__ import annotations
 import uuid
 
 from django import forms
+from django.utils.translation import get_language
 
 from contentops.models import ReviewDecision
 from integrations.publishing import PublicationMode
 from releasegate.models import ChannelAccount, Publication, RuntimeEnvironment
+
+
+def _is_english() -> bool:
+    return str(get_language() or "zh-hans").lower().startswith("en")
+
+
+REVIEW_FORM_TEXT = {
+    "decision": ("审核结论", "Review decision"),
+    "rationale": ("审核说明", "Review notes"),
+    "channel_account": ("发布账号", "Publishing account"),
+    "runtime_environment": ("运行环境", "Runtime environment"),
+    "mode": ("执行方式", "Publishing method"),
+    "external_url": ("已发布内容网址", "Published content URL"),
+    "external_publication_id": ("平台内容 ID", "Platform content ID"),
+    "confirmed": (
+        "我已核对账号、内容和门禁，并确认执行所选发布方式",
+        "I checked the account, content, and release gate, and confirm the selected publishing method",
+    ),
+}
+
+REVIEW_FORM_HELP = {
+    "rationale": (
+        "请用自然语言说明为什么通过，或具体需要修改什么。",
+        "Explain in plain language why this passes or exactly what needs to change.",
+    ),
+    "external_url": (
+        "选择人工发布时，网址或平台内容 ID 至少填写一项。",
+        "For manual publishing, provide either a URL or a platform content ID.",
+    ),
+}
+
+
+def _localize_form(form: forms.Form) -> None:
+    if not _is_english():
+        return
+    for name, field in form.fields.items():
+        if name in REVIEW_FORM_TEXT:
+            field.label = REVIEW_FORM_TEXT[name][1]
+        if name in REVIEW_FORM_HELP:
+            field.help_text = REVIEW_FORM_HELP[name][1]
 
 
 class CommandVersionForm(forms.Form):
@@ -18,6 +59,7 @@ class CommandVersionForm(forms.Form):
         initial.setdefault("command_id", uuid.uuid4())
         initial.setdefault("expected_state_version", state_version)
         super().__init__(*args, **kwargs)
+        _localize_form(self)
 
 
 class ReviewDecisionForm(CommandVersionForm):
@@ -34,6 +76,14 @@ class ReviewDecisionForm(CommandVersionForm):
         widget=forms.Textarea(attrs={"rows": 5}),
         help_text="请用自然语言说明为什么通过，或具体需要修改什么。",
     )
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if _is_english():
+            self.fields["decision"].choices = (
+                (ReviewDecision.Decision.APPROVED, "Approve and continue to release checks"),
+                (ReviewDecision.Decision.CHANGES_REQUESTED, "Request changes and return for revision"),
+            )
 
 
 class ReleaseGateForm(CommandVersionForm):
@@ -52,6 +102,9 @@ class ReleaseGateForm(CommandVersionForm):
         super().__init__(*args, state_version=state_version, **kwargs)
         self.fields["channel_account"].queryset = accounts
         self.fields["runtime_environment"].queryset = environments
+        if _is_english():
+            self.fields["channel_account"].empty_label = "Select an account"
+            self.fields["runtime_environment"].empty_label = "Select an environment"
 
 
 class PublicationProofForm(forms.Form):
@@ -92,6 +145,13 @@ class PublicationProofForm(forms.Form):
             initial.setdefault("publication", initial_publication)
         super().__init__(*args, **kwargs)
         self.fields["publication"].queryset = publications
+        if _is_english():
+            self.fields["mode"].choices = (
+                (PublicationMode.MANUAL, "Manual publishing (recommended; record the URL or content ID afterward)"),
+                (PublicationMode.API, "Platform API (off by default)"),
+                (PublicationMode.BROWSER, "Controlled browser (off by default)"),
+            )
+        _localize_form(self)
 
     def clean(self):
         cleaned = super().clean()
@@ -99,11 +159,19 @@ class PublicationProofForm(forms.Form):
         if mode == PublicationMode.MANUAL and not (
             cleaned.get("external_url") or cleaned.get("external_publication_id")
         ):
-            raise forms.ValidationError("已发布内容网址或平台内容 ID 至少填写一项。")
+            raise forms.ValidationError(
+                "Provide either the published URL or the platform content ID."
+                if _is_english()
+                else "已发布内容网址或平台内容 ID 至少填写一项。"
+            )
         if mode in {PublicationMode.API, PublicationMode.BROWSER} and (
             cleaned.get("external_url") or cleaned.get("external_publication_id")
         ):
-            raise forms.ValidationError("API/浏览器方式的发布结果只能由受控运行层返回，不能手工填写。")
+            raise forms.ValidationError(
+                "API or browser results must come from the controlled runtime and cannot be entered manually."
+                if _is_english()
+                else "API/浏览器方式的发布结果只能由受控运行层返回，不能手工填写。"
+            )
         return cleaned
 
 

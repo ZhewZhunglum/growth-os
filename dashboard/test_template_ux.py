@@ -62,11 +62,11 @@ class DashboardTemplateUXTests(SimpleTestCase):
             },
         )
 
-        self.assertIn("待我审核", html)
-        self.assertIn("待我发布", html)
-        self.assertIn("待我确认完成", html)
-        self.assertIn("这些不是我的执行任务", html)
-        self.assertIn("今天没有分配给你的任务", html)
+        self.assertIn("今天的待办已经清空", html)
+        self.assertIn("现在没有执行任务", html)
+        self.assertNotIn("先弄清楚为什么做", html)
+        self.assertNotIn("开工检查（DoR）", html)
+        self.assertNotIn("交付检查（DoD）", html)
 
     def test_review_queue_has_safe_empty_read_only_history_region(self):
         html = render_to_string(

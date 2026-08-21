@@ -96,6 +96,25 @@ class SevenPlatformConnectorRunner:
     def connectors(self) -> Mapping[Platform, FallbackConnector]:
         return self._connectors
 
+    def run_one(self, request: ConnectorRequest) -> ConnectorResult:
+        """Run one reviewed connector route for progressive UI collection."""
+
+        platform = request.platform
+        if platform not in self._connectors:
+            raise IntegrationConfigurationError("The requested platform is not in the V1 connector set")
+        try:
+            return self._connectors[platform].collect(request)
+        except (IntegrationError, OSError, TimeoutError, RuntimeError) as exc:
+            return ConnectorResult(
+                platform=platform,
+                status=ConnectorRunStatus.FAILED,
+                operation_key=request.operation_key,
+                mode=None,
+                provider=None,
+                reason=f"Connector execution failed safely: {type(exc).__name__}",
+                retryable=True,
+            )
+
     def run(self, requests: Mapping[Platform, ConnectorRequest]) -> ConnectorBatchResult:
         if set(requests) != set(Platform):
             raise IntegrationConfigurationError(
@@ -108,18 +127,7 @@ class SevenPlatformConnectorRunner:
                 raise IntegrationConfigurationError(
                     f"Connector request key {platform.value} does not match its request platform"
                 )
-            try:
-                results[platform] = self._connectors[platform].collect(request)
-            except (IntegrationError, OSError, TimeoutError, RuntimeError) as exc:
-                results[platform] = ConnectorResult(
-                    platform=platform,
-                    status=ConnectorRunStatus.FAILED,
-                    operation_key=request.operation_key,
-                    mode=None,
-                    provider=None,
-                    reason=f"Connector execution failed safely: {type(exc).__name__}",
-                    retryable=True,
-                )
+            results[platform] = self.run_one(request)
         return ConnectorBatchResult(results)
 
 

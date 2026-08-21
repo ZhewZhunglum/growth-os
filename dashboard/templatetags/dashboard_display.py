@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from django import template
+from django.utils.translation import get_language
 
 
 register = template.Library()
@@ -170,11 +171,18 @@ def render_delivery_check(bound_field):
     field = bound_field.field
     original_choices = field.choices
     try:
-        field.choices = (
-            ("", "请选择交付状态"),
-            ("PASS", "确认完整交付并送审"),
-            ("BLOCKED", "尚未准备好，本次不送审"),
-        )
+        if str(get_language() or "zh-hans").lower().startswith("en"):
+            field.choices = (
+                ("", "Select delivery status"),
+                ("PASS", "Confirm complete delivery and send for review"),
+                ("BLOCKED", "Not ready; do not send for review"),
+            )
+        else:
+            field.choices = (
+                ("", "请选择交付状态"),
+                ("PASS", "确认完整交付并送审"),
+                ("BLOCKED", "尚未准备好，本次不送审"),
+            )
         return bound_field.as_widget()
     finally:
         field.choices = original_choices

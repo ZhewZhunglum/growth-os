@@ -303,6 +303,9 @@ class FeedbackUiTests(TestCase):
         response = self.client.get(reverse("feedback:home"))
         self.assertEqual(response.status_code, 200)
         self.assertContains(response, "真实的 0")
+        self.assertContains(response, "AI 搜索曝光与结果")
+        self.assertContains(response, "手动记录一次 AI 搜索结果")
+        self.assertContains(response, "高级录入（通常不用打开）")
         response = self.client.post(
             reverse("feedback:performance-manual"),
             {
@@ -318,6 +321,73 @@ class FeedbackUiTests(TestCase):
         )
         self.assertEqual(response.status_code, 302)
         self.assertTrue(ChannelPerformanceObservation.objects.filter(metric_definition__metric_key="shares").exists())
+
+    def test_feedback_page_switches_all_visible_ui_and_form_copy_to_english(self):
+        self.client.force_login(self.operator)
+        self.client.post(
+            reverse("set_language"),
+            {"language": "en", "next": reverse("feedback:home")},
+        )
+
+        response = self.client.get(reverse("feedback:home"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "AI Search Visibility & Results")
+        self.assertContains(response, "Will AI answers mention PUKO?")
+        self.assertContains(response, "Record one AI search result")
+        self.assertContains(response, "Where did you ask?")
+        self.assertContains(response, "Did you receive an answer?")
+        self.assertContains(response, "Advanced entry (usually leave closed)")
+        self.assertContains(response, "Other result tools: platform performance and proposals")
+        self.assertNotContains(response, "手动记录一次 AI 搜索结果")
+        self.assertNotContains(response, "这次拿到回答了吗")
+
+    def test_geo_form_validation_and_success_message_follow_selected_language(self):
+        self.client.force_login(self.operator)
+        self.client.post(
+            reverse("set_language"),
+            {"language": "en", "next": reverse("feedback:home")},
+        )
+        operation_key = str(uuid.uuid4())
+
+        invalid = self.client.post(
+            reverse("feedback:geo-result"),
+            {
+                "operation_key": operation_key,
+                "panel_item": self.panel_item.pk,
+                "provider": "DeepSeek",
+                "model_reference": "",
+                "availability_state": AvailabilityState.PRESENT,
+                "response_text": "",
+                "citation_urls": "",
+            },
+        )
+
+        self.assertEqual(invalid.status_code, 400)
+        self.assertContains(
+            invalid,
+            "Paste the AI answer when a result is available.",
+            status_code=400,
+        )
+
+        saved = self.client.post(
+            reverse("feedback:geo-result"),
+            {
+                "operation_key": operation_key,
+                "panel_item": self.panel_item.pk,
+                "provider": "DeepSeek",
+                "model_reference": "",
+                "availability_state": AvailabilityState.PRESENT,
+                "response_text": "PUKO is one option.",
+                "brand_mentioned": "on",
+                "citation_urls": "https://example.com/result",
+            },
+            follow=True,
+        )
+
+        self.assertEqual(saved.status_code, 200)
+        self.assertContains(saved, "The AI search result was saved.")
+        self.assertContains(saved, "PUKO mentioned")
 
     def test_owner_can_append_replay_safe_geo_panel_versions_and_items(self):
         PermissionGrant.objects.create(
@@ -394,7 +464,7 @@ class FeedbackUiTests(TestCase):
 
         self.client.force_login(self.operator)
         page = self.client.get(reverse("feedback:home"))
-        self.assertNotContains(page, "新建一个问题组版本")
+        self.assertNotContains(page, "设置一组要问 AI 的问题")
         forged = self.client.post(
             reverse("feedback:geo-panel-version"),
             {
@@ -422,7 +492,7 @@ class FeedbackUiTests(TestCase):
         self.assertFalse(self.owner.is_superuser)
         self.client.force_login(self.owner)
         page = self.client.get(reverse("feedback:home"))
-        self.assertContains(page, "新建一个问题组版本")
+        self.assertContains(page, "设置一组要问 AI 的问题")
         created = self.client.post(
             reverse("feedback:geo-panel-version"),
             {

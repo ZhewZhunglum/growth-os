@@ -6,6 +6,7 @@ from datetime import timedelta
 from unittest.mock import patch
 
 from django.core.exceptions import ValidationError
+from django.conf import settings
 from django.http import HttpResponse
 from django.test import TestCase, override_settings
 from django.urls import include, path, reverse
@@ -709,6 +710,8 @@ class ReviewReleaseUISliceTests(TestCase):
         self.assertEqual(reviewer_today.context["pending_review_count"], 1)
         self.assertEqual(reviewer_today.context["pending_publish_count"], 0)
         self.assertEqual(reviewer_today.context["pending_complete_count"], 0)
+        self.assertContains(reviewer_today, "等我审核")
+        self.assertContains(reviewer_today, 'class="notification-badge">1</span>')
 
         self._approve()
         self.client.force_login(self.publisher)
@@ -716,6 +719,8 @@ class ReviewReleaseUISliceTests(TestCase):
         self.assertEqual(publisher_today.context["pending_review_count"], 0)
         self.assertEqual(publisher_today.context["pending_publish_count"], 1)
         self.assertEqual(publisher_today.context["pending_complete_count"], 0)
+        self.assertNotContains(publisher_today, "等我审核")
+        self.assertContains(publisher_today, "等我发布")
 
         _gate_response, _gate_command, publication = self._gate_via_ui()
         proof = self.client.post(
@@ -744,6 +749,8 @@ class ReviewReleaseUISliceTests(TestCase):
         self.assertEqual(outsider_after.context["pending_review_count"], 0)
         self.assertEqual(outsider_after.context["pending_publish_count"], 0)
         self.assertEqual(outsider_after.context["pending_complete_count"], 0)
+        self.assertNotContains(outsider_after, "等我审核")
+        self.assertNotContains(outsider_after, "等我发布")
 
     def test_review_requires_independent_edit_grant_and_changes_path_is_explicit(self):
         review_only = Principal.objects.create_user(
@@ -949,3 +956,40 @@ class ReviewReleaseUISliceTests(TestCase):
         self.client.force_login(self.outsider)
         self.assertNotContains(self.client.get(reverse("dashboard:release-queue")), self.task.title)
         self.assertEqual(self.client.get(reverse("dashboard:release-detail", args=[self.task.pk])).status_code, 403)
+
+    def test_review_and_release_core_controls_switch_fully_to_english(self):
+        self.client.cookies[settings.LANGUAGE_COOKIE_NAME] = "en"
+        self.client.force_login(self.reviewer)
+
+        review_queue_response = self.client.get(reverse("dashboard:review-queue"))
+        self.assertContains(review_queue_response, "Review queue")
+        self.assertContains(review_queue_response, "Open review")
+        self.assertContains(review_queue_response, "My completed reviews")
+        self.assertNotContains(review_queue_response, "打开审核")
+        self.assertNotContains(review_queue_response, "我已完成的审核")
+
+        review_detail_response = self.client.get(
+            reverse("dashboard:review-detail", args=[self.task.pk])
+        )
+        self.assertContains(review_detail_response, "Human review")
+        self.assertContains(review_detail_response, "Review decision")
+        self.assertContains(review_detail_response, "Save review decision")
+        self.assertContains(review_detail_response, "Approve and continue to release checks")
+        self.assertNotContains(review_detail_response, "保存审核结论")
+        self.assertNotContains(review_detail_response, "审核说明")
+
+        self._approve()
+        self.client.force_login(self.publisher)
+        release_queue_response = self.client.get(reverse("dashboard:release-queue"))
+        self.assertContains(release_queue_response, "Publishing queue")
+        self.assertContains(release_queue_response, "Open publishing flow")
+        self.assertNotContains(release_queue_response, "打开发布流程")
+
+        release_detail_response = self.client.get(
+            reverse("dashboard:release-detail", args=[self.task.pk])
+        )
+        self.assertContains(release_detail_response, "Release checks and controlled publishing")
+        self.assertContains(release_detail_response, "Publishing account")
+        self.assertContains(release_detail_response, "Run release checks")
+        self.assertNotContains(release_detail_response, "运行发布检查")
+        self.assertNotContains(release_detail_response, "发布账号")
