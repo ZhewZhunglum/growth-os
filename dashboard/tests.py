@@ -1,14 +1,12 @@
 import hashlib
-import tempfile
 import uuid
 from datetime import timedelta
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from django.conf import settings
 from django.core.exceptions import ValidationError
-from django.core.files.uploadedfile import SimpleUploadedFile
 from django.db import IntegrityError
-from django.test import TestCase, override_settings
+from django.test import TestCase
 from django.urls import reverse
 from django.utils import timezone
 
@@ -157,7 +155,8 @@ class DashboardTests(TestCase):
         self.client.force_login(self.user)
         response = self.client.get(reverse("dashboard:home"))
         self.assertContains(response, "PUKO Growth OS")
-        self.assertContains(response, "今天没有分配给你的任务")
+        self.assertContains(response, "现在没有执行任务")
+        self.assertContains(response, "今天的待办已经清空")
         self.assertEqual(response.context["task_count"], 0)
 
     def test_user_only_sees_tasks_assigned_to_or_created_by_them(self):
@@ -173,20 +172,55 @@ class DashboardTests(TestCase):
         self.assertNotIn(hidden.id, visible_ids)
         self.assertNotContains(response, "Another user's task")
 
-    def test_task_card_explains_status_checks_dod_and_release_gate(self):
+    def test_task_row_leads_with_plain_next_action_and_hides_technical_detail(self):
         self.make_task(owner=self.user, assignee=self.user)
         self.client.force_login(self.user)
 
         response = self.client.get(reverse("dashboard:home"))
 
         self.assertContains(response, "Write a clear Quora answer")
-        self.assertContains(response, "执行中")
-        self.assertContains(response, "为什么做")
-        self.assertContains(response, "尚未检查", count=1)
-        self.assertContains(response, "Use plain, natural language")
-        self.assertContains(response, "Human review must pass")
-        self.assertContains(response, "实际发布仍需人工审核和最终门禁校验")
-        self.assertNotContains(response, "Open admin setup")
+        self.assertContains(response, "进行中")
+        self.assertContains(response, "继续并提交")
+        self.assertNotContains(response, "开工检查（DoR）")
+        self.assertNotContains(response, "交付检查（DoD）")
+        self.assertNotContains(response, "合同版本")
+
+    def test_creator_does_not_see_work_that_is_currently_assigned_to_someone_else(self):
+        delegated = self.make_task(
+            owner=self.user,
+            title="Delegated work",
+            assignee=self.other_user,
+        )
+
+        self.client.force_login(self.user)
+        response = self.client.get(reverse("dashboard:home"))
+
+        self.assertNotIn(delegated.pk, {task.pk for task in response.context["tasks"]})
+        self.assertNotContains(response, "Delegated work")
+
+    def test_assigned_task_disappears_immediately_after_edit_grant_is_revoked(self):
+        assigned = self.make_task(
+            owner=self.other_user,
+            title="Permission filtered work",
+            assignee=self.user,
+        )
+        PermissionGrant.objects.filter(
+            principal=self.user,
+            product=assigned.product,
+            action=PermissionGrant.Action.EDIT,
+        ).update(
+            grant_status=PermissionGrant.GrantStatus.REVOKED,
+            revoked_at=timezone.now(),
+            revoked_by_principal=self.other_user,
+            revocation_reason="Access removed before inbox refresh.",
+        )
+
+        self.client.force_login(self.user)
+        response = self.client.get(reverse("dashboard:home"))
+
+        self.assertEqual(response.context["task_count"], 0)
+        self.assertNotContains(response, "Permission filtered work")
+        self.assertEqual(response.context["action_center"].total_count, 0)
 
 
 class ControlledTaskUiTests(TestCase):
@@ -318,6 +352,7 @@ class ControlledTaskUiTests(TestCase):
         self.assertContains(response, "逐项确认：现在是否具备开工条件？")
         self.assertContains(response, "Reliable sources are ready")
         self.assertContains(response, "本页不会审核、通过门禁或发布内容")
+        self.assertNotContains(response, "Daily Operations 编译上下文（只读）")
         self.assertNotContains(response, "/actions/review/")
         self.assertNotContains(response, "/actions/gate/")
         self.assertNotContains(response, "/actions/publish/")
@@ -325,6 +360,20 @@ class ControlledTaskUiTests(TestCase):
         self.client.force_login(self.outsider)
         hidden = self.client.get(reverse("dashboard:task-detail", args=[self.task.pk]))
         self.assertEqual(hidden.status_code, 404)
+
+    def test_task_detail_core_controls_switch_fully_to_english(self):
+        self.client.cookies[settings.LANGUAGE_COOKIE_NAME] = "en"
+        self.client.force_login(self.owner)
+        response = self.client.get(reverse("dashboard:task-detail", args=[self.task.pk]))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Task details")
+        self.assertContains(response, "Confirm each item: is this task ready to start?")
+        self.assertContains(response, "Save readiness check")
+        self.assertContains(response, "Select a result")
+        self.assertNotContains(response, "逐项确认")
+        self.assertNotContains(response, "保存开工检查结果")
+        self.assertNotContains(response, "请选择结果")
 
     def test_draft_cancel_hides_task_from_today_but_preserves_audited_record(self):
         self.client.force_login(self.owner)
@@ -424,25 +473,27 @@ class ControlledTaskUiTests(TestCase):
         self.task.refresh_from_db()
         self.assertEqual(self.task.current_state, Task.State.IN_PROGRESS)
 
-    def test_upload_seals_exact_asset_and_moves_only_to_under_review(self):
+    def test_delivery_link_seals_exact_asset_and_moves_only_to_under_review(self):
         self._assign_and_start()
-        payload = b"A clear, evidence-informed answer.\n"
-        with tempfile.TemporaryDirectory() as media_root, override_settings(MEDIA_ROOT=media_root):
-            response = self.client.post(
-                reverse("dashboard:task-action", args=[self.task.pk, "upload"]),
-                self._command_data(
-                    self.task,
-                    deliverable=SimpleUploadedFile("answer.txt", payload, content_type="text/plain"),
-                    submission_note="Ready for human review.",
-                    criterion__plain_language=TaskCheckRun.Result.PASS,
-                ),
-                follow=True,
-            )
-            self.assertEqual(response.status_code, 200)
-            version = ContentAssetVersion.objects.get(content_asset__task=self.task)
-            self.assertEqual(version.byte_size, len(payload))
-            self.assertEqual(version.content_sha256, hashlib.sha256(payload).hexdigest())
-            self.assertTrue((Path(media_root) / version.object_key).is_file())
+        external_url = "https://docs.example.com/deliveries/answer-v1"
+        response = self.client.post(
+            reverse("dashboard:task-action", args=[self.task.pk, "deliver"]),
+            self._command_data(
+                self.task,
+                external_url=external_url,
+                submission_note="Ready for human review.",
+                criterion__plain_language=TaskCheckRun.Result.PASS,
+            ),
+            follow=True,
+        )
+        self.assertEqual(response.status_code, 200)
+        version = ContentAssetVersion.objects.get(content_asset__task=self.task)
+        encoded_url = external_url.encode("utf-8")
+        self.assertEqual(version.object_key, external_url)
+        self.assertEqual(version.mime_type, "text/uri-list")
+        self.assertEqual(version.byte_size, len(encoded_url))
+        self.assertEqual(version.content_sha256, hashlib.sha256(encoded_url).hexdigest())
+        self.assertEqual(version.metadata, {"source": "external-url"})
 
         self.task.refresh_from_db()
         self.assertEqual(self.task.current_state, Task.State.UNDER_REVIEW)
@@ -461,31 +512,28 @@ class ControlledTaskUiTests(TestCase):
                 Task.State.UNDER_REVIEW,
             ],
         )
-        self.assertContains(response, "交付已送入人工审核")
+        self.assertContains(response, "交付链接已封存并送入人工审核")
         self.assertNotContains(response, "/actions/review/")
         self.assertNotContains(response, "/actions/gate/")
         self.assertNotContains(response, "/actions/publish/")
 
-    def test_upload_domain_failure_rolls_back_database_and_removes_file(self):
+    def test_delivery_domain_failure_rolls_back_all_database_facts(self):
         self._assign_and_start()
-        payload = b"This write must be rolled back."
-        with tempfile.TemporaryDirectory() as media_root, override_settings(MEDIA_ROOT=media_root):
-            with patch(
-                "dashboard.views.TaskSubmission.seal",
-                side_effect=ValidationError("Simulated domain failure."),
-            ):
-                response = self.client.post(
-                    reverse("dashboard:task-action", args=[self.task.pk, "upload"]),
-                    self._command_data(
-                        self.task,
-                        deliverable=SimpleUploadedFile("answer.txt", payload, content_type="text/plain"),
-                        submission_note="Must not survive.",
-                        criterion__plain_language=TaskCheckRun.Result.PASS,
-                    ),
-                    follow=True,
-                )
-            self.assertEqual(response.status_code, 200)
-            self.assertFalse(any(path.is_file() for path in Path(media_root).rglob("*")))
+        with patch(
+            "dashboard.views.TaskSubmission.seal",
+            side_effect=ValidationError("Simulated domain failure."),
+        ):
+            response = self.client.post(
+                reverse("dashboard:task-action", args=[self.task.pk, "deliver"]),
+                self._command_data(
+                    self.task,
+                    external_url="https://docs.example.com/deliveries/rollback",
+                    submission_note="Must not survive.",
+                    criterion__plain_language=TaskCheckRun.Result.PASS,
+                ),
+                follow=True,
+            )
+        self.assertEqual(response.status_code, 200)
 
         self.task.refresh_from_db()
         self.assertEqual(self.task.current_state, Task.State.IN_PROGRESS)
@@ -497,134 +545,135 @@ class ControlledTaskUiTests(TestCase):
         self.assertEqual(self.task.state_events.count(), 3)
         self.assertContains(response, "Simulated domain failure")
 
-    def test_exact_upload_command_replay_is_idempotent_and_conflicting_payload_is_rejected(self):
+    def test_delivery_form_requires_external_url_and_has_no_file_input(self):
+        self._assign_and_start()
+        detail = self.client.get(reverse("dashboard:task-detail", args=[self.task.pk]))
+        self.assertNotContains(detail, 'type="file"')
+        self.assertNotContains(detail, "multipart/form-data")
+        response = self.client.post(
+            reverse("dashboard:task-action", args=[self.task.pk, "deliver"]),
+            self._command_data(
+                self.task,
+                submission_note="Missing link must fail.",
+                criterion__plain_language=TaskCheckRun.Result.PASS,
+            ),
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(ContentAssetVersion.objects.filter(content_asset__task=self.task).exists())
+        self.assertContains(response, "本次交付链接", status_code=400)
+
+    def test_exact_delivery_command_replay_is_idempotent_and_conflicting_url_is_rejected(self):
         self._assign_and_start()
         root_command = uuid.uuid4()
         expected_version = self.task.state_version
-        payload = b"One immutable delivery.\n"
+        external_url = "https://docs.example.com/deliveries/exact-retry"
 
-        def upload_data(content):
+        def delivery_data(url):
             return {
                 "command_id": str(root_command),
                 "expected_state_version": expected_version,
-                "deliverable": SimpleUploadedFile("answer.txt", content, content_type="text/plain"),
+                "external_url": url,
                 "submission_note": "Exact retry contract.",
                 "criterion__plain_language": TaskCheckRun.Result.PASS,
             }
 
-        with tempfile.TemporaryDirectory() as media_root, override_settings(MEDIA_ROOT=media_root):
-            first = self.client.post(
-                reverse("dashboard:task-action", args=[self.task.pk, "upload"]),
-                upload_data(payload),
-                follow=True,
-            )
-            self.assertEqual(first.status_code, 200)
-            original_files = sorted(
-                path.relative_to(media_root) for path in Path(media_root).rglob("*") if path.is_file()
-            )
-            self.assertEqual(len(original_files), 1)
+        first = self.client.post(
+            reverse("dashboard:task-action", args=[self.task.pk, "deliver"]),
+            delivery_data(external_url),
+            follow=True,
+        )
+        self.assertEqual(first.status_code, 200)
 
-            replay = self.client.post(
-                reverse("dashboard:task-action", args=[self.task.pk, "upload"]),
-                upload_data(payload),
-                follow=True,
-            )
-            self.assertEqual(replay.status_code, 200)
-            replay_files = sorted(
-                path.relative_to(media_root) for path in Path(media_root).rglob("*") if path.is_file()
-            )
-            self.assertEqual(replay_files, original_files)
-            self.assertEqual(ContentAsset.objects.filter(task=self.task).count(), 1)
-            self.assertEqual(ContentAssetVersion.objects.filter(content_asset__task=self.task).count(), 1)
-            self.assertEqual(TaskSubmission.objects.filter(task=self.task).count(), 1)
-            self.assertEqual(self.task.check_runs.filter(check_kind=TaskCheckRun.Kind.DOD).count(), 1)
+        replay = self.client.post(
+            reverse("dashboard:task-action", args=[self.task.pk, "deliver"]),
+            delivery_data(external_url),
+            follow=True,
+        )
+        self.assertEqual(replay.status_code, 200)
+        self.assertEqual(ContentAsset.objects.filter(task=self.task).count(), 1)
+        self.assertEqual(ContentAssetVersion.objects.filter(content_asset__task=self.task).count(), 1)
+        self.assertEqual(TaskSubmission.objects.filter(task=self.task).count(), 1)
+        self.assertEqual(self.task.check_runs.filter(check_kind=TaskCheckRun.Kind.DOD).count(), 1)
 
-            conflict = self.client.post(
-                reverse("dashboard:task-action", args=[self.task.pk, "upload"]),
-                upload_data(b"Different bytes under the same command."),
-                follow=True,
-            )
-            self.assertEqual(conflict.status_code, 200)
-            self.assertContains(conflict, "command_id 已用于另一份上传内容或表单")
-            conflict_files = sorted(
-                path.relative_to(media_root) for path in Path(media_root).rglob("*") if path.is_file()
-            )
-            self.assertEqual(conflict_files, original_files)
-            self.assertEqual(ContentAssetVersion.objects.filter(content_asset__task=self.task).count(), 1)
-            self.assertEqual(TaskSubmission.objects.filter(task=self.task).count(), 1)
+        conflict = self.client.post(
+            reverse("dashboard:task-action", args=[self.task.pk, "deliver"]),
+            delivery_data("https://docs.example.com/deliveries/conflict"),
+            follow=True,
+        )
+        self.assertEqual(conflict.status_code, 200)
+        self.assertContains(conflict, "command_id 已用于另一份交付链接或表单")
+        self.assertEqual(ContentAssetVersion.objects.filter(content_asset__task=self.task).count(), 1)
+        self.assertEqual(TaskSubmission.objects.filter(task=self.task).count(), 1)
 
     def test_human_rework_resumes_and_creates_new_version_dod_and_submission(self):
         self._assign_and_start()
-        first_payload = b"First delivery requiring changes.\n"
-        second_payload = b"Revised delivery with requested changes.\n"
-        with tempfile.TemporaryDirectory() as media_root, override_settings(MEDIA_ROOT=media_root):
-            first_response = self.client.post(
-                reverse("dashboard:task-action", args=[self.task.pk, "upload"]),
-                self._command_data(
-                    self.task,
-                    deliverable=SimpleUploadedFile("answer-v1.txt", first_payload, content_type="text/plain"),
-                    submission_note="First submission.",
-                    criterion__plain_language=TaskCheckRun.Result.PASS,
-                ),
-            )
-            self.assertEqual(first_response.status_code, 302)
-            self.task.refresh_from_db()
-            first_submission = TaskSubmission.objects.get(task=self.task)
-            first_version = first_submission.primary_asset_version
-            first_dod_id = first_submission.dod_check_run_id
-            original_manifest_hash = first_submission.manifest_sha256
+        first_url = "https://docs.example.com/deliveries/rework-v1"
+        second_url = "https://docs.example.com/deliveries/rework-v2"
+        first_response = self.client.post(
+            reverse("dashboard:task-action", args=[self.task.pk, "deliver"]),
+            self._command_data(
+                self.task,
+                external_url=first_url,
+                submission_note="First submission.",
+                criterion__plain_language=TaskCheckRun.Result.PASS,
+            ),
+        )
+        self.assertEqual(first_response.status_code, 302)
+        self.task.refresh_from_db()
+        first_submission = TaskSubmission.objects.get(task=self.task)
+        first_version = first_submission.primary_asset_version
+        first_dod_id = first_submission.dod_check_run_id
+        original_manifest_hash = first_submission.manifest_sha256
 
-            review_grant = self._grant(self.owner, PermissionGrant.Action.REVIEW)
-            review = ReviewDecision.record_final(
-                submission=first_submission,
-                decision=ReviewDecision.Decision.CHANGES_REQUESTED,
-                rationale="Please revise the wording.",
-                command_id=uuid.uuid4(),
-                expected_task_version=self.task.state_version,
-                reviewer_principal=self.owner,
-                acting_role=self.owner.role,
-                permission_grant=review_grant,
-                recorded_by_principal=self.owner,
-            )
-            Task.transition(
-                task_id=self.task.pk,
-                to_state=Task.State.HUMAN_REWORK,
-                command_id=uuid.uuid4(),
-                expected_state_version=self.task.state_version,
-                actor_principal=self.owner,
-                acting_role=self.owner.role,
-                permission_grant=self.owner_grant,
-                recorded_by_principal=self.owner,
-                reason="Human review requested changes.",
-            )
-            self.task.refresh_from_db()
-            self.assertEqual(self.task.current_state, Task.State.HUMAN_REWORK)
+        review_grant = self._grant(self.owner, PermissionGrant.Action.REVIEW)
+        review = ReviewDecision.record_final(
+            submission=first_submission,
+            decision=ReviewDecision.Decision.CHANGES_REQUESTED,
+            rationale="Please revise the wording.",
+            command_id=uuid.uuid4(),
+            expected_task_version=self.task.state_version,
+            reviewer_principal=self.owner,
+            acting_role=self.owner.role,
+            permission_grant=review_grant,
+            recorded_by_principal=self.owner,
+        )
+        Task.transition(
+            task_id=self.task.pk,
+            to_state=Task.State.HUMAN_REWORK,
+            command_id=uuid.uuid4(),
+            expected_state_version=self.task.state_version,
+            actor_principal=self.owner,
+            acting_role=self.owner.role,
+            permission_grant=self.owner_grant,
+            recorded_by_principal=self.owner,
+            reason="Human review requested changes.",
+        )
+        self.task.refresh_from_db()
+        self.assertEqual(self.task.current_state, Task.State.HUMAN_REWORK)
 
-            self.client.force_login(self.operator)
-            detail = self.client.get(reverse("dashboard:task-detail", args=[self.task.pk]))
-            self.assertContains(detail, "审核要求修改，恢复制作新版本")
-            self.assertContains(detail, "恢复制作")
-            resumed = self.client.post(
-                reverse("dashboard:task-action", args=[self.task.pk, "resume-work"]),
-                self._command_data(self.task),
-            )
-            self.assertEqual(resumed.status_code, 302)
-            self.task.refresh_from_db()
-            self.assertEqual(self.task.current_state, Task.State.IN_PROGRESS)
+        self.client.force_login(self.operator)
+        detail = self.client.get(reverse("dashboard:task-detail", args=[self.task.pk]))
+        self.assertContains(detail, "审核要求修改，恢复制作新版本")
+        self.assertContains(detail, "恢复制作")
+        resumed = self.client.post(
+            reverse("dashboard:task-action", args=[self.task.pk, "resume-work"]),
+            self._command_data(self.task),
+        )
+        self.assertEqual(resumed.status_code, 302)
+        self.task.refresh_from_db()
+        self.assertEqual(self.task.current_state, Task.State.IN_PROGRESS)
 
-            second_response = self.client.post(
-                reverse("dashboard:task-action", args=[self.task.pk, "upload"]),
-                self._command_data(
-                    self.task,
-                    deliverable=SimpleUploadedFile("answer-v2.txt", second_payload, content_type="text/plain"),
-                    submission_note="Revised after human feedback.",
-                    criterion__plain_language=TaskCheckRun.Result.PASS,
-                ),
-                follow=True,
-            )
-            self.assertEqual(second_response.status_code, 200)
-            files = [path for path in Path(media_root).rglob("*") if path.is_file()]
-            self.assertEqual(len(files), 2)
+        second_response = self.client.post(
+            reverse("dashboard:task-action", args=[self.task.pk, "deliver"]),
+            self._command_data(
+                self.task,
+                external_url=second_url,
+                submission_note="Revised after human feedback.",
+                criterion__plain_language=TaskCheckRun.Result.PASS,
+            ),
+            follow=True,
+        )
+        self.assertEqual(second_response.status_code, 200)
 
         self.task.refresh_from_db()
         self.assertEqual(self.task.current_state, Task.State.UNDER_REVIEW)
@@ -637,7 +686,11 @@ class ControlledTaskUiTests(TestCase):
         self.assertNotEqual(second_submission.dod_check_run_id, first_dod_id)
         self.assertEqual(second_submission.primary_asset_version.content_asset_id, first_version.content_asset_id)
         self.assertEqual(second_submission.primary_asset_version.version_number, 2)
-        self.assertEqual(second_submission.primary_asset_version.content_sha256, hashlib.sha256(second_payload).hexdigest())
+        self.assertEqual(second_submission.primary_asset_version.object_key, second_url)
+        self.assertEqual(
+            second_submission.primary_asset_version.content_sha256,
+            hashlib.sha256(second_url.encode("utf-8")).hexdigest(),
+        )
         first_submission.refresh_from_db()
         self.assertEqual(first_submission.primary_asset_version_id, first_version.pk)
         self.assertEqual(first_submission.dod_check_run_id, first_dod_id)
@@ -648,64 +701,55 @@ class ControlledTaskUiTests(TestCase):
 
     def test_operator_can_withdraw_unreviewed_submission_and_resubmit_as_v2(self):
         self._assign_and_start()
-        first_payload = b"First delivery withdrawn before review.\n"
-        second_payload = b"Corrected delivery after withdrawal.\n"
+        first_url = "https://docs.example.com/deliveries/withdraw-v1"
+        second_url = "https://docs.example.com/deliveries/withdraw-v2"
 
-        with tempfile.TemporaryDirectory() as media_root, override_settings(MEDIA_ROOT=media_root):
-            first_response = self.client.post(
-                reverse("dashboard:task-action", args=[self.task.pk, "upload"]),
-                self._command_data(
-                    self.task,
-                    deliverable=SimpleUploadedFile(
-                        "answer-v1.txt", first_payload, content_type="text/plain"
-                    ),
-                    submission_note="Submitted with the wrong final wording.",
-                    criterion__plain_language=TaskCheckRun.Result.PASS,
-                ),
-            )
-            self.assertEqual(first_response.status_code, 302)
-            self.task.refresh_from_db()
-            self.assertEqual(self.task.current_state, Task.State.UNDER_REVIEW)
-            first_submission = self.task.submissions.get()
+        first_response = self.client.post(
+            reverse("dashboard:task-action", args=[self.task.pk, "deliver"]),
+            self._command_data(
+                self.task,
+                external_url=first_url,
+                submission_note="Submitted with the wrong final wording.",
+                criterion__plain_language=TaskCheckRun.Result.PASS,
+            ),
+        )
+        self.assertEqual(first_response.status_code, 302)
+        self.task.refresh_from_db()
+        self.assertEqual(self.task.current_state, Task.State.UNDER_REVIEW)
+        first_submission = self.task.submissions.get()
 
-            withdraw_response = self.client.post(
-                reverse("dashboard:task-action", args=[self.task.pk, "withdraw"]),
-                self._command_data(
-                    self.task,
-                    reason="I noticed the final sentence was incorrect.",
-                    confirm="on",
-                ),
-            )
-            self.assertRedirects(
-                withdraw_response,
-                reverse("dashboard:task-detail", args=[self.task.pk]),
-            )
-            self.task.refresh_from_db()
-            self.assertEqual(self.task.current_state, Task.State.IN_PROGRESS)
-            withdrawal = self.task.state_events.get(
-                event_type=TaskStateEvent.EventType.SUBMISSION_WITHDRAWN
-            )
-            self.assertEqual(withdrawal.submission_id, first_submission.pk)
-            self.assertEqual(withdrawal.permission_grant_id, self.operator_grant.pk)
-            self.assertFalse(ReviewDecision.objects.filter(submission=first_submission).exists())
+        withdraw_response = self.client.post(
+            reverse("dashboard:task-action", args=[self.task.pk, "withdraw"]),
+            self._command_data(
+                self.task,
+                reason="I noticed the final sentence was incorrect.",
+                confirm="on",
+            ),
+        )
+        self.assertRedirects(
+            withdraw_response,
+            reverse("dashboard:task-detail", args=[self.task.pk]),
+        )
+        self.task.refresh_from_db()
+        self.assertEqual(self.task.current_state, Task.State.IN_PROGRESS)
+        withdrawal = self.task.state_events.get(
+            event_type=TaskStateEvent.EventType.SUBMISSION_WITHDRAWN
+        )
+        self.assertEqual(withdrawal.submission_id, first_submission.pk)
+        self.assertEqual(withdrawal.permission_grant_id, self.operator_grant.pk)
+        self.assertFalse(ReviewDecision.objects.filter(submission=first_submission).exists())
 
-            second_response = self.client.post(
-                reverse("dashboard:task-action", args=[self.task.pk, "upload"]),
-                self._command_data(
-                    self.task,
-                    deliverable=SimpleUploadedFile(
-                        "answer-v2.txt", second_payload, content_type="text/plain"
-                    ),
-                    submission_note="Corrected before reviewer decision.",
-                    criterion__plain_language=TaskCheckRun.Result.PASS,
-                ),
-                follow=True,
-            )
-            self.assertEqual(second_response.status_code, 200)
-            self.assertEqual(
-                len([path for path in Path(media_root).rglob("*") if path.is_file()]),
-                2,
-            )
+        second_response = self.client.post(
+            reverse("dashboard:task-action", args=[self.task.pk, "deliver"]),
+            self._command_data(
+                self.task,
+                external_url=second_url,
+                submission_note="Corrected before reviewer decision.",
+                criterion__plain_language=TaskCheckRun.Result.PASS,
+            ),
+            follow=True,
+        )
+        self.assertEqual(second_response.status_code, 200)
 
         self.task.refresh_from_db()
         self.assertEqual(self.task.current_state, Task.State.UNDER_REVIEW)
@@ -714,9 +758,10 @@ class ControlledTaskUiTests(TestCase):
         self.assertEqual(submissions[1].supersedes_submission_id, first_submission.pk)
         self.assertIsNone(submissions[1].triggering_review_id)
         self.assertEqual(submissions[1].primary_asset_version.version_number, 2)
+        self.assertEqual(submissions[1].primary_asset_version.object_key, second_url)
         self.assertEqual(
             submissions[1].primary_asset_version.content_sha256,
-            hashlib.sha256(second_payload).hexdigest(),
+            hashlib.sha256(second_url.encode("utf-8")).hexdigest(),
         )
 
     def _new_task_form_data(self, *, title="Draft a new evidence-led answer", description="Explain why this task matters."):

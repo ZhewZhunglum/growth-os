@@ -1,13 +1,10 @@
 from __future__ import annotations
 
-import hashlib
 import uuid
-from pathlib import Path
 
 from django.contrib import messages
 from django.contrib.auth.decorators import login_required
-from django.core.exceptions import PermissionDenied, ValidationError
-from django.core.files.storage import default_storage
+from django.core.exceptions import ImproperlyConfigured, PermissionDenied, ValidationError
 from django.db import transaction
 from django.http import Http404, HttpRequest, HttpResponse
 from django.shortcuts import get_object_or_404, redirect, render
@@ -22,13 +19,23 @@ from dashboard.review_forms import (
     ReleaseGateForm,
     ReviewDecisionForm,
 )
+from integrations.publishing import PublicationMode, get_publication_runtime
 from releasegate.models import ChannelAccount, Publication, PublicationEvent, RuntimeEnvironment
-from releasegate.services import orchestrate_v1_release_gate, record_manual_publication_proof
+from releasegate.publishing import (
+    dispatch_confirmed_publication,
+    prepare_human_publication_confirmation,
+)
+from releasegate.services import orchestrate_v1_release_gate
 from workflow.models import Task
 
 
-MAX_PROOF_BYTES = 25 * 1024 * 1024
-ALLOWED_PROOF_TYPES = {"application/pdf", "image/jpeg", "image/png", "image/webp"}
+def _is_link_delivery(asset_version) -> bool:
+    metadata = asset_version.metadata
+    return bool(
+        asset_version.mime_type == "text/uri-list"
+        and isinstance(metadata, dict)
+        and metadata.get("source") == "external-url"
+    )
 
 
 def _subcommand(root: uuid.UUID, label: str) -> uuid.UUID:
@@ -121,12 +128,86 @@ def _can_review_submission(user: Principal, task: Task, submission: TaskSubmissi
     )
 
 
+def _can_view_asset_version(
+    user: Principal,
+    task: Task,
+    submission: TaskSubmission,
+) -> bool:
+    """Authorize a read of the exact immutable primary asset version."""
+
+    if submission.primary_asset_version_id is None:
+        return False
+    if ReviewDecision.objects.filter(
+        submission=submission,
+        reviewer_principal=user,
+    ).exists() and _product_decision(
+        user, task, PermissionGrant.Action.REVIEW
+    ).allowed:
+        return True
+    latest_submission = task.submissions.order_by("-submission_number").first()
+    if latest_submission is None or latest_submission.pk != submission.pk:
+        return False
+    if task.current_state == Task.State.UNDER_REVIEW and _can_review_submission(
+        user, task, submission
+    ):
+        return True
+    if user.pk in {
+        task.created_by_principal_id,
+        task.current_assignee_principal_id,
+    } and _product_decision(user, task, PermissionGrant.Action.EDIT).allowed:
+        return True
+    if task.current_state in {
+        Task.State.APPROVED,
+        Task.State.DONE,
+    } and _product_decision(
+        user, task, PermissionGrant.Action.COMPLETE_TASK
+    ).allowed:
+        return True
+    if task.current_state == Task.State.APPROVED:
+        publication = submission.publications.select_related(
+            "current_gate__channel_account"
+        ).filter(
+            requested_by_principal=user,
+            current_gate__isnull=False,
+        ).order_by("-created_at", "-id").first()
+        if publication and _publish_decision(
+            user, task, publication.current_gate.channel_account
+        ).allowed:
+            return True
+    return False
+
+
+def _can_view_publication_proof_event(
+    user: Principal,
+    event: PublicationEvent,
+) -> bool:
+    task = event.publication.submission.task
+    current_gate = event.publication.current_gate
+    may_complete = _product_decision(
+        user,
+        task,
+        PermissionGrant.Action.COMPLETE_TASK,
+    ).allowed
+    may_publish = bool(
+        current_gate
+        and event.publication.requested_by_principal_id == user.pk
+        and _publish_decision(
+            user,
+            task,
+            current_gate.channel_account,
+        ).allowed
+    )
+    return may_complete or may_publish
+
+
 def _review_context(task: Task, *, form=None):
     submission = _latest_submission(task)
+    asset_version = submission.primary_asset_version
     return {
         "task": task,
         "submission": submission,
-        "asset_version": submission.primary_asset_version,
+        "asset_version": asset_version,
+        "is_link_delivery": _is_link_delivery(asset_version),
         "review_form": form or ReviewDecisionForm(state_version=task.state_version),
     }
 
@@ -139,17 +220,26 @@ def _release_context(task: Task, user: Principal, *, gate_form=None, proof_form=
         "current_gate__channel_account",
         "current_gate__runtime_environment",
         "requested_by_principal",
-    ).order_by("-created_at", "-id")
+    ).prefetch_related("events").order_by("-created_at", "-id")
     ready_publications = publications.filter(
         status=Publication.Status.READY_FOR_MANUAL_PUBLISH,
         requested_by_principal=user,
     )
     initial_publication = ready_publications.first()
     can_publish = accounts.exists()
+    publication_list = list(publications)
+    asset_version = submission.primary_asset_version
+    readable_proof_event_ids = {
+        event.pk
+        for publication in publication_list
+        for event in publication.events.all()
+        if (event.external_url or event.external_publication_id)
+        and _can_view_publication_proof_event(user, event)
+    }
     return {
         "task": task,
         "submission": submission,
-        "publications": publications,
+        "publications": publication_list,
         "gate_form": gate_form or ReleaseGateForm(
             accounts=accounts,
             environments=environments,
@@ -167,6 +257,9 @@ def _release_context(task: Task, user: Principal, *, gate_form=None, proof_form=
             CompleteTaskForm(state_version=task.state_version) if _can_complete(user, task) else None
         ),
         "can_publish": can_publish,
+        "can_view_asset": _can_view_asset_version(user, task, submission),
+        "is_link_delivery": _is_link_delivery(asset_version),
+        "readable_proof_event_ids": readable_proof_event_ids,
     }
 
 
@@ -231,6 +324,14 @@ def review_history_detail(request: HttpRequest, review_id) -> HttpResponse:
             "submission": review.submission,
             "task": review.submission.task,
             "asset_version": review.submission.primary_asset_version,
+            "is_link_delivery": _is_link_delivery(
+                review.submission.primary_asset_version
+            ),
+            "can_view_asset": _can_view_asset_version(
+                request.user,
+                review.submission.task,
+                review.submission,
+            ),
         },
     )
 
@@ -360,48 +461,12 @@ def release_gate_action(request: HttpRequest, task_id) -> HttpResponse:
             command_id=form.cleaned_data["command_id"],
         )
         if result.gate.outcome == "PASSED":
-            messages.success(request, "门禁已通过。请你在平台上人工发布，然后回来上传证明。")
+            messages.success(request, "门禁已通过。请选择发布方式并完成最终人工确认；未配置的 API/浏览器路径会直接拒绝。")
         else:
             messages.error(request, "门禁未通过，系统没有发布任何内容。请先处理页面显示的阻塞原因。")
     except ValidationError as error:
         messages.error(request, _validation_text(error))
     return redirect("dashboard:release-detail", task_id=task.pk)
-
-
-def _hash_proof(uploaded) -> tuple[str, int]:
-    digest = hashlib.sha256()
-    size = 0
-    for chunk in uploaded.chunks():
-        size += len(chunk)
-        if size > MAX_PROOF_BYTES:
-            raise ValidationError("发布证明超过 25 MB 上限。")
-        digest.update(chunk)
-    if not size:
-        raise ValidationError("发布证明文件不能为空。")
-    uploaded.seek(0)
-    return digest.hexdigest(), size
-
-
-def _valid_proof_signature(uploaded, mime_type: str) -> bool:
-    header = uploaded.read(12)
-    uploaded.seek(0)
-    if mime_type == "application/pdf":
-        return header.startswith(b"%PDF-")
-    if mime_type == "image/png":
-        return header.startswith(b"\x89PNG\r\n\x1a\n")
-    if mime_type == "image/jpeg":
-        return header.startswith(b"\xff\xd8\xff")
-    if mime_type == "image/webp":
-        return len(header) >= 12 and header[:4] == b"RIFF" and header[8:12] == b"WEBP"
-    return False
-
-
-def _delete_proof(name: str) -> None:
-    try:
-        if name and default_storage.exists(name):
-            default_storage.delete(name)
-    except Exception:
-        pass
 
 
 @login_required
@@ -414,7 +479,7 @@ def release_proof_action(request: HttpRequest, task_id) -> HttpResponse:
     )
     submission = _latest_submission(task)
     # Include the terminal publication only so an identical command replay can
-    # return its existing immutable proof without uploading another file.
+    # return its existing immutable URL/content-ID proof without creating another event.
     ready_publications = submission.publications.filter(
         status__in=[
             Publication.Status.READY_FOR_MANUAL_PUBLISH,
@@ -424,7 +489,6 @@ def release_proof_action(request: HttpRequest, task_id) -> HttpResponse:
     )
     form = PublicationProofForm(
         request.POST,
-        request.FILES,
         publications=ready_publications,
     )
     if not form.is_valid():
@@ -435,55 +499,37 @@ def release_proof_action(request: HttpRequest, task_id) -> HttpResponse:
             status=400,
         )
     publication = form.cleaned_data["publication"]
-    uploaded = form.cleaned_data["proof_file"]
-    mime_type = (uploaded.content_type or "application/octet-stream").lower()
-    if mime_type not in ALLOWED_PROOF_TYPES:
-        messages.error(request, "发布证明仅支持 PNG、JPEG、WebP 或 PDF。")
-        return redirect("dashboard:release-detail", task_id=task.pk)
     try:
-        proof_sha256, _size = _hash_proof(uploaded)
-        if not _valid_proof_signature(uploaded, mime_type):
-            raise ValidationError("发布证明的文件内容与所选图片/PDF类型不一致。")
-        root = form.cleaned_data["command_id"]
-        existing = PublicationEvent.objects.filter(command_id=root).first()
-        if existing is not None:
-            if (
-                existing.publication_id != publication.pk
-                or existing.event_type != PublicationEvent.EventType.MANUAL_PUBLISHED_RECORDED
-                or existing.external_url != form.cleaned_data["external_url"]
-                or existing.external_publication_id != form.cleaned_data["external_publication_id"]
-                or existing.proof_sha256 != proof_sha256
-            ):
-                raise ValidationError("该 command_id 已用于不同的发布证明。")
-            record_manual_publication_proof(
-                publication=publication,
-                publisher_principal=request.user,
-                command_id=root,
-                external_url=existing.external_url,
-                external_publication_id=existing.external_publication_id,
-                proof_reference=existing.proof_reference,
-                proof_sha256=existing.proof_sha256,
-            )
-        else:
-            original_name = Path(uploaded.name or "proof.bin").name
-            safe_name = default_storage.get_valid_name(original_name) or "proof.bin"
-            requested_name = f"publication-proofs/{publication.pk}/{root.hex}/{safe_name}"
-            stored_name = ""
+        root_command = form.cleaned_data["command_id"]
+        mode = PublicationMode(form.cleaned_data["mode"])
+        confirmation = prepare_human_publication_confirmation(
+            publication=publication,
+            publisher_principal=request.user,
+            mode=mode,
+            confirmation_id=_subcommand(root_command, "human-publish-confirmation"),
+            confirmed=form.cleaned_data["confirmed"],
+        )
+        runtime = None
+        if mode is not PublicationMode.MANUAL:
             try:
-                stored_name = default_storage.save(requested_name, uploaded)
-                record_manual_publication_proof(
-                    publication=publication,
-                    publisher_principal=request.user,
-                    command_id=root,
-                    external_url=form.cleaned_data["external_url"],
-                    external_publication_id=form.cleaned_data["external_publication_id"],
-                    proof_reference=stored_name,
-                    proof_sha256=proof_sha256,
-                )
-            except Exception:
-                _delete_proof(stored_name)
-                raise
-        messages.success(request, "人工发布证明已保存；系统没有执行任何外部发布动作。")
+                runtime = get_publication_runtime()
+            except ImproperlyConfigured as error:
+                raise ValidationError(
+                    {"mode": "受控发布运行层配置无效；本次没有执行发布。"}
+                ) from error
+        result = dispatch_confirmed_publication(
+            publication=publication,
+            publisher_principal=request.user,
+            confirmation=confirmation,
+            command_id=root_command,
+            runtime=runtime,
+            manual_external_url=form.cleaned_data["external_url"],
+            manual_external_publication_id=form.cleaned_data["external_publication_id"],
+        )
+        if result.mode is PublicationMode.MANUAL:
+            messages.success(request, "人工发布确认和外部网址/内容 ID 已保存。")
+        else:
+            messages.success(request, "受控发布已完成，并保存了不可变发布证明。")
     except ValidationError as error:
         messages.error(request, _validation_text(error))
     return redirect("dashboard:release-detail", task_id=task.pk)

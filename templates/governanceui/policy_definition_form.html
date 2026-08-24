@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block title %}新建规则定义 · PUKO{% endblock %}
+{% block page_title %}新建规则定义{% endblock %}
+{% block content %}
+<a class="back-link" href="{% url 'governanceui:home' %}">← 返回问题与规则治理</a>
+<section class="detail-columns">
+  <article class="detail-panel action-panel">
+    <p class="eyebrow">先建立稳定编号</p>
+    <h3>这一步只创建规则目录</h3>
+    <form class="config-form" method="post">{% csrf_token %}{{ form.as_p }}<button class="button button-primary" type="submit">保存并继续建候选版本</button></form>
+  </article>
+  <article class="detail-panel">
+    <p class="eyebrow">不会自动生效</p>
+    <h3>后面仍要完整验证和人工批准</h3>
+    <p class="muted">保存后还要追加不可变版本、建立提案、Replay、Shadow、人工批准、Canary，最后才能受控启用。</p>
+  </article>
+</section>
+{% endblock %}

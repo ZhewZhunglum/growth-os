@@ -1,31 +1,37 @@
-{% load static %}
+{% load static ui_i18n %}
 <!doctype html>
-<html lang="zh-CN">
+<html lang="{% ui_language_code %}">
 <head>
     <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>登录 · PUKO Growth OS</title><link rel="stylesheet" href="{% static 'css/app.css' %}">
+    <title>{% ui '登录' 'Sign in' %} · PUKO Growth OS</title><link rel="stylesheet" href="{% static 'css/app.css' %}">
 </head>
 <body class="auth-page">
+    {% url 'set_language' as set_language_url %}
     <main class="auth-card">
+        <form class="language-switch auth-language-switch" action="{{ set_language_url|default:'/i18n/setlang/' }}" method="post" aria-label="{% ui '界面语言' 'Interface language' %}">
+            {% csrf_token %}<input name="next" type="hidden" value="{{ request.get_full_path }}">
+            <button class="language-option{% if request.LANGUAGE_CODE|slice:':2' == 'zh' %} is-selected{% endif %}" type="submit" name="language" value="zh-hans" lang="zh-CN">中文</button>
+            <button class="language-option{% if request.LANGUAGE_CODE|slice:':2' == 'en' %} is-selected{% endif %}" type="submit" name="language" value="en" lang="en">EN</button>
+        </form>
         <div class="brand auth-brand"><span class="brand-mark">P</span><span><strong>PUKO</strong><small>Growth OS</small></span></div>
-        <p class="eyebrow">公司内部工作台</p><h1>登录后继续</h1>
-        <p class="muted">任务、审核和发布记录都保存在同一条可追溯流程中。</p>
-        {% if form.errors %}<p class="form-error">用户名或密码不正确，请重新输入。</p>{% endif %}
+        <p class="eyebrow">{% ui '公司内部工作台' 'Company internal workspace' %}</p><h1>{% ui '登录后继续' 'Sign in to continue' %}</h1>
+        <p class="muted">{% ui '任务、审核和发布记录都保存在同一条可追溯流程中。' 'Tasks, reviews, and publishing records stay in one traceable workflow.' %}</p>
+        {% if form.errors %}<p class="form-error">{% ui '用户名或密码不正确，请重新输入。' 'Incorrect username or password. Please try again.' %}</p>{% endif %}
         <form method="post" class="auth-form" id="growth-os-login-form">
             {% csrf_token %}
-            <label for="id_username">用户名</label>
+            <label for="id_username">{% ui '用户名' 'Username' %}</label>
             {{ form.username.errors }}
             <input type="text" name="username" value="{{ form.username.value|default_if_none:'' }}" maxlength="150" autocapitalize="none" autocomplete="username" autofocus required id="id_username">
-            <label for="id_password">密码</label>
+            <label for="id_password">{% ui '密码' 'Password' %}</label>
             {{ form.password.errors }}
             <input type="password" name="password" autocomplete="current-password" required id="id_password">
             <label class="remember-username" for="id_remember_username">
                 <input type="checkbox" id="id_remember_username" checked>
-                <span>在这台电脑上记住用户名</span>
+                <span>{% ui '在这台电脑上记住用户名' 'Remember username on this computer' %}</span>
             </label>
-            <p class="privacy-note">系统只保存用户名；密码是否保存由浏览器的密码管理器决定。</p>
+            <p class="privacy-note">{% ui '系统只保存用户名；密码是否保存由浏览器的密码管理器决定。' 'Only the username is remembered here; your browser decides whether to save the password.' %}</p>
             {% if next %}<input type="hidden" name="next" value="{{ next }}">{% endif %}
-            <button class="button button-primary" type="submit">登录</button>
+            <button class="button button-primary" type="submit">{% ui '登录' 'Sign in' %}</button>
         </form>
     </main>
     <script>

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 from django.core.exceptions import ImproperlyConfigured
@@ -8,8 +9,25 @@ from django.core.exceptions import ImproperlyConfigured
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 ENVIRONMENT = os.getenv("GROWTH_OS_ENV", "local").strip().lower()
+if ENVIRONMENT not in {"local", "staging", "production"}:
+    raise ImproperlyConfigured("GROWTH_OS_ENV must be local, staging, or production.")
 IS_LOCAL = ENVIRONMENT == "local"
 IS_PRODUCTION = ENVIRONMENT == "production"
+
+# Deployment identity is intentionally small and non-sensitive.  The release
+# SHA is baked into Docker images at build time; source checkouts may leave it
+# as ``unknown`` so they never claim to be a traceable deployment by accident.
+DEPLOYMENT_STAGE = os.getenv("GROWTH_OS_DEPLOYMENT_STAGE", ENVIRONMENT).strip().lower()
+if DEPLOYMENT_STAGE not in {"local", "staging", "staging-candidate", "production"}:
+    raise ImproperlyConfigured(
+        "GROWTH_OS_DEPLOYMENT_STAGE must be local, staging, staging-candidate, or production."
+    )
+
+RELEASE_SHA = os.getenv("GROWTH_OS_RELEASE_SHA", "unknown").strip()
+if RELEASE_SHA != "unknown" and not re.fullmatch(r"[0-9a-f]{40}", RELEASE_SHA):
+    raise ImproperlyConfigured(
+        "GROWTH_OS_RELEASE_SHA must be 'unknown' or a full 40-character lowercase Git SHA."
+    )
 
 
 def csv_env(name: str, default: str = "") -> list[str]:
@@ -27,15 +45,81 @@ def positive_int_env(name: str, default: int) -> int:
     return value
 
 
-SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "local-development-only-not-for-deployment")
-if not IS_LOCAL and SECRET_KEY == "local-development-only-not-for-deployment":
-    raise ImproperlyConfigured("DJANGO_SECRET_KEY must be supplied outside local development.")
+def boolean_env(name: str, default: bool = False) -> bool:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    normalized = raw_value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off", ""}:
+        return False
+    raise ImproperlyConfigured(f"{name} must be an explicit boolean.")
+
+
+def secret_env_or_file(
+    name: str,
+    *,
+    required: bool = False,
+    file_only: bool = False,
+) -> str:
+    """Read one secret from either NAME or NAME_FILE, never both.
+
+    ``*_FILE`` supports read-only container secret mounts without placing the
+    value in Compose files or command arguments.  Error messages deliberately
+    name only the setting, never the secret value.
+    """
+
+    direct_value = os.getenv(name)
+    file_value = os.getenv(f"{name}_FILE")
+    if direct_value is not None and file_value is not None:
+        raise ImproperlyConfigured(f"Set only one of {name} or {name}_FILE.")
+    if file_only and direct_value is not None:
+        raise ImproperlyConfigured(
+            f"{name} must use the {name}_FILE secret mount outside Local."
+        )
+
+    value = direct_value
+    if file_value is not None:
+        secret_path = Path(file_value)
+        try:
+            value = secret_path.read_text(encoding="utf-8").rstrip("\r\n")
+        except OSError as error:
+            raise ImproperlyConfigured(f"Unable to read {name}_FILE.") from error
+
+    if value is not None and any(character in value for character in ("\x00", "\r", "\n")):
+        raise ImproperlyConfigured(f"{name} must be a single-line secret.")
+    if required and not value:
+        raise ImproperlyConfigured(f"{name} or {name}_FILE must be supplied.")
+    return value or ""
+
+
+SECRET_KEY = secret_env_or_file(
+    "DJANGO_SECRET_KEY",
+    required=not IS_LOCAL,
+    file_only=not IS_LOCAL,
+)
+if not SECRET_KEY:
+    SECRET_KEY = "local-development-only-not-for-deployment"
+if not IS_LOCAL and (
+    len(SECRET_KEY) < 50
+    or len(set(SECRET_KEY)) < 5
+    or SECRET_KEY.startswith("django-insecure-")
+):
+    raise ImproperlyConfigured(
+        "DJANGO_SECRET_KEY_FILE must contain a strong deployment signing key."
+    )
 
 DEBUG = IS_LOCAL and os.getenv("DJANGO_DEBUG", "1") == "1"
 ALLOWED_HOSTS = csv_env("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1" if IS_LOCAL else "")
 CSRF_TRUSTED_ORIGINS = csv_env("DJANGO_CSRF_TRUSTED_ORIGINS")
 if not IS_LOCAL and not ALLOWED_HOSTS:
     raise ImproperlyConfigured("DJANGO_ALLOWED_HOSTS must be explicit outside local development.")
+
+# Networked Daily Operations and publication adapters are opt-in deployment
+# composition.  Local/source defaults stay offline and therefore cost nothing.
+PUBLICATION_NETWORK_ENABLED = boolean_env("PUBLICATION_NETWORK_ENABLED", False)
+PUBLICATION_RUNTIME_FACTORY = os.getenv("PUBLICATION_RUNTIME_FACTORY", "").strip()
 
 INSTALLED_APPS = [
     "django.contrib.admin",
@@ -50,6 +134,12 @@ INSTALLED_APPS = [
     "workflow",
     "contentops",
     "releasegate",
+    "insights",
+    "intelligence",
+    "governance",
+    "dailyops",
+    "feedbackui",
+    "governanceui",
     "dashboard",
 ]
 
@@ -57,6 +147,7 @@ MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
     "whitenoise.middleware.WhiteNoiseMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
+    "django.middleware.locale.LocaleMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
@@ -98,7 +189,11 @@ elif DATABASE_ENGINE == "postgresql":
     required_db_values = {
         "NAME": os.getenv("POSTGRES_DB", ""),
         "USER": os.getenv("POSTGRES_USER", ""),
-        "PASSWORD": os.getenv("POSTGRES_PASSWORD", ""),
+        "PASSWORD": secret_env_or_file(
+            "POSTGRES_PASSWORD",
+            required=True,
+            file_only=not IS_LOCAL,
+        ),
         "HOST": os.getenv("POSTGRES_HOST", ""),
         "PORT": os.getenv("POSTGRES_PORT", "5432"),
     }
@@ -117,6 +212,7 @@ else:
     raise ImproperlyConfigured("DATABASE_ENGINE must be sqlite or postgresql.")
 
 AUTH_USER_MODEL = "accounts.Principal"
+AUTHENTICATION_BACKENDS = ["accounts.backends.PrincipalStatusBackend"]
 
 PASSWORD_MIN_LENGTH = positive_int_env("PASSWORD_MIN_LENGTH", 6 if IS_LOCAL else 12)
 required_password_minimum = 6 if IS_LOCAL else 12
@@ -136,7 +232,11 @@ AUTH_PASSWORD_VALIDATORS = [
     {"NAME": "django.contrib.auth.password_validation.NumericPasswordValidator"},
 ]
 
-LANGUAGE_CODE = "en-us"
+LANGUAGE_CODE = "zh-hans"
+LANGUAGES = [
+    ("zh-hans", "简体中文"),
+    ("en", "English"),
+]
 TIME_ZONE = "Asia/Shanghai"
 USE_I18N = True
 USE_TZ = True
@@ -144,16 +244,14 @@ USE_TZ = True
 STATIC_URL = "static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
 STATICFILES_DIRS = [BASE_DIR / "static"]
+
 STORAGES = {
-    "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"},
     "staticfiles": {
         "BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage"
         if not IS_LOCAL
         else "django.contrib.staticfiles.storage.StaticFilesStorage"
     },
 }
-MEDIA_URL = "media/"
-MEDIA_ROOT = Path(os.getenv("MEDIA_ROOT", BASE_DIR / "media"))
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 LOGIN_URL = "login"
@@ -166,7 +264,7 @@ X_FRAME_OPTIONS = "DENY"
 SECURE_CONTENT_TYPE_NOSNIFF = True
 SECURE_REFERRER_POLICY = "same-origin"
 
-if IS_PRODUCTION:
+if not IS_LOCAL:
     if os.getenv("TRUST_PROXY_SSL_HEADER", "0") == "1":
         SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
     SECURE_SSL_REDIRECT = True
@@ -175,6 +273,8 @@ if IS_PRODUCTION:
     SECURE_REDIRECT_EXEMPT = [r"^health/$"]
     SESSION_COOKIE_SECURE = True
     CSRF_COOKIE_SECURE = True
+
+if IS_PRODUCTION:
     SECURE_HSTS_SECONDS = 31_536_000
     SECURE_HSTS_INCLUDE_SUBDOMAINS = True
     SECURE_HSTS_PRELOAD = True
@@ -186,5 +286,6 @@ LOGGING = {
         "standard": {"format": "%(asctime)s %(levelname)s %(name)s %(message)s"},
     },
     "handlers": {"console": {"class": "logging.StreamHandler", "formatter": "standard"}},
+    "loggers": {},
     "root": {"handlers": ["console"], "level": os.getenv("LOG_LEVEL", "INFO")},
 }

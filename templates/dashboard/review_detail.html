@@ -1,18 +1,18 @@
 {% extends "base.html" %}
-{% load dashboard_display %}
-{% block title %}审核 {{ task.title }} · PUKO Growth OS{% endblock %}
-{% block page_title %}人工审核{% endblock %}
+{% load dashboard_display ui_i18n %}
+{% block title %}{% ui '审核' 'Review' %} {{ task.title }} · PUKO Growth OS{% endblock %}
+{% block page_title %}{% ui '人工审核' 'Human review' %}{% endblock %}
 {% block content %}
-<a class="back-link" href="{% url 'dashboard:review-queue' %}">← 返回待审核</a>
-<section class="task-detail-hero"><div><p class="eyebrow">{{ task.product.name }} · 第 {{ submission.submission_number }} 次提交</p><h2>{{ task.title }}</h2><p>{{ task.description|default:"暂无背景说明" }}</p></div><div class="detail-status-stack"><span class="task-state">{{ task.current_state|task_state_zh }}</span><small>状态版本 {{ task.state_version }}</small></div></section>
+<a class="back-link" href="{% url 'dashboard:review-queue' %}">← {% ui '返回待审核' 'Back to review queue' %}</a>
+<section class="task-detail-hero"><div><p class="eyebrow">{{ task.product.name }} · {% ui '第' 'Submission' %} {{ submission.submission_number }} {% ui '次提交' '' %}</p><h2>{{ task.title }}</h2><p>{% if task.description %}{{ task.description }}{% else %}{% ui '暂无背景说明' 'No background provided' %}{% endif %}</p></div><div class="detail-status-stack"><span class="task-state">{% ui_task_state task.current_state %}</span><small>{% ui '状态版本' 'State version' %} {{ task.state_version }}</small></div></section>
 <section class="detail-summary-grid">
-    <article><span class="task-label">交付文件</span><p>{{ asset_version.metadata.original_filename|default:asset_version.object_key }}</p></article>
-    <article><span class="task-label">文件类型</span><p>{{ asset_version.mime_type }}</p></article>
-    <article><span class="task-label">SHA-256</span><p>{{ asset_version.content_sha256|truncatechars:22 }}</p></article>
-    <article><span class="task-label">提交说明</span><p>{{ submission.submission_note|default:"未填写" }}</p></article>
+    {% if is_link_delivery %}<article><span class="task-label">{% ui '交付链接' 'Delivery link' %}</span><p>{{ asset_version.object_key }}</p><a class="button" href="{{ asset_version.object_key }}" target="_blank" rel="noopener noreferrer">{% ui '打开这份交付内容' 'Open delivery' %}</a></article>{% else %}<article><span class="task-label">{% ui '旧版交付' 'Legacy delivery' %}</span><p>{% ui 'V1 已停止支持该旧文件交付。' 'V1 no longer supports this legacy file delivery.' %}</p></article>{% endif %}
+    <article><span class="task-label">{% ui '版本清单类型' 'Manifest type' %}</span><p>{{ asset_version.mime_type }}</p></article>
+    <article><span class="task-label">{% ui '链接 SHA-256' 'Link SHA-256' %}</span><p>{{ asset_version.content_sha256|truncatechars:22 }}</p></article>
+    <article><span class="task-label">{% ui '提交说明' 'Submission note' %}</span><p>{% if submission.submission_note %}{{ submission.submission_note }}{% else %}{% ui '未填写' 'Not provided' %}{% endif %}</p></article>
 </section>
 <section class="detail-columns">
-    <article class="detail-panel"><p class="eyebrow">审核依据</p><h3>你需要核对什么</h3><p class="action-explanation">检查精确封存的内容版本是否符合任务说明、交付标准、品牌语气和合规边界。通过只代表可进入门禁，不代表已经发布。</p><dl class="submission-summary"><dt>资产版本</dt><dd>v{{ asset_version.version_number }}</dd><dt>文件存储标识</dt><dd>{{ asset_version.object_key }}</dd><dt>封存时间</dt><dd>{{ submission.sealed_at }}</dd></dl></article>
-    <article class="detail-panel action-panel"><p class="eyebrow">人工结论</p><h3>记录不可变审核结论</h3><form class="task-action-form" action="{% url 'dashboard:review-action' task.id %}" method="post">{% csrf_token %}{{ review_form.command_id }}{{ review_form.expected_state_version }}{{ review_form.non_field_errors }}{% for field in review_form.visible_fields %}<div class="field-row">{{ field.label_tag }}{{ field }}{{ field.errors }}{% if field.help_text %}<small>{{ field.help_text }}</small>{% endif %}</div>{% endfor %}<button class="button button-primary" type="submit">保存审核结论</button></form></article>
+    <article class="detail-panel"><p class="eyebrow">{% ui '审核依据' 'Review basis' %}</p><h3>{% ui '你需要核对什么' 'What to check' %}</h3><p class="action-explanation">{% if is_link_delivery %}{% ui '打开精确封存的交付链接，核对内容是否符合任务说明、交付标准、品牌语气和合规边界。' 'Open the exact sealed link and check it against the task instructions, delivery criteria, brand voice, and compliance boundaries.' %}{% else %}{% ui 'V1 已停止支持该旧文件交付；请让执行人员改用外部链接重新提交。' 'V1 no longer supports this legacy file delivery. Ask the operator to resubmit using an external link.' %}{% endif %} {% ui '通过只代表可进入门禁，不代表已经发布。' 'Approval only allows the work to enter release checks; it does not publish anything.' %}</p><dl class="submission-summary"><dt>{% ui '资产版本' 'Asset version' %}</dt><dd>v{{ asset_version.version_number }}</dd>{% if is_link_delivery %}<dt>{% ui '封存链接' 'Sealed link' %}</dt><dd>{{ asset_version.object_key }}</dd>{% endif %}<dt>{% ui '封存时间' 'Sealed at' %}</dt><dd>{{ submission.sealed_at }}</dd></dl></article>
+    <article class="detail-panel action-panel"><p class="eyebrow">{% ui '人工结论' 'Human decision' %}</p><h3>{% ui '记录不可变审核结论' 'Record an immutable review decision' %}</h3><form class="task-action-form" action="{% url 'dashboard:review-action' task.id %}" method="post">{% csrf_token %}{{ review_form.command_id }}{{ review_form.expected_state_version }}{{ review_form.non_field_errors }}{% for field in review_form.visible_fields %}<div class="field-row">{{ field.label_tag }}{{ field }}{{ field.errors }}{% if field.help_text %}<small>{{ field.help_text }}</small>{% endif %}</div>{% endfor %}<button class="button button-primary" type="submit">{% ui '保存审核结论' 'Save review decision' %}</button></form></article>
 </section>
 {% endblock %}

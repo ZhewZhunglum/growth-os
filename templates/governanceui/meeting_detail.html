@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block title %}{{ meeting.title }} · PUKO{% endblock %}
+{% block page_title %}会议与结论{% endblock %}
+{% block content %}
+<a class="back-link" href="{% url 'governanceui:home' %}">← 返回问题与规则治理</a>
+<section class="task-detail-hero"><div><p class="eyebrow">{{ meeting.meeting_key }} · {{ meeting.get_meeting_type_display }}</p><h2>{{ meeting.title }}</h2><p>{{ meeting.summary|default:"无摘要" }}</p></div><div class="detail-status-stack"><small>{{ meeting.occurred_at }}</small><small>{% for item in participants %}{{ item.principal }}{% if not forloop.last %}、{% endif %}{% endfor %}</small></div></section>
+<section class="detail-columns" style="margin-top:16px"><article class="detail-panel action-panel"><p class="eyebrow">新增结论</p><h3>谁负责、影响什么、何时完成</h3><form class="config-form" method="post" action="{% url 'governanceui:meeting-decision-create' meeting.id %}">{% csrf_token %}{{ decision_form.as_p }}<button class="button button-primary" type="submit">保存结构化结论</button></form></article>
+<article class="detail-panel"><p class="eyebrow">不可变记录</p><h3>会议结论</h3><div class="grant-list">{% for decision in decisions %}<div class="grant-card"><div class="grant-heading"><strong>{{ decision.decision }}</strong><span class="task-state">{{ decision.get_decision_type_display }}</span></div><dl class="grant-facts"><dt>负责人</dt><dd>{{ decision.owner_principal }}</dd><dt>影响范围</dt><dd>{{ decision.impact_scope }}</dd><dt>截止</dt><dd>{{ decision.due_at|default:"未设置" }}</dd></dl></div>{% empty %}<p class="muted">还没有结构化结论。</p>{% endfor %}</div></article></section>
+{% endblock %}

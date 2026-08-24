@@ -1,0 +1,8 @@
+{% extends "base.html" %}
+{% block title %}新建规则提案 · PUKO{% endblock %}
+{% block page_title %}新建规则提案{% endblock %}
+{% block content %}
+<a class="back-link" href="{% url 'governanceui:home' %}">← 返回问题与规则治理</a>
+<section class="detail-columns"><article class="detail-panel action-panel"><p class="eyebrow">只是提案，不会生效</p><h3>绑定确切来源和候选规则版本</h3><p class="muted">列表里没有需要的版本？<a href="{% url 'governanceui:policy-definition-create' %}">新建规则定义</a>或<a href="{% url 'governanceui:policy-version-create' %}">追加候选版本</a>。</p><form class="config-form" method="post">{% csrf_token %}{{ form.as_p }}<button class="button button-primary" type="submit">创建提案</button></form></article>
+<article class="detail-panel"><p class="eyebrow">强制流程</p><h3>Replay → Shadow → 人工批准 → Canary → 启用</h3><p class="muted">Learning 只能来到这里；它不能代替人批准。RELAX 必须由 Owner 本人批准并启用。</p></article></section>
+{% endblock %}

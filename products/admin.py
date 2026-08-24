@@ -1,6 +1,20 @@
 from django.contrib import admin
 
-from products.models import Product, ProductProfileVersion
+from products.models import (
+    ClaimEvidenceLink,
+    ClaimMatrixItem,
+    ClaimMatrixVersion,
+    ControlledEvidenceItemVersion,
+    EvidenceLibraryItem,
+    EvidenceLibraryVersion,
+    ObjectiveMetricLink,
+    ObjectiveProfileVersion,
+    Product,
+    ProductClaimVersion,
+    ProductProfileAssetLink,
+    ProductProfilePolicyLink,
+    ProductProfileVersion,
+)
 
 
 @admin.register(Product)
@@ -15,4 +29,20 @@ class ProductProfileVersionAdmin(admin.ModelAdmin):
     list_display = ("product", "version_number", "market_code", "language_code", "sealed_at", "manifest_sha256")
     list_filter = ("market_code", "language_code")
     readonly_fields = ("manifest_sha256", "sealed_at", "sealed_by_principal", "created_at")
+
+
+for model in (
+    ObjectiveProfileVersion,
+    ObjectiveMetricLink,
+    ClaimMatrixVersion,
+    ProductClaimVersion,
+    ClaimMatrixItem,
+    ControlledEvidenceItemVersion,
+    ClaimEvidenceLink,
+    EvidenceLibraryVersion,
+    EvidenceLibraryItem,
+    ProductProfilePolicyLink,
+    ProductProfileAssetLink,
+):
+    admin.site.register(model)
 

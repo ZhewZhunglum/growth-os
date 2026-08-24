@@ -1,10 +1,22 @@
-FROM python:3.12-slim AS runtime
+FROM python:3.12.13-slim-trixie@sha256:229a2c5bfa27522db7815ea81f9bed70af17ccb9de9fc7ad142b1877b5830d36 AS runtime
+
+ARG GIT_COMMIT_SHA
+
+LABEL org.opencontainers.image.source="https://github.com/ZhewZhunglum/growth-os" \
+      org.opencontainers.image.revision="${GIT_COMMIT_SHA}"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    GROWTH_OS_RELEASE_SHA="${GIT_COMMIT_SHA}"
 
 WORKDIR /app
+
+# A deployable image must identify one immutable full commit.  This validation
+# also prevents a branch name, "latest", or an abbreviated SHA being recorded
+# as deployment evidence.
+RUN test "${#GIT_COMMIT_SHA}" -eq 40 \
+    && case "${GIT_COMMIT_SHA}" in *[!0-9a-f]*) exit 1 ;; esac
 
 RUN addgroup --system growthos && adduser --system --ingroup growthos growthos
 
@@ -12,7 +24,7 @@ COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY . /app
-RUN mkdir -p /app/staticfiles /app/media && chown -R growthos:growthos /app
+RUN mkdir -p /app/staticfiles && chown -R growthos:growthos /app
 
 USER growthos
 

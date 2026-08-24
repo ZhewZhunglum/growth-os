@@ -15,7 +15,12 @@ services:
       retries: 12
 
   web:
-    build: .
+    build:
+      context: .
+      args:
+        # Set this from `git rev-parse HEAD`; Dockerfile rejects branch names,
+        # abbreviated SHAs and the unedited example placeholder.
+        GIT_COMMIT_SHA: ${GIT_COMMIT_SHA:?Set GIT_COMMIT_SHA to the full output of git rev-parse HEAD}
     restart: unless-stopped
     env_file:
       - .env
@@ -26,8 +31,6 @@ services:
       POSTGRES_SSLMODE: disable
     ports:
       - "127.0.0.1:${WEB_PORT:-8000}:8000"
-    volumes:
-      - media_data:/app/media
     depends_on:
       db:
         condition: service_healthy
@@ -42,4 +45,3 @@ services:
 
 volumes:
   postgres_data:
-  media_data:

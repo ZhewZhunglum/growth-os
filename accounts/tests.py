@@ -1,8 +1,7 @@
 from datetime import timedelta
 
 from django.contrib.auth import authenticate
-from django.core.exceptions import PermissionDenied
-from django.db import IntegrityError, transaction
+from django.core.exceptions import PermissionDenied, ValidationError
 from django.test import TestCase
 from django.utils import timezone
 
@@ -38,6 +37,25 @@ class PrincipalTests(TestCase):
             self.assertFalse(principal.is_active)
             self.assertIsNone(authenticate(username=username, password="valid-test-password"))
 
+    def test_non_human_principal_cannot_use_interactive_password_login(self):
+        for principal_type in (
+            Principal.PrincipalType.SERVICE_ACCOUNT,
+            Principal.PrincipalType.API_CLIENT,
+            Principal.PrincipalType.SYSTEM,
+        ):
+            with self.subTest(principal_type=principal_type):
+                username = f"non-human-{principal_type.lower()}"
+                principal = Principal.objects.create_user(
+                    username=username,
+                    password="valid-test-password",
+                    principal_type=principal_type,
+                )
+                self.assertTrue(principal.is_active)
+                self.assertTrue(principal.has_usable_password())
+                self.assertIsNone(
+                    authenticate(username=username, password="valid-test-password")
+                )
+
     def test_status_only_update_also_disables_login_flag(self):
         principal = Principal.objects.create_user(username="locked-later", password="valid-test-password")
         principal.principal_status = Principal.PrincipalStatus.LOCKED
@@ -68,8 +86,8 @@ class PermissionGrantTests(TestCase):
         )
         self.assertTrue(grant.is_current)
 
-    def test_invalid_implicit_scope_is_rejected_by_database(self):
-        with self.assertRaises(IntegrityError), transaction.atomic():
+    def test_invalid_implicit_scope_is_rejected_before_database_write(self):
+        with self.assertRaises(ValidationError):
             PermissionGrant.objects.create(
                 principal=self.operator, scope_kind=PermissionGrant.ScopeKind.GLOBAL, product=self.product,
                 action=PermissionGrant.Action.EDIT, valid_from=timezone.now(), granted_by_principal=self.owner,
@@ -85,6 +103,21 @@ class PermissionGrantTests(TestCase):
             valid_until=timezone.now() + timedelta(hours=1),
             granted_by_principal=self.owner,
             **scope,
+        )
+
+    def _revoke(self, grant):
+        grant.grant_status = PermissionGrant.GrantStatus.REVOKED
+        grant.revoked_at = timezone.now()
+        grant.revoked_by_principal = self.owner
+        grant.revocation_reason = "Authorization test moved to the next exact scope."
+        grant.save(
+            update_fields=[
+                "grant_status",
+                "revoked_at",
+                "revoked_by_principal",
+                "revocation_reason",
+                "updated_at",
+            ]
         )
 
     def test_account_and_surface_scopes_are_exact(self):
@@ -169,8 +202,7 @@ class PermissionGrantTests(TestCase):
         self.assertFalse(decision.allowed)
         self.assertEqual(decision.denied_by, product_deny)
 
-        product_deny.grant_status = PermissionGrant.GrantStatus.REVOKED
-        product_deny.save(update_fields=["grant_status"])
+        self._revoke(product_deny)
         platform_deny = self._grant(
             scope_kind=PermissionGrant.ScopeKind.PLATFORM,
             platform_code="TIKTOK",
@@ -188,8 +220,7 @@ class PermissionGrantTests(TestCase):
         self.assertFalse(decision.allowed)
         self.assertEqual(decision.denied_by, platform_deny)
 
-        platform_deny.grant_status = PermissionGrant.GrantStatus.REVOKED
-        platform_deny.save(update_fields=["grant_status"])
+        self._revoke(platform_deny)
         decision = resolve_authorization(
             principal=self.operator,
             acting_role=Principal.Role.OPERATOR,

@@ -1,5 +1,7 @@
 # Local acceptance evidence — 2026-08-19
 
+> This is a historical checkpoint. Its upload/media/object-storage statements are superseded by [V1 Link-Only Errata — 2026-08-20](spec/v1-freeze-2026-08-18/05-LINK-ONLY-ERRATA-2026-08-20.md).
+
 This is a development checkpoint, not Staging or Production sign-off.
 
 ## Candidate identity

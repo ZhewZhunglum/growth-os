@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% load ui_i18n %}
+{% block title %}{% ui '产品与运行配置' 'Product & runtime setup' %} · PUKO{% endblock %}
+{% block page_title %}{% ui '产品与运行配置' 'Product & runtime setup' %}{% endblock %}
+{% block content %}
+<section class="hero-panel config-hero">
+  <div><p class="eyebrow">{% ui 'Daily Operations 基础资料' 'Daily Operations foundation' %}</p><h2>{% ui '把真实产品、规则和账号准备好' 'Prepare real products, rules, and accounts' %}</h2>
+  <p>{% ui '这里只保存封存版本、平台账号编号和外部链接，不接收图片、视频、密码或 API 密钥。' 'This area stores sealed versions, platform account identifiers, and external links—not images, videos, passwords, or API keys.' %}</p></div>
+  {% if can_manage_runtime %}<a class="button button-primary" href="{% url 'dashboard:runtime-configuration' %}">{% ui '配置账号与环境' 'Configure accounts & environments' %}</a>{% endif %}
+</section>
+<section class="section-heading config-heading"><div><p class="eyebrow">{% ui '产品' 'Products' %}</p><h2>{% ui '我能配置的产品' 'Products I can configure' %}</h2></div></section>
+<div class="product-list">
+{% for product in products %}
+  <article class="product-card">
+    <span class="product-icon">{{ product.name|slice:":1" }}</span>
+    <div class="product-copy"><div class="product-title"><h3>{{ product.name }}</h3><span>{{ product.product_code }}</span></div>
+      <p>{{ product.market_code }} · {{ product.language_code }} · {% ui '当前档案' 'Current profile' %}：{% if product.current_profile_version %}v{{ product.current_profile_version.version_number }}{% else %}{% ui '尚未设置' 'Not set' %}{% endif %}</p></div>
+    <a class="button button-primary" href="{% url 'dashboard:product-configuration' product.id %}">{% ui '打开配置' 'Open setup' %}</a>
+  </article>
+{% empty %}<article class="empty-state"><span class="empty-number">0</span><div><h3>{% ui '没有可配置的产品' 'No configurable products' %}</h3><p>{% ui '需要该产品当前有效的“编辑”权限。' 'An active Edit permission for the product is required.' %}</p></div></article>{% endfor %}
+</div>
+{% endblock %}
