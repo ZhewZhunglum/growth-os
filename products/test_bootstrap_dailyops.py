@@ -9,6 +9,7 @@ from django.test import TestCase
 from accounts.models import PermissionGrant, Principal
 from intelligence.models import SourceRegistry
 from products.models import Product
+from releasegate.models import ChannelAccount
 from workflow.models import Task, TaskContractVersion
 
 
@@ -88,6 +89,17 @@ class BootstrapDailyOperationsTests(TestCase):
             )
 
         product = Product.objects.get(product_code="PUKO")
+        channel = ChannelAccount.objects.get(account_code="puko-us")
+        for principal in (owner, admin, operator):
+            publish_grant = PermissionGrant.objects.get(
+                principal=principal,
+                action=PermissionGrant.Action.PUBLISH,
+                scope_kind=PermissionGrant.ScopeKind.ACCOUNT,
+                account_ref=channel.account_code,
+            )
+            self.assertEqual(publish_grant.effect, PermissionGrant.Effect.ALLOW)
+            self.assertEqual(publish_grant.risk_level, PermissionGrant.RiskLevel.HIGH)
+            self.assertIsNotNone(publish_grant.valid_until)
         profile = product.current_profile_version
         self.assertIsNotNone(profile)
         self.assertTrue(profile.is_sealed)

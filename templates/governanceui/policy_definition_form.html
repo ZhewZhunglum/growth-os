@@ -1,18 +1,19 @@
 {% extends "base.html" %}
-{% block title %}新建规则定义 · PUKO{% endblock %}
-{% block page_title %}新建规则定义{% endblock %}
+{% load ui_i18n %}
+{% block title %}{% ui '新建规则定义' 'New rule definition' %} · PUKO{% endblock %}
+{% block page_title %}{% ui '新建规则定义' 'New rule definition' %}{% endblock %}
 {% block content %}
-<a class="back-link" href="{% url 'governanceui:home' %}">← 返回问题与规则治理</a>
+<a class="back-link" href="{% url 'governanceui:home' %}">← {% ui '返回问题与规则治理' 'Back to issues and rules' %}</a>
 <section class="detail-columns">
   <article class="detail-panel action-panel">
-    <p class="eyebrow">先建立稳定编号</p>
-    <h3>这一步只创建规则目录</h3>
-    <form class="config-form" method="post">{% csrf_token %}{{ form.as_p }}<button class="button button-primary" type="submit">保存并继续建候选版本</button></form>
+    <p class="eyebrow">{% ui '先建立稳定编号' 'Start with a stable code' %}</p>
+    <h3>{% ui '这一步只创建规则目录' 'This step only creates the rule definition' %}</h3>
+    <form class="config-form" method="post">{% csrf_token %}{{ form.as_p }}<button class="button button-primary" type="submit">{% ui '保存并继续建候选版本' 'Save and add a candidate version' %}</button></form>
   </article>
   <article class="detail-panel">
-    <p class="eyebrow">不会自动生效</p>
-    <h3>后面仍要完整验证和人工批准</h3>
-    <p class="muted">保存后还要追加不可变版本、建立提案、Replay、Shadow、人工批准、Canary，最后才能受控启用。</p>
+    <p class="eyebrow">{% ui '不会自动生效' 'No automatic activation' %}</p>
+    <h3>{% ui '后面仍要完整验证和人工批准' 'Validation and human approval still follow' %}</h3>
+    <p class="muted">{% ui '保存后还要追加不可变版本、建立提案、Replay、Shadow、人工批准、Canary，最后才能受控启用。' 'After saving, add an immutable version and proposal, then complete Replay, Shadow, human approval, and Canary before controlled activation.' %}</p>
   </article>
 </section>
 {% endblock %}

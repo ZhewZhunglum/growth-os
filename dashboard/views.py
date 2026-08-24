@@ -68,6 +68,25 @@ def _require_edit(user: Principal, task: Task):
     )
 
 
+def _can_manage_assignment(user: Principal, task: Task) -> bool:
+    if (
+        user.role == Principal.Role.OPERATIONS_ADMIN
+        and task.current_assignee_principal_id is not None
+        and task.current_assignee_principal.role != Principal.Role.OPERATOR
+    ):
+        return False
+    return bool(
+        user.role in {Principal.Role.OWNER, Principal.Role.OPERATIONS_ADMIN}
+        and task.current_state in {
+            Task.State.READY,
+            Task.State.ASSIGNED,
+            Task.State.IN_PROGRESS,
+        }
+        and not task.submissions.exists()
+        and _authorization(user, task, PermissionGrant.Action.ASSIGN_TASK).allowed
+    )
+
+
 def _task_for_user(user: Principal, task_id) -> Task:
     task = get_object_or_404(
         Task.objects.select_related(
@@ -76,6 +95,8 @@ def _task_for_user(user: Principal, task_id) -> Task:
         pk=task_id,
     )
     if user.pk in {task.created_by_principal_id, task.current_assignee_principal_id}:
+        return task
+    if _can_manage_assignment(user, task):
         return task
     # The personal workspace is deliberately narrower than a product-wide
     # grant: knowing a task UUID must not make another employee's task visible.
@@ -119,12 +140,16 @@ def _require_profile_create(user: Principal, profile: ProductProfileVersion):
     )
 
 
-def _eligible_operators(task: Task):
+def _eligible_operators(task: Task, manager: Principal | None = None, *, exclude_current: bool = False):
     candidates = Principal.objects.filter(
         principal_type=Principal.PrincipalType.HUMAN_USER,
         principal_status=Principal.PrincipalStatus.ACTIVE,
         is_active=True,
     ).order_by("display_name", "username")
+    if manager is not None and manager.role == Principal.Role.OPERATIONS_ADMIN:
+        candidates = candidates.filter(role=Principal.Role.OPERATOR)
+    if exclude_current and task.current_assignee_principal_id:
+        candidates = candidates.exclude(pk=task.current_assignee_principal_id)
     allowed_ids = [
         candidate.pk
         for candidate in candidates
@@ -137,6 +162,158 @@ def _eligible_operators(task: Task):
         ).allowed
     ]
     return candidates.filter(pk__in=allowed_ids)
+
+
+def _principal_turn_label(principal: Principal) -> str:
+    name = principal.display_name or principal.username
+    role = {
+        Principal.Role.OWNER: "Owner",
+        Principal.Role.OPERATIONS_ADMIN: "Admin",
+        Principal.Role.OPERATOR: "Operator",
+    }.get(principal.role, principal.role)
+    return f"{name}（{role}）"
+
+
+def _authorized_product_people(task: Task, action: str, *, exclude_principal_id=None) -> list[Principal]:
+    people = Principal.objects.filter(
+        principal_type=Principal.PrincipalType.HUMAN_USER,
+        principal_status=Principal.PrincipalStatus.ACTIVE,
+        is_active=True,
+    ).order_by("display_name", "username")
+    return [
+        person
+        for person in people
+        if person.pk != exclude_principal_id
+        and _authorization(person, task, action).allowed
+    ]
+
+
+def _turn_people_label(people: list[Principal], fallback_zh: str, fallback_en: str) -> tuple[str, str]:
+    if not people:
+        return fallback_zh, fallback_en
+    labels = "、".join(_principal_turn_label(person) for person in people[:3])
+    if len(people) > 3:
+        labels += f" 等 {len(people)} 人"
+    return labels, labels
+
+
+def _current_task_turn(task: Task, compilation_context=None) -> dict[str, str]:
+    assignee = task.current_assignee_principal
+    creator = task.created_by_principal
+    if task.current_state == Task.State.DRAFT:
+        who = _principal_turn_label(creator)
+        return {
+            "who_zh": who,
+            "who_en": who,
+            "action_zh": "补齐资料并完成开始前检查",
+            "action_en": "Complete the information and readiness check",
+            "note_zh": "确认资料齐全后，这份任务才会进入分配阶段。",
+            "note_en": "The task can be assigned only after its information is ready.",
+        }
+    if task.current_state == Task.State.READY:
+        people = [
+            person
+            for person in _authorized_product_people(task, PermissionGrant.Action.ASSIGN_TASK)
+            if person.role in {Principal.Role.OWNER, Principal.Role.OPERATIONS_ADMIN}
+        ]
+        who_zh, who_en = _turn_people_label(people, "尚未配置分配负责人", "No assignment manager configured")
+        return {
+            "who_zh": who_zh,
+            "who_en": who_en,
+            "action_zh": "选择一位执行人",
+            "action_en": "Choose an assignee",
+            "note_zh": "只有拥有当前有效分配权限的 Owner 或 Admin 可以操作。",
+            "note_en": "Only an Owner or Admin with live assignment permission can act.",
+        }
+    if task.current_state in {Task.State.ASSIGNED, Task.State.IN_PROGRESS, Task.State.HUMAN_REWORK}:
+        who = _principal_turn_label(assignee) if assignee else "尚未分配"
+        action_zh = {
+            Task.State.ASSIGNED: "确认开工",
+            Task.State.IN_PROGRESS: "完成内容并送审",
+            Task.State.HUMAN_REWORK: "按审核意见修改后重新送审",
+        }[task.current_state]
+        action_en = {
+            Task.State.ASSIGNED: "Start the task",
+            Task.State.IN_PROGRESS: "Finish the content and submit it",
+            Task.State.HUMAN_REWORK: "Revise and resubmit after review feedback",
+        }[task.current_state]
+        return {
+            "who_zh": who,
+            "who_en": who,
+            "action_zh": action_zh,
+            "action_en": action_en,
+            "note_zh": "当前负责人完成后，系统会把下一步送到正确的审核或发布队列。",
+            "note_en": "When the assignee finishes, the next step moves to the correct review or publishing queue.",
+        }
+    if task.current_state in {Task.State.SUBMITTED, Task.State.UNDER_REVIEW}:
+        submission = task.submissions.order_by("-submission_number").first()
+        submitter_id = submission.submitted_by_principal_id if submission else None
+        people = _authorized_product_people(
+            task,
+            PermissionGrant.Action.REVIEW,
+            exclude_principal_id=submitter_id,
+        )
+        who_zh, who_en = _turn_people_label(people, "尚未配置独立审核人", "No independent reviewer configured")
+        return {
+            "who_zh": who_zh,
+            "who_en": who_en,
+            "action_zh": "审核这次提交",
+            "action_en": "Review this submission",
+            "note_zh": "提交人不能审核自己的内容；请由 Admin 或另一位拥有审核权限的账号处理。",
+            "note_en": "The submitter cannot review their own work. An Admin or another authorized account must review it.",
+        }
+    if task.current_state == Task.State.APPROVED:
+        account = (
+            compilation_context.channel_plan.channel_account
+            if compilation_context and compilation_context.channel_plan.channel_account_id
+            else None
+        )
+        people: list[Principal] = []
+        if account is not None:
+            for person in Principal.objects.filter(
+                principal_type=Principal.PrincipalType.HUMAN_USER,
+                principal_status=Principal.PrincipalStatus.ACTIVE,
+                is_active=True,
+            ).order_by("display_name", "username"):
+                decision = resolve_authorization(
+                    principal=person,
+                    acting_role=person.role,
+                    action=PermissionGrant.Action.PUBLISH,
+                    scope_kind=PermissionGrant.ScopeKind.ACCOUNT,
+                    product=task.product,
+                    platform_code=account.platform_code,
+                    account_ref=account.account_code,
+                )
+                if decision.allowed:
+                    people.append(person)
+        who_zh, who_en = _turn_people_label(people, "尚未配置该账号的发布人", "No publisher configured for this account")
+        return {
+            "who_zh": who_zh,
+            "who_en": who_en,
+            "action_zh": "打开发布队列，完成发布检查并登记结果",
+            "action_en": "Open the publishing queue, run checks, and record the result",
+            "note_zh": "Owner、Admin 或 Operator 都可以发布，但必须各自拥有这个平台账号的有效发布权限。",
+            "note_en": "Owner, Admin, or Operator may publish only with their own live permission for this exact account.",
+        }
+    if task.current_state == Task.State.BLOCKED:
+        person = assignee or creator
+        who = _principal_turn_label(person)
+        return {
+            "who_zh": who,
+            "who_en": who,
+            "action_zh": "补齐缺失资料后重新检查",
+            "action_en": "Resolve the missing information and check again",
+            "note_zh": "阻塞原因和旧检查结果会保留。",
+            "note_en": "The blocker and previous check remain in history.",
+        }
+    return {
+        "who_zh": "无需继续处理",
+        "who_en": "No further action",
+        "action_zh": "流程已结束",
+        "action_en": "The workflow is finished",
+        "note_zh": "历史记录仍会保留。",
+        "note_en": "The history remains available.",
+    }
 
 
 def _decorate_task(task: Task) -> None:
@@ -189,7 +366,7 @@ def _action_form(task: Task, user: Principal):
     if task.current_state == Task.State.READY and _authorization(
         user, task, PermissionGrant.Action.ASSIGN_TASK
     ).allowed:
-        return "assign", AssignmentForm(operators=_eligible_operators(task), **common)
+        return "assign", AssignmentForm(operators=_eligible_operators(task, user), **common)
     if task.current_state == Task.State.ASSIGNED and task.current_assignee_principal_id == user.pk and can_edit:
         return "start", StartWorkForm(**common)
     if task.current_state == Task.State.HUMAN_REWORK and task.current_assignee_principal_id == user.pk and can_edit:
@@ -211,6 +388,7 @@ def _detail_context(
     action_form=None,
     cancel_form=None,
     withdraw_form=None,
+    reassign_form=None,
     generate_form=None,
     revision_form=None,
 ) -> dict:
@@ -228,6 +406,12 @@ def _detail_context(
     )
     inline_versions = _inline_content_versions(task)
     latest_inline_version = inline_versions.first()
+    latest_assignment = task.assignments.order_by("-assignment_number").first()
+    may_reassign = bool(
+        latest_assignment
+        and task.current_state in {Task.State.ASSIGNED, Task.State.IN_PROGRESS}
+        and _can_manage_assignment(user, task)
+    )
     may_edit_content = bool(
         task.current_state == Task.State.IN_PROGRESS
         and task.current_assignee_principal_id == user.pk
@@ -242,6 +426,41 @@ def _detail_context(
             if compilation_context and isinstance(compilation_context.channel_plan.goal, dict)
             else []
         ),
+        "platform_label": (
+            {
+                "TIKTOK": "TikTok",
+                "PINTEREST": "Pinterest",
+                "QUORA": "Quora",
+                "REDDIT": "Reddit",
+                "SHOPIFY": "Shopify",
+                "GOOGLE": "Google",
+                "YOUTUBE": "YouTube",
+            }.get(compilation_context.channel_plan.platform_code, compilation_context.channel_plan.platform_code)
+            if compilation_context
+            else ""
+        ),
+        "environment_label_zh": (
+            "正式环境"
+            if compilation_context
+            and compilation_context.capability_state.account_environment_binding.runtime_environment.environment_type
+            == "PRODUCTION"
+            else "测试环境"
+        ),
+        "environment_label_en": (
+            compilation_context.capability_state.account_environment_binding.runtime_environment.get_environment_type_display()
+            if compilation_context
+            else ""
+        ),
+        "capability_label_zh": (
+            {
+                "OPEN": "可以进行人工发布",
+                "CLOSED": "暂时不能发布",
+                "UNKNOWN": "发布状态尚未确认",
+            }.get(compilation_context.capability_state.state, "发布状态尚未确认")
+            if compilation_context
+            else ""
+        ),
+        "current_turn": _current_task_turn(task, compilation_context),
         "action_kind": action_kind,
         "action_form": action_form,
         "submission": task.submissions.order_by("-submission_number").first(),
@@ -268,6 +487,15 @@ def _detail_context(
             CancelTaskForm(state_version=task.state_version)
             if task.current_state == Task.State.DRAFT
             and _authorization(user, task, PermissionGrant.Action.CANCEL_TASK).allowed
+            else None
+        ),
+        "reassign_form": reassign_form if reassign_form is not None else (
+            AssignmentForm(
+                operators=_eligible_operators(task, user, exclude_current=True),
+                state_version=task.state_version,
+                current_assignment=latest_assignment,
+            )
+            if may_reassign
             else None
         ),
         "withdraw_form": withdraw_form if withdraw_form is not None else (
@@ -420,6 +648,7 @@ def _assign_task(task: Task, user: Principal, grant, form: AssignmentForm) -> No
             acting_role=user.role,
             permission_grant=grant,
             recorded_by_principal=user,
+            expected_current_assignment_id=form.cleaned_data.get("expected_current_assignment_id"),
         )
         Task.transition(
             task_id=task.pk,
@@ -431,6 +660,23 @@ def _assign_task(task: Task, user: Principal, grant, form: AssignmentForm) -> No
             permission_grant=grant,
             recorded_by_principal=user,
         )
+
+
+def _reassign_task(task: Task, user: Principal, grant, form: AssignmentForm) -> None:
+    assignee = form.cleaned_data["assignee"]
+    if not _authorization(assignee, task, PermissionGrant.Action.EDIT).allowed:
+        raise PermissionDenied("ASSIGNEE_NO_LONGER_AUTHORIZED")
+    TaskAssignment.record(
+        task=task,
+        assignee_principal=assignee,
+        command_id=_subcommand_id(form.cleaned_data["command_id"], "reassignment"),
+        expected_task_version=form.cleaned_data["expected_state_version"],
+        assigned_by_principal=user,
+        acting_role=user.role,
+        permission_grant=grant,
+        recorded_by_principal=user,
+        expected_current_assignment_id=form.cleaned_data["expected_current_assignment_id"],
+    )
 
 
 def _start_task(task: Task, user: Principal, grant, form: StartWorkForm) -> None:
@@ -680,7 +926,7 @@ def _deliver_and_submit(task: Task, user: Principal, grant, form: DeliveryDoDFor
 @require_POST
 def task_action(request: HttpRequest, task_id, action: str) -> HttpResponse:
     task = _task_for_user(request.user, task_id)
-    if action == "assign":
+    if action in {"assign", "reassign"}:
         grant = _require_task_action(request.user, task, PermissionGrant.Action.ASSIGN_TASK)
     elif action == "cancel":
         grant = _require_task_action(request.user, task, PermissionGrant.Action.CANCEL_TASK)
@@ -726,13 +972,30 @@ def task_action(request: HttpRequest, task_id, action: str) -> HttpResponse:
         elif action == "assign":
             form = AssignmentForm(
                 request.POST,
-                operators=_eligible_operators(task),
+                operators=_eligible_operators(task, request.user),
                 state_version=task.state_version,
             )
             if not form.is_valid():
                 return render(request, "dashboard/task_detail.html", _detail_context(task, request.user, action_kind=action, action_form=form), status=400)
             _assign_task(task, request.user, grant, form)
             messages.success(request, "任务已明确分配；只有当前负责人可以开始执行。")
+        elif action == "reassign":
+            latest_assignment = task.assignments.order_by("-assignment_number").first()
+            form = AssignmentForm(
+                request.POST,
+                operators=_eligible_operators(task, request.user, exclude_current=True),
+                state_version=task.state_version,
+                current_assignment=latest_assignment,
+            )
+            if not form.is_valid():
+                return render(
+                    request,
+                    "dashboard/task_detail.html",
+                    _detail_context(task, request.user, reassign_form=form),
+                    status=400,
+                )
+            _reassign_task(task, request.user, grant, form)
+            messages.success(request, "执行人已改派；旧分配记录仍保留，新负责人现在可以继续处理。")
         elif action == "start":
             form = StartWorkForm(request.POST, state_version=task.state_version)
             if not form.is_valid():
@@ -817,6 +1080,8 @@ def task_action(request: HttpRequest, task_id, action: str) -> HttpResponse:
                     _detail_context(task, request.user, cancel_form=form),
                     status=400,
                 )
+            if task.current_state != Task.State.DRAFT:
+                raise ValidationError("只有尚未开始的草稿可以删除；进行中的任务请按流程处理。")
             Task.transition(
                 task_id=task.pk,
                 to_state=Task.State.CANCELLED,

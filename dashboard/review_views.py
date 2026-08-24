@@ -20,6 +20,7 @@ from dashboard.review_forms import (
     ReviewDecisionForm,
 )
 from integrations.publishing import PublicationMode, get_publication_runtime
+from intelligence.models import TaskCompilationContext
 from releasegate.models import ChannelAccount, Publication, PublicationEvent, RuntimeEnvironment
 from releasegate.publishing import (
     dispatch_confirmed_publication,
@@ -86,17 +87,52 @@ def _publish_decision(user: Principal, task: Task, account: ChannelAccount):
 
 
 def _allowed_accounts(user: Principal, task: Task):
+    candidates = ChannelAccount.objects.filter(status=ChannelAccount.Status.ACTIVE)
+    compilation_context = (
+        TaskCompilationContext.objects.select_related("channel_plan__channel_account")
+        .filter(task=task)
+        .first()
+    )
+    if compilation_context is not None:
+        # A compiled Daily Operations task is sealed to one exact account.
+        # A PUBLISH grant for another account must never make this task appear
+        # in the queue or let the user choose a different destination.
+        candidates = candidates.filter(
+            pk=compilation_context.channel_plan.channel_account_id
+        )
     account_ids = [
         account.pk
-        for account in ChannelAccount.objects.filter(status=ChannelAccount.Status.ACTIVE).order_by(
-            "platform_code", "account_code"
-        )
+        for account in candidates.order_by("platform_code", "account_code")
         if _publish_decision(user, task, account).allowed
     ]
     return ChannelAccount.objects.filter(pk__in=account_ids).order_by("platform_code", "account_code")
 
 
-def _allowed_environments(accounts):
+def _allowed_environments(accounts, *, task: Task | None = None):
+    if task is not None:
+        compilation_context = (
+            TaskCompilationContext.objects.select_related(
+                "channel_plan__channel_account",
+                "capability_state__account_environment_binding__runtime_environment",
+            )
+            .filter(task=task)
+            .first()
+        )
+        if compilation_context is not None:
+            exact_account_id = compilation_context.channel_plan.channel_account_id
+            if not exact_account_id or not accounts.filter(pk=exact_account_id).exists():
+                return RuntimeEnvironment.objects.none()
+            exact_environment_id = (
+                compilation_context.capability_state.account_environment_binding.runtime_environment_id
+            )
+            # A compiled Daily Operations task is sealed to the exact account
+            # *and* environment represented by its capability snapshot.  A
+            # second active binding must never make production/staging
+            # interchangeable in the release form.
+            return RuntimeEnvironment.objects.filter(
+                pk=exact_environment_id,
+                status=RuntimeEnvironment.Status.ACTIVE,
+            )
     return RuntimeEnvironment.objects.filter(
         status=RuntimeEnvironment.Status.ACTIVE,
         account_bindings__channel_account__in=accounts,
@@ -223,7 +259,7 @@ def _review_context(task: Task, *, form=None):
 def _release_context(task: Task, user: Principal, *, gate_form=None, proof_form=None, done_form=None):
     submission = _latest_submission(task)
     accounts = _allowed_accounts(user, task)
-    environments = _allowed_environments(accounts)
+    environments = _allowed_environments(accounts, task=task)
     publications = submission.publications.select_related(
         "current_gate__channel_account",
         "current_gate__runtime_environment",
@@ -446,7 +482,7 @@ def release_gate_action(request: HttpRequest, task_id) -> HttpResponse:
         current_state=Task.State.APPROVED,
     )
     accounts = _allowed_accounts(request.user, task)
-    environments = _allowed_environments(accounts)
+    environments = _allowed_environments(accounts, task=task)
     form = ReleaseGateForm(
         request.POST,
         accounts=accounts,

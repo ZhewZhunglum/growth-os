@@ -43,6 +43,30 @@ FORM_TEXT = {
     "submission_note": ("交付说明", "Delivery note"),
 }
 
+
+PLAIN_CRITERION_LABELS = {
+    "inputs_complete": (
+        "开始前需要的资料、目标和账号都已准备好",
+        "The information, goal, and account needed to start are ready",
+    ),
+    "primary_deliverable": (
+        "已经完成一份可以直接送审的完整内容",
+        "A complete version is ready to send for review",
+    ),
+    "primary-deliverable": (
+        "已经完成一份可以直接送审的完整内容",
+        "A complete version is ready to send for review",
+    ),
+    "exact_release_context": (
+        "发布前重新核对账号、环境、权限和规则",
+        "Recheck the account, environment, permission, and rules before publishing",
+    ),
+    "exact-release-context": (
+        "发布前重新核对账号、环境、权限和规则",
+        "Recheck the account, environment, permission, and rules before publishing",
+    ),
+}
+
 FORM_HELP = {
     "description": (
         "请用自然语言说明背景和目标；具体 DoR/DoD 来自所选合同。",
@@ -191,6 +215,10 @@ class TaskCreateForm(forms.Form):
 
 
 def criterion_label(criterion: dict, fallback: str) -> str:
+    key = criterion.get("key", "")
+    if key in PLAIN_CRITERION_LABELS and not criterion.get("label") and not criterion.get("description"):
+        labels = PLAIN_CRITERION_LABELS[key]
+        return labels[1] if _is_english() else labels[0]
     return (
         criterion.get("label")
         or criterion.get("description")
@@ -247,13 +275,19 @@ class DoRForm(CriteriaCommandForm):
 
 
 class AssignmentForm(CommandForm):
+    expected_current_assignment_id = forms.UUIDField(required=False, widget=forms.HiddenInput)
     assignee = forms.ModelChoiceField(
         queryset=Principal.objects.none(),
         label="分配给哪位执行负责人",
         empty_label="请选择一位可执行人员",
     )
 
-    def __init__(self, *args, operators, state_version: int, **kwargs):
+    def __init__(self, *args, operators, state_version: int, current_assignment=None, **kwargs):
+        initial = kwargs.setdefault("initial", {})
+        initial.setdefault(
+            "expected_current_assignment_id",
+            getattr(current_assignment, "pk", None),
+        )
         super().__init__(*args, state_version=state_version, **kwargs)
         self.fields["assignee"].queryset = operators
         if _is_english():

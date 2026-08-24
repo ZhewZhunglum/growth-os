@@ -12,7 +12,7 @@
     <span class="status-pill"><span></span>{{ staff_rows|length }} {% ui '个可管理员工' 'manageable staff' %}</span>
 </section>
 
-<section class="team-list" aria-label="员工列表">
+<section class="team-list" aria-label="{% ui '员工列表' 'Staff list' %}">
     {% for member, active_count in staff_rows %}
     <article class="team-card">
         <span class="avatar team-avatar">{{ member.username|slice:":1"|upper }}</span>

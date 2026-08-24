@@ -71,6 +71,15 @@ class ContentOpsInvariantTests(TestCase):
             valid_until=now + timedelta(hours=1),
             granted_by_principal=self.owner,
         )
+        self.owner_assign_grant = PermissionGrant.objects.create(
+            principal=self.owner,
+            scope_kind=PermissionGrant.ScopeKind.PRODUCT,
+            product=self.product,
+            action=PermissionGrant.Action.ASSIGN_TASK,
+            valid_from=now - timedelta(minutes=1),
+            valid_until=now + timedelta(hours=1),
+            granted_by_principal=self.owner,
+        )
         self.review_grant = PermissionGrant.objects.create(
             principal=self.reviewer,
             scope_kind=PermissionGrant.ScopeKind.PRODUCT,
@@ -136,8 +145,8 @@ class ContentOpsInvariantTests(TestCase):
             self.task.refresh_from_db()
             TaskAssignment.record(
                 task=self.task, assignee_principal=self.operator, command_id=uuid7(),
-                expected_task_version=1, assigned_by_principal=self.operator, acting_role="OPERATOR",
-                permission_grant=self.assign_grant, recorded_by_principal=self.recorder,
+                expected_task_version=1, assigned_by_principal=self.owner, acting_role="OWNER",
+                permission_grant=self.owner_assign_grant, recorded_by_principal=self.recorder,
             )
             Task.transition(
                 task_id=self.task.pk, to_state=Task.State.ASSIGNED, command_id=uuid7(),
@@ -683,6 +692,124 @@ class ContentOpsInvariantTests(TestCase):
                 review=review2,
             )
         self.assertEqual(TaskSubmission.objects.count(), 2)
+
+    def test_owner_submitter_with_review_grant_is_still_rejected_from_self_review(self):
+        """Owner rank never overrides the exact submitter/reviewer separation."""
+
+        now = timezone.now()
+        owner_edit_grant = PermissionGrant.objects.create(
+            principal=self.owner,
+            scope_kind=PermissionGrant.ScopeKind.PRODUCT,
+            product=self.product,
+            action=PermissionGrant.Action.EDIT,
+            valid_from=now - timedelta(minutes=1),
+            valid_until=now + timedelta(hours=1),
+            granted_by_principal=self.owner,
+        )
+        owner_review_grant = PermissionGrant.objects.create(
+            principal=self.owner,
+            scope_kind=PermissionGrant.ScopeKind.PRODUCT,
+            product=self.product,
+            action=PermissionGrant.Action.REVIEW,
+            valid_from=now - timedelta(minutes=1),
+            valid_until=now + timedelta(hours=1),
+            granted_by_principal=self.owner,
+        )
+
+        # Fixture-only projection adjustment: the test is about self-review,
+        # so make Owner the exact current assignee before creating any facts.
+        type(self.task).objects.filter(pk=self.task.pk).update(
+            current_assignee_principal=self.owner,
+            updated_by_principal=self.owner,
+        )
+        self.task.refresh_from_db()
+
+        asset = ContentAsset.create_idempotent(
+            task=self.task,
+            asset_key="owner-authored-copy",
+            title="Owner-authored primary copy",
+            asset_kind=ContentAsset.AssetKind.COPY,
+            command_id=uuid7(),
+            actor_principal=self.owner,
+            acting_role=ActingRole.OWNER,
+            permission_grant=owner_edit_grant,
+            recorded_by_principal=self.recorder,
+        )
+        content = b"immutable owner-authored content"
+        version = ContentAssetVersion.create_next(
+            content_asset=asset,
+            object_key=f"https://drafts.example.com/tasks/{self.task.pk}/owner-v1",
+            mime_type="text/plain",
+            byte_size=len(content),
+            content_sha256=hashlib.sha256(content).hexdigest(),
+            metadata={"source": "owner-self-review-negative"},
+            command_id=uuid7(),
+            actor_principal=self.owner,
+            acting_role=ActingRole.OWNER,
+            permission_grant=owner_edit_grant,
+            recorded_by_principal=self.recorder,
+        )
+        TaskCheckRun = apps.get_model("workflow", "TaskCheckRun")
+        dod = TaskCheckRun.record_completed(
+            task=self.task,
+            check_kind=TaskCheckRun.Kind.DOD,
+            results=[
+                {
+                    "criterion_key": "primary-deliverable",
+                    "result": "PASS",
+                    "evidence": {"exact": True},
+                },
+                {
+                    "criterion_key": "claims-check",
+                    "result": "PASS",
+                    "evidence": {"checked": True},
+                },
+            ],
+            command_id=uuid7(),
+            evaluator_principal=self.owner,
+            acting_role=ActingRole.OWNER,
+            permission_grant=owner_edit_grant,
+            recorded_by_principal=self.recorder,
+        )
+        submission = TaskSubmission.seal(
+            task=self.task,
+            dod_check_run=dod,
+            primary_asset_version=version,
+            command_id=uuid7(),
+            expected_task_version=self.task.state_version,
+            actor_principal=self.owner,
+            acting_role=ActingRole.OWNER,
+            permission_grant=owner_edit_grant,
+            recorded_by_principal=self.recorder,
+        )
+
+        Task = apps.get_model("workflow", "Task")
+        for next_state in (Task.State.SUBMITTED, Task.State.UNDER_REVIEW):
+            Task.transition(
+                task_id=self.task.pk,
+                to_state=next_state,
+                command_id=uuid7(),
+                expected_state_version=self.task.state_version,
+                actor_principal=self.owner,
+                acting_role=ActingRole.OWNER,
+                permission_grant=owner_edit_grant,
+                recorded_by_principal=self.recorder,
+            )
+            self.task.refresh_from_db()
+
+        with self.assertRaisesMessage(ValidationError, "cannot review their own"):
+            ReviewDecision.record_final(
+                submission=submission,
+                decision=ReviewDecision.Decision.APPROVED,
+                rationale="Owner authority cannot override self-review separation.",
+                command_id=uuid7(),
+                expected_task_version=self.task.state_version,
+                reviewer_principal=self.owner,
+                acting_role=ActingRole.OWNER,
+                permission_grant=owner_review_grant,
+                recorded_by_principal=self.recorder,
+            )
+        self.assertFalse(ReviewDecision.objects.filter(submission=submission).exists())
 
     def test_self_review_is_rejected_and_record_final_is_the_only_orm_write_path(self):
         asset = self._asset()

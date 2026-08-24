@@ -6,6 +6,7 @@ from decimal import Decimal
 from unittest.mock import patch
 
 from django.core.exceptions import ValidationError
+from django.db import transaction
 from django.test import TestCase
 from django.utils import timezone
 
@@ -71,11 +72,17 @@ from integrations.connectors.types import (
     Platform,
 )
 from integrations.ai.providers import FakeAIProvider
-from integrations.publishing import PublicationDispatchStatus, PublicationMode
+from integrations.publishing import (
+    PublicationDispatchStatus,
+    PublicationMode,
+    PublicationRuntime,
+    PublicationRuntimeConfig,
+)
 from intelligence.models import (
     ChannelPlan,
     CollectionRun,
     EvidenceArtifactLink,
+    EvidenceInvalidationEvent,
     ExternalEvidenceItem,
     Initiative,
     ProductOpportunity,
@@ -171,6 +178,21 @@ class _OfflineSevenPlatformRunner:
                     reason="Offline integration fixture has no paired browser worker.",
                 )
         return ConnectorBatchResult(results)
+
+
+class _FailIfCalledPublicationTransport:
+    """Prove a stale evidence manifest blocks before any external dispatch."""
+
+    def __init__(self):
+        self.calls = []
+
+    def dispatch(self, request):
+        self.calls.append(request)
+        raise AssertionError("Publication transport must not run for invalidated evidence.")
+
+
+class _RollbackEvidenceInvalidationProbe(Exception):
+    """Rollback a test-only invalidation so the happy-path fixture can continue."""
 
 
 class FullDailyOperationsVerticalFlowTests(TestCase):
@@ -940,6 +962,44 @@ class FullDailyOperationsVerticalFlowTests(TestCase):
             reason="Exact final human review accepted.",
         )
 
+        alternate_environment = RuntimeEnvironment.objects.create(
+            environment_code="vertical-production-like",
+            environment_type=RuntimeEnvironment.EnvironmentType.PRODUCTION,
+            identity_namespace="vertical-other-identity",
+            database_namespace="vertical-other-database",
+            object_storage_namespace="link-only-other",
+            created_by_principal=self.owner,
+            updated_by_principal=self.owner,
+        )
+        alternate_binding = AccountEnvironmentBinding.objects.create(
+            channel_account=self.account,
+            runtime_environment=alternate_environment,
+            binding_version=2,
+            identity_reference="vertical-other-session",
+            valid_from=self.now - timedelta(minutes=5),
+            created_by_principal=self.owner,
+            recorded_by_principal=self.owner,
+        )
+        CapabilityState.objects.create(
+            account_environment_binding=alternate_binding,
+            capability_code=CapabilityState.MANUAL_PUBLISH,
+            state_version=1,
+            state=CapabilityState.State.OPEN,
+            effective_from=self.now - timedelta(minutes=5),
+            created_by_principal=self.owner,
+            recorded_by_principal=self.owner,
+        )
+        with self.assertRaisesMessage(ValidationError, "exact environment"):
+            orchestrate_v1_release_gate(
+                task=task,
+                submission=submission,
+                publisher_principal=self.publisher,
+                channel_account=self.account,
+                runtime_environment=alternate_environment,
+                command_id=uuid.uuid4(),
+            )
+        self.assertFalse(Publication.objects.filter(submission=submission).exists())
+
         gate_result = orchestrate_v1_release_gate(
             task=task,
             submission=submission,
@@ -951,6 +1011,65 @@ class FullDailyOperationsVerticalFlowTests(TestCase):
         self.assertEqual(gate_result.gate.outcome, ReleaseGateRecord.Outcome.PASSED)
         publication = gate_result.publication
         self.assertEqual(publication.status, Publication.Status.READY_FOR_MANUAL_PUBLISH)
+
+        # Negative: this is a real PASSED gate followed by a real immutable
+        # invalidation event. Final API publication must detect that the exact
+        # inline evidence manifest is stale before calling any transport or
+        # appending any PublicationEvent. The outer savepoint is rolled back
+        # afterwards only so this one vertical-flow test can continue through
+        # its independent successful manual-publication path.
+        api_confirmation = prepare_human_publication_confirmation(
+            publication=publication,
+            publisher_principal=self.publisher,
+            mode=PublicationMode.API,
+            confirmation_id=uuid.uuid4(),
+            confirmed=True,
+        )
+        transport = _FailIfCalledPublicationTransport()
+        runtime = PublicationRuntime(
+            PublicationRuntimeConfig(
+                transports={(Platform.TIKTOK, PublicationMode.API): transport}
+            )
+        )
+        events_before_invalidation = PublicationEvent.objects.filter(
+            publication=publication
+        ).count()
+        try:
+            with transaction.atomic():
+                invalidation = invalidate_evidence(
+                    evidence_id=evidence_item.pk,
+                    product=self.product,
+                    batch_key=batch_key,
+                    command_id=uuid.uuid4(),
+                    reason="Rollback-scoped final dispatch freshness probe.",
+                    principal=self.owner,
+                    acting_role=self.owner.role,
+                )
+                self.assertTrue(invalidation.created)
+                self.assertTrue(
+                    EvidenceInvalidationEvent.objects.filter(
+                        evidence_item=evidence_item
+                    ).exists()
+                )
+                with self.assertRaisesMessage(ValidationError, "外部需求证据"):
+                    dispatch_confirmed_publication(
+                        publication=publication,
+                        publisher_principal=self.publisher,
+                        confirmation=api_confirmation,
+                        command_id=uuid.uuid4(),
+                        runtime=runtime,
+                    )
+                self.assertEqual(transport.calls, [])
+                self.assertEqual(
+                    PublicationEvent.objects.filter(publication=publication).count(),
+                    events_before_invalidation,
+                )
+                raise _RollbackEvidenceInvalidationProbe
+        except _RollbackEvidenceInvalidationProbe:
+            pass
+        self.assertFalse(
+            EvidenceInvalidationEvent.objects.filter(evidence_item=evidence_item).exists()
+        )
 
         # Negative: a gate alone is not consent to publish. An unchecked human
         # confirmation creates no publication proof.

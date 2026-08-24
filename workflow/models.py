@@ -649,11 +649,43 @@ class TaskAssignment(AppendOnlyFact):
         settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="task_assignments_recorded"
     )
     assigned_at = models.DateTimeField()
+    supersedes_assignment = models.OneToOneField(
+        "self",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="superseded_by_assignment",
+    )
 
     class Meta:
         constraints = [
-            models.UniqueConstraint(fields=["task", "assignment_number"], name="workflow_unique_assignment_number")
+            models.UniqueConstraint(fields=["task", "assignment_number"], name="workflow_unique_assignment_number"),
+            models.CheckConstraint(
+                condition=(
+                    Q(assignment_number=1, supersedes_assignment__isnull=True)
+                    | Q(assignment_number__gt=1, supersedes_assignment__isnull=False)
+                ),
+                name="workflow_assignment_supersession_shape",
+            ),
         ]
+
+    def clean(self):
+        super().clean()
+        if self.assignment_number == 1 and self.supersedes_assignment_id:
+            raise ValidationError(
+                {"supersedes_assignment": "The first assignment cannot supersede another assignment."}
+            )
+        if self.assignment_number > 1 and not self.supersedes_assignment_id:
+            raise ValidationError(
+                {"supersedes_assignment": "A reassignment must link to the immediately previous assignment."}
+            )
+        if self.supersedes_assignment_id and (
+            self.supersedes_assignment.task_id != self.task_id
+            or self.supersedes_assignment.assignment_number != self.assignment_number - 1
+        ):
+            raise ValidationError(
+                {"supersedes_assignment": "A reassignment must supersede the immediately older assignment for the same task."}
+            )
 
     @classmethod
     def record(
@@ -667,11 +699,18 @@ class TaskAssignment(AppendOnlyFact):
         acting_role: str,
         permission_grant,
         recorded_by_principal,
+        expected_current_assignment_id=None,
     ) -> TaskAssignment:
         payload = {
             "task_id": str(task.pk),
             "assignee_principal_id": str(assignee_principal.pk),
             "expected_task_version": expected_task_version,
+            "expected_current_assignment_id": (
+                str(expected_current_assignment_id) if expected_current_assignment_id else ""
+            ),
+            "assigned_by_principal_id": str(getattr(assigned_by_principal, "pk", "")),
+            "acting_role": acting_role,
+            "permission_grant_id": str(getattr(permission_grant, "pk", "")),
         }
         digest = payload_sha256(payload)
         existing = cls.objects.filter(command_id=command_id).first()
@@ -682,23 +721,74 @@ class TaskAssignment(AppendOnlyFact):
 
         with transaction.atomic():
             locked_task = Task.objects.select_for_update().get(pk=task.pk)
+            existing = cls.objects.filter(command_id=command_id).first()
+            if existing:
+                if existing.payload_hash != digest:
+                    raise CommandReplayConflict("command_id was already used for a different assignment.")
+                return existing
             if locked_task.state_version != expected_task_version:
                 raise OptimisticConcurrencyConflict("Task version is stale; reread before assigning.")
-            if locked_task.current_state != Task.State.READY:
-                raise IllegalTaskTransition("V1 only allows the first assignment while a task is READY.")
+
+            from accounts.authorization import resolve_authorization
+            from accounts.models import PermissionGrant, Principal
+
+            persisted_assigner = Principal.objects.filter(pk=getattr(assigned_by_principal, "pk", None)).first()
+            if (
+                persisted_assigner is None
+                or persisted_assigner.principal_type != Principal.PrincipalType.HUMAN_USER
+                or not persisted_assigner.can_authenticate
+                or persisted_assigner.role != acting_role
+            ):
+                raise PermissionDenied("ACTIVE_ASSIGNMENT_MANAGER_REQUIRED")
+            if persisted_assigner.role not in {
+                Principal.Role.OWNER,
+                Principal.Role.OPERATIONS_ADMIN,
+            }:
+                raise PermissionDenied("ONLY_OWNER_OR_ADMIN_CAN_ASSIGN")
+            # Lock the exact authority row after the Task.  Grant revocation
+            # uses the same row lock, so either revocation wins and this
+            # command fails closed, or this audited assignment commits first.
+            permission_grant = PermissionGrant.objects.select_for_update().get(
+                pk=getattr(permission_grant, "pk", None)
+            )
             validate_current_grant(
                 permission_grant,
-                principal=assigned_by_principal,
+                principal=persisted_assigner,
                 acting_role=acting_role,
                 action="ASSIGN_TASK",
                 product_id=locked_task.product_id,
             )
             latest = cls.objects.filter(task=locked_task).order_by("-assignment_number").first()
-            if latest is not None or locked_task.current_assignee_principal_id is not None:
-                raise CheckGateRejected("V1 does not allow reassignment; cancel and create a new task instead.")
 
-            from accounts.authorization import resolve_authorization
-            from accounts.models import Principal
+            is_initial_assignment = locked_task.current_state == Task.State.READY
+            is_reassignment = locked_task.current_state in {
+                Task.State.ASSIGNED,
+                Task.State.IN_PROGRESS,
+            }
+            if not is_initial_assignment and not is_reassignment:
+                raise IllegalTaskTransition(
+                    "Assignments may change only before submission; an item under review cannot be reassigned."
+                )
+            if locked_task.submissions.exists():
+                raise IllegalTaskTransition("A task with a sealed submission cannot be reassigned.")
+            if is_initial_assignment:
+                if latest is not None or locked_task.current_assignee_principal_id is not None:
+                    raise CheckGateRejected("The READY task already has an assignment record.")
+                if expected_current_assignment_id is not None:
+                    raise OptimisticConcurrencyConflict("The expected assignment is stale; refresh and retry.")
+            else:
+                if latest is None or locked_task.current_assignee_principal_id is None:
+                    raise CheckGateRejected("The task has no current assignment to replace.")
+                if latest.pk != expected_current_assignment_id:
+                    raise OptimisticConcurrencyConflict("The current assignee changed; refresh and retry.")
+                if latest.assignee_principal_id != locked_task.current_assignee_principal_id:
+                    raise CheckGateRejected("The assignment projection is inconsistent; reassignment was stopped.")
+                if persisted_assigner.role == Principal.Role.OPERATIONS_ADMIN:
+                    current_assignee = Principal.objects.filter(
+                        pk=locked_task.current_assignee_principal_id
+                    ).first()
+                    if current_assignee is None or current_assignee.role != Principal.Role.OPERATOR:
+                        raise PermissionDenied("ADMIN_MAY_REASSIGN_ONLY_OPERATOR_WORK")
 
             persisted_assignee = type(assignee_principal).objects.filter(
                 pk=assignee_principal.pk
@@ -709,6 +799,13 @@ class TaskAssignment(AppendOnlyFact):
                 or not persisted_assignee.can_authenticate
             ):
                 raise ValidationError("The assignee must be an active human Principal.")
+            if (
+                persisted_assigner.role == Principal.Role.OPERATIONS_ADMIN
+                and persisted_assignee.role != Principal.Role.OPERATOR
+            ):
+                raise PermissionDenied("ADMIN_MAY_ASSIGN_ONLY_OPERATORS")
+            if is_reassignment and persisted_assignee.pk == locked_task.current_assignee_principal_id:
+                raise ValidationError("The selected person is already the current assignee.")
             assignee_decision = resolve_authorization(
                 principal=persisted_assignee,
                 acting_role=persisted_assignee.role,
@@ -724,7 +821,7 @@ class TaskAssignment(AppendOnlyFact):
             assignment = cls.objects.create(
                 task=locked_task,
                 assignee_principal=persisted_assignee,
-                assignment_number=1,
+                assignment_number=(latest.assignment_number + 1 if latest else 1),
                 command_id=command_id,
                 payload_hash=digest,
                 expected_task_version=expected_task_version,
@@ -733,6 +830,7 @@ class TaskAssignment(AppendOnlyFact):
                 permission_grant=permission_grant,
                 recorded_by_principal=recorded_by_principal,
                 assigned_at=timezone.now(),
+                supersedes_assignment=latest,
             )
             Task.objects.filter(pk=locked_task.pk).update(
                 current_assignee_principal=persisted_assignee,

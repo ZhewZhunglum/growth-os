@@ -27,6 +27,43 @@
   </aside>
   {% endif %}
 
+  <section class="daily-recommendations" aria-labelledby="daily-recommendations-title">
+    <header class="daily-section-title">
+      <div>
+        <p class="eyebrow">{% ui '数据优先' 'Data first' %}</p>
+        <h2 id="daily-recommendations-title">{% ui '系统建议先研究什么' 'What the system suggests researching first' %}</h2>
+      </div>
+    </header>
+    {% if data_recommendations %}
+    <div class="task-list">
+      {% for recommendation in data_recommendations %}
+      <article class="task-card daily-recommendation-card">
+        <div>
+          <p class="task-meta">{{ recommendation.product.name }} · {% ui '已确认的外部需求' 'Confirmed external demand' %}</p>
+          <h3>{{ recommendation.opportunity.title }}</h3>
+          <p>{{ recommendation.opportunity.recommendation|truncatechars:220 }}</p>
+          <small>{% ui '需求分数' 'Demand score' %} {{ recommendation.opportunity.demand_assessment.demand_score }} · {% ui '优先级' 'Priority' %} {{ recommendation.opportunity.priority_score }}</small>
+        </div>
+        <button
+          class="button button-secondary daily-use-recommendation"
+          type="button"
+          data-product="{{ recommendation.product.id }}"
+          data-query="{{ recommendation.query|escape }}"
+        >{% ui '按这个建议开始研究' 'Research this suggestion' %}</button>
+      </article>
+      {% endfor %}
+    </div>
+    {% else %}
+    <article class="empty-state daily-empty-state">
+      <span class="empty-number">0</span>
+      <div>
+        <h3>{% ui '目前没有可直接采用的数据建议' 'No ready data suggestion yet' %}</h3>
+        <p>{% ui '系统只推荐已确认、仍有效的外部需求和机会。现在请在下方手动填写今天的问题。' 'Only confirmed, still-valid external demand and opportunities are suggested. Enter today’s question manually below.' %}</p>
+      </div>
+    </article>
+    {% endif %}
+  </section>
+
   <section class="daily-start-card" aria-labelledby="daily-start-title">
     <div class="daily-start-copy">
       <span class="daily-step-number">1</span>
@@ -57,7 +94,7 @@
           {{ form.window_end }}{{ form.window_end.errors }}
         </label>
       </div>
-      <button class="button button-primary daily-primary-action" type="submit"{% if configured_source_count < expected_source_count %} disabled aria-disabled="true"{% endif %}>
+      <button class="button button-primary daily-primary-action" type="submit"{% if configured_source_count < expected_source_count or not can_start_batch %} disabled aria-disabled="true"{% endif %}>
         {% ui '开始收集线索' 'Start collecting signals' %}
       </button>
     </form>
@@ -74,7 +111,36 @@
           <p class="task-meta">{{ batch.product.name }} · {{ batch.created_at|date:"Y-m-d H:i" }}</p>
           <h3>{{ batch.query|default_if_none:""|default:"—" }}</h3>
         </div>
-        <a class="button button-primary" href="{% url 'dailyops:batch-detail' batch.product.id batch.batch_key %}">{% ui '继续下一步' 'Continue' %}</a>
+        <div class="daily-recent-actions">
+          <a class="button button-primary" href="{% url 'dailyops:batch-detail' batch.product.id batch.batch_key %}">{% ui '继续下一步' 'Continue' %}</a>
+          {% if batch.can_dispose %}<details class="daily-disposition-control">
+            <summary class="daily-text-button">
+              {% if batch.has_formal_execution %}{% ui '从最近工作隐藏（任务保留）' 'Hide from Recent work (tasks remain)' %}{% else %}{% ui '删除这次草稿' 'Remove this draft' %}{% endif %}
+            </summary>
+            <form method="post" action="{% url 'dailyops:batch-dispose' batch.product.id batch.batch_key %}" data-disposition-form>
+              {% csrf_token %}
+              <input type="hidden" name="command_id" value="{{ batch.disposition_command_id }}">
+              <p>
+                {% if batch.has_formal_execution %}
+                  {% ui '已有正式项目、计划或任务：这里只会把本轮从最近工作隐藏，所有任务和审计记录都会保留。' 'Formal project, plan, or task facts already exist. This only hides the run from Recent work; all tasks and audit records remain.' %}
+                {% else %}
+                  {% ui '这里只会从最近工作隐藏这次草稿；采集记录与审计历史不会删除。' 'This only hides the draft from Recent work; collection and audit history are not deleted.' %}
+                {% endif %}
+              </p>
+              <label>
+                <span>{% ui '原因' 'Reason' %}</span>
+                <textarea name="reason" rows="2" required placeholder="{% ui '例如：问题选错了，重新开始' 'For example: wrong question; start again' %}"></textarea>
+              </label>
+              <label class="daily-confirm-line">
+                <input type="checkbox" name="confirm" value="on" required>
+                <span>{% ui '我确认隐藏；历史仍保留' 'I confirm hiding it; history remains' %}</span>
+              </label>
+              <button class="button button-secondary" type="submit">
+                {% if batch.has_formal_execution %}{% ui '确认隐藏，任务保留' 'Confirm hiding; keep tasks' %}{% else %}{% ui '确认删除草稿' 'Confirm removal' %}{% endif %}
+              </button>
+            </form>
+          </details>{% endif %}
+        </div>
       </article>
     {% empty %}
       <article class="empty-state daily-empty-state">
@@ -88,9 +154,26 @@
 <script>
 (() => {
   const query = document.getElementById('id_query');
+  const product = document.getElementById('id_product');
   if (query) query.placeholder = document.documentElement.lang.startsWith('en')
     ? 'For example: How can I stay focused in the afternoon?'
     : '例如：下午注意力不集中怎么办';
+  document.querySelectorAll('.daily-use-recommendation').forEach((button) => {
+    button.addEventListener('click', () => {
+      if (product) product.value = button.dataset.product || '';
+      if (query) query.value = button.dataset.query || '';
+      document.getElementById('daily-start-title')?.scrollIntoView({behavior: 'smooth'});
+      query?.focus();
+    });
+  });
+  document.querySelectorAll('[data-disposition-form]').forEach((form) => {
+    form.addEventListener('submit', (event) => {
+      const prompt = document.documentElement.lang.startsWith('en')
+        ? 'Hide this run from Recent work? Its audit history will remain.'
+        : '确认从“最近的工作”隐藏这次记录吗？审计历史仍会保留。';
+      if (!window.confirm(prompt)) event.preventDefault();
+    });
+  });
 })();
 </script>
 {% endblock %}

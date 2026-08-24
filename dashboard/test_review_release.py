@@ -796,6 +796,31 @@ class ReviewReleaseUISliceTests(TestCase):
         self.assertNotContains(outsider_after, "等我审核")
         self.assertNotContains(outsider_after, "等我发布")
 
+    def test_owner_admin_and_operator_each_see_publish_work_with_their_own_exact_grant(self):
+        now = timezone.now()
+        for principal in (self.owner, self.reviewer):
+            PermissionGrant.objects.create(
+                principal=principal,
+                scope_kind=PermissionGrant.ScopeKind.ACCOUNT,
+                account_ref=self.channel.account_code,
+                action=PermissionGrant.Action.PUBLISH,
+                effect=PermissionGrant.Effect.ALLOW,
+                valid_from=now - timedelta(minutes=1),
+                valid_until=now + timedelta(hours=1),
+                granted_by_principal=self.owner,
+            )
+        self._approve()
+
+        for principal in (self.owner, self.reviewer, self.publisher):
+            with self.subTest(role=principal.role):
+                self.client.force_login(principal)
+                today = self.client.get(reverse("dashboard:home"))
+                self.assertEqual(today.context["pending_publish_count"], 1)
+                self.assertContains(today, "等我发布")
+                self.assertContains(today, 'class="notification-badge">1</span>')
+                queue = self.client.get(reverse("dashboard:release-queue"))
+                self.assertContains(queue, self.task.title)
+
     def test_review_requires_independent_edit_grant_and_changes_path_is_explicit(self):
         review_only = Principal.objects.create_user(
             username="review-only", password="test-only", role=Principal.Role.OPERATIONS_ADMIN
