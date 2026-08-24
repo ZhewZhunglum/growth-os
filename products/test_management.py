@@ -254,7 +254,7 @@ class BootstrapDogfoodTests(TestCase):
         self.assertEqual(admin.role, Principal.Role.OPERATIONS_ADMIN)
         self.assertEqual(evaluator.principal_type, Principal.PrincipalType.SERVICE_ACCOUNT)
         self.assertEqual(Principal.objects.count(), 4)
-        self.assertEqual(PermissionGrant.objects.count(), 52)
+        self.assertEqual(PermissionGrant.objects.count(), 54)
         self.assertFalse(Principal.objects.filter(username__in=["reviewer", "publisher"]).exists())
         self.assertTrue(PermissionGrant.objects.filter(
             principal=operator, action=PermissionGrant.Action.EDIT,
@@ -268,12 +268,17 @@ class BootstrapDogfoodTests(TestCase):
             principal=owner, action=PermissionGrant.Action.REVIEW,
             scope_kind=PermissionGrant.ScopeKind.PRODUCT, product=product,
         ).exists())
-        self.assertTrue(PermissionGrant.objects.filter(
-            principal=operator, action=PermissionGrant.Action.PUBLISH,
-            scope_kind=PermissionGrant.ScopeKind.ACCOUNT, account_ref="puko-us",
-            product__isnull=True,
-            risk_level=PermissionGrant.RiskLevel.HIGH,
-        ).exists())
+        for principal in (owner, admin, operator):
+            grant = PermissionGrant.objects.get(
+                principal=principal,
+                action=PermissionGrant.Action.PUBLISH,
+                scope_kind=PermissionGrant.ScopeKind.ACCOUNT,
+                account_ref="puko-us",
+                product__isnull=True,
+            )
+            self.assertEqual(grant.risk_level, PermissionGrant.RiskLevel.HIGH)
+            self.assertEqual(grant.granted_by_principal, owner)
+            self.assertIsNotNone(grant.valid_until)
         self.assertSetEqual(
             set(
                 PermissionGrant.objects.filter(
@@ -307,10 +312,6 @@ class BootstrapDogfoodTests(TestCase):
                 PermissionGrant.Action.COLLECT_READ_ONLY,
             },
         )
-        self.assertFalse(PermissionGrant.objects.filter(
-            principal__in=[owner, admin],
-            action=PermissionGrant.Action.PUBLISH,
-        ).exists())
         self.assertTrue(PermissionGrant.objects.filter(
             principal=evaluator, action=PermissionGrant.Action.REVIEW,
             scope_kind=PermissionGrant.ScopeKind.PRODUCT, product=product,
@@ -331,7 +332,7 @@ class BootstrapDogfoodTests(TestCase):
             call_command("bootstrap_dogfood", full_demo=True, stdout=self.stdout)
 
         self.assertEqual(Principal.objects.count(), 4)
-        self.assertEqual(PermissionGrant.objects.count(), 52)
+        self.assertEqual(PermissionGrant.objects.count(), 54)
 
     def test_full_demo_accepts_legacy_reviewer_password_env_for_new_admin(self):
         self._owner()
@@ -434,6 +435,18 @@ class BootstrapDogfoodTests(TestCase):
             account_ref="puko-us",
             risk_level=PermissionGrant.RiskLevel.HIGH,
         ).exists())
+        self.assertSetEqual(
+            set(
+                PermissionGrant.objects.filter(
+                    principal__username__in=["owner", "admin", "operator"],
+                    action=PermissionGrant.Action.PUBLISH,
+                    scope_kind=PermissionGrant.ScopeKind.ACCOUNT,
+                    account_ref="puko-us",
+                    risk_level=PermissionGrant.RiskLevel.HIGH,
+                ).values_list("principal__username", flat=True)
+            ),
+            {"owner", "admin", "operator"},
+        )
 
     def test_new_human_password_values_must_be_distinct(self):
         self._owner()

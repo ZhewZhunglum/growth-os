@@ -6,6 +6,7 @@ import re
 import uuid
 from collections.abc import Iterable
 from typing import Any
+from urllib.parse import urlsplit
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
@@ -208,9 +209,27 @@ class ContentAsset(AppendOnlyFact):
 
 
 class ContentAssetVersion(AppendOnlyFact):
+    class PayloadSchemaVersion(models.IntegerChoices):
+        V1 = 1, "Legacy object-key payload"
+        V2 = 2, "Representation-aware payload"
+
+    class RepresentationKind(models.TextChoices):
+        EXTERNAL_URL = "EXTERNAL_URL", "External URL"
+        INLINE_TEXT = "INLINE_TEXT", "Inline text"
+
     content_asset = models.ForeignKey(ContentAsset, on_delete=models.PROTECT, related_name="versions")
     version_number = models.PositiveIntegerField()
-    object_key = models.CharField(max_length=1024)
+    payload_schema_version = models.PositiveSmallIntegerField(
+        choices=PayloadSchemaVersion.choices,
+        default=PayloadSchemaVersion.V2,
+    )
+    representation_kind = models.CharField(
+        max_length=16,
+        choices=RepresentationKind.choices,
+        default=RepresentationKind.EXTERNAL_URL,
+    )
+    object_key = models.CharField(max_length=1024, blank=True, default="")
+    inline_content = models.TextField(blank=True, default="")
     mime_type = models.CharField(max_length=255)
     byte_size = models.PositiveBigIntegerField()
     content_sha256 = models.CharField(max_length=64, validators=[validate_sha256])
@@ -237,11 +256,24 @@ class ContentAssetVersion(AppendOnlyFact):
                 fields=["content_asset", "version_number"], name="contentops_unique_asset_version"
             ),
             models.CheckConstraint(condition=Q(version_number__gte=1), name="contentops_asset_version_gte_one"),
-            models.CheckConstraint(condition=~Q(object_key=""), name="contentops_object_key_not_empty"),
+            models.CheckConstraint(
+                condition=(
+                    Q(representation_kind="EXTERNAL_URL")
+                    & ~Q(object_key="")
+                    & Q(inline_content="")
+                )
+                | (
+                    Q(representation_kind="INLINE_TEXT")
+                    & Q(object_key="")
+                    & ~Q(inline_content="")
+                ),
+                name="contentops_asset_version_representation_valid",
+            ),
         ]
 
-    def command_payload(self) -> dict[str, Any]:
-        return {
+    def command_payload(self, *, schema_version: int | None = None) -> dict[str, Any]:
+        version = self.payload_schema_version if schema_version is None else schema_version
+        legacy_payload = {
             "content_asset_id": str(self.content_asset_id),
             "object_key": self.object_key,
             "mime_type": self.mime_type,
@@ -249,12 +281,50 @@ class ContentAssetVersion(AppendOnlyFact):
             "content_sha256": self.content_sha256,
             "metadata": self.metadata,
         }
+        if version == self.PayloadSchemaVersion.V1:
+            return legacy_payload
+        if version != self.PayloadSchemaVersion.V2:
+            raise ValidationError({"payload_schema_version": "Unsupported content payload schema version."})
+        return {
+            **legacy_payload,
+            "payload_schema_version": self.PayloadSchemaVersion.V2,
+            "representation_kind": self.representation_kind,
+            "inline_content": self.inline_content,
+        }
 
     def manifest_payload(self) -> dict[str, Any]:
         return {**self.command_payload(), "version_number": self.version_number}
 
     def clean(self):
         super().clean()
+        if self.payload_schema_version == self.PayloadSchemaVersion.V1:
+            if self.representation_kind != self.RepresentationKind.EXTERNAL_URL or self.inline_content:
+                raise ValidationError(
+                    {"representation_kind": "Legacy content payloads must remain object-key references."}
+                )
+        elif self.payload_schema_version != self.PayloadSchemaVersion.V2:
+            raise ValidationError({"payload_schema_version": "Unsupported content payload schema version."})
+        elif self.representation_kind == self.RepresentationKind.EXTERNAL_URL:
+            parsed = urlsplit(self.object_key)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                raise ValidationError({"object_key": "External content must use an absolute HTTP(S) URL."})
+            if parsed.username or parsed.password:
+                raise ValidationError({"object_key": "External content URLs must not embed credentials."})
+            if self.inline_content:
+                raise ValidationError({"inline_content": "External URL content cannot also contain inline text."})
+        elif self.representation_kind == self.RepresentationKind.INLINE_TEXT:
+            if self.object_key:
+                raise ValidationError({"object_key": "Inline text content cannot also contain an external URL."})
+            if not self.inline_content.strip():
+                raise ValidationError({"inline_content": "Inline text content cannot be blank."})
+            inline_bytes = self.inline_content.encode("utf-8")
+            if self.byte_size != len(inline_bytes):
+                raise ValidationError({"byte_size": "Inline byte size must match the UTF-8 content."})
+            if self.content_sha256 != hashlib.sha256(inline_bytes).hexdigest():
+                raise ValidationError({"content_sha256": "Inline content hash does not match the UTF-8 content."})
+        else:
+            raise ValidationError({"representation_kind": "Unsupported content representation."})
+
         expected_payload_hash = canonical_sha256(self.command_payload())
         expected_manifest_hash = canonical_sha256(self.manifest_payload())
         if not self.creation_payload_hash:
@@ -279,10 +349,12 @@ class ContentAssetVersion(AppendOnlyFact):
         cls,
         *,
         content_asset: ContentAsset,
-        object_key: str,
+        object_key: str = "",
+        inline_content: str = "",
+        representation_kind: str = RepresentationKind.EXTERNAL_URL,
         mime_type: str,
-        byte_size: int,
-        content_sha256: str,
+        byte_size: int | None = None,
+        content_sha256: str | None = None,
         metadata: dict[str, Any] | None = None,
         command_id: uuid.UUID,
         actor_principal,
@@ -291,19 +363,34 @@ class ContentAssetVersion(AppendOnlyFact):
         recorded_by_principal,
     ) -> ContentAssetVersion:
         metadata = metadata or {}
-        payload_hash = canonical_sha256(
-            {
-                "content_asset_id": str(content_asset.pk),
-                "object_key": object_key,
-                "mime_type": mime_type,
-                "byte_size": byte_size,
-                "content_sha256": content_sha256,
-                "metadata": metadata,
-            }
+        if representation_kind == cls.RepresentationKind.INLINE_TEXT:
+            inline_bytes = inline_content.encode("utf-8")
+            if byte_size is None:
+                byte_size = len(inline_bytes)
+            if content_sha256 is None:
+                content_sha256 = hashlib.sha256(inline_bytes).hexdigest()
+        elif byte_size is None or content_sha256 is None:
+            raise ValidationError("External URL versions require byte_size and content_sha256.")
+
+        provisional = cls(
+            content_asset=content_asset,
+            version_number=1,
+            payload_schema_version=cls.PayloadSchemaVersion.V2,
+            representation_kind=representation_kind,
+            object_key=object_key,
+            inline_content=inline_content,
+            mime_type=mime_type,
+            byte_size=byte_size,
+            content_sha256=content_sha256,
+            metadata=metadata,
         )
+        payload_hash = canonical_sha256(provisional.command_payload())
         existing = cls.objects.filter(creation_command_id=command_id).first()
         if existing:
-            if existing.creation_payload_hash != payload_hash:
+            replay_hash = canonical_sha256(
+                provisional.command_payload(schema_version=existing.payload_schema_version)
+            )
+            if existing.creation_payload_hash != replay_hash:
                 raise ValidationError("The command_id was already used with a different payload.")
             return existing
 
@@ -314,7 +401,10 @@ class ContentAssetVersion(AppendOnlyFact):
             return cls.objects.create(
                 content_asset=locked_asset,
                 version_number=next_number,
+                payload_schema_version=cls.PayloadSchemaVersion.V2,
+                representation_kind=representation_kind,
                 object_key=object_key,
+                inline_content=inline_content,
                 mime_type=mime_type,
                 byte_size=byte_size,
                 content_sha256=content_sha256,

@@ -1,6 +1,7 @@
 import hashlib
 import uuid
 from datetime import timedelta
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from django.conf import settings
@@ -512,7 +513,7 @@ class ControlledTaskUiTests(TestCase):
                 Task.State.UNDER_REVIEW,
             ],
         )
-        self.assertContains(response, "交付链接已封存并送入人工审核")
+        self.assertContains(response, "交付内容已封存并送入人工审核")
         self.assertNotContains(response, "/actions/review/")
         self.assertNotContains(response, "/actions/gate/")
         self.assertNotContains(response, "/actions/publish/")
@@ -601,7 +602,7 @@ class ControlledTaskUiTests(TestCase):
             follow=True,
         )
         self.assertEqual(conflict.status_code, 200)
-        self.assertContains(conflict, "command_id 已用于另一份交付链接或表单")
+        self.assertContains(conflict, "command_id 已用于另一份交付内容或表单")
         self.assertEqual(ContentAssetVersion.objects.filter(content_asset__task=self.task).count(), 1)
         self.assertEqual(TaskSubmission.objects.filter(task=self.task).count(), 1)
 
@@ -698,6 +699,158 @@ class ControlledTaskUiTests(TestCase):
         self.assertEqual(ContentAsset.objects.filter(task=self.task).count(), 1)
         self.assertEqual(ContentAssetVersion.objects.filter(content_asset__task=self.task).count(), 2)
         self.assertEqual(self.task.check_runs.filter(check_kind=TaskCheckRun.Kind.DOD).count(), 2)
+
+    def _inline_content_version(self, *, body="Complete platform-ready content v1"):
+        asset = self.task.content_assets.filter(asset_key="publishable-content").first()
+        if asset is None:
+            asset = ContentAsset.create_idempotent(
+                task=self.task,
+                asset_key="publishable-content",
+                title="Complete publishable content",
+                asset_kind=ContentAsset.AssetKind.COPY,
+                command_id=uuid.uuid4(),
+                actor_principal=self.operator,
+                acting_role=self.operator.role,
+                permission_grant=self.operator_grant,
+                recorded_by_principal=self.operator,
+            )
+        return ContentAssetVersion.create_next(
+            content_asset=asset,
+            representation_kind=ContentAssetVersion.RepresentationKind.INLINE_TEXT,
+            inline_content=body,
+            mime_type="text/plain; charset=utf-8",
+            metadata={"source": "generated-inline-content", "title": "Ready copy"},
+            command_id=uuid.uuid4(),
+            actor_principal=self.operator,
+            acting_role=self.operator.role,
+            permission_grant=self.operator_grant,
+            recorded_by_principal=self.operator,
+        )
+
+    @patch("dashboard.views.generate_task_content_draft")
+    def test_current_assignee_can_request_offline_content_generation(self, generate):
+        self._assign_and_start()
+        generate.return_value = SimpleNamespace(created=True)
+
+        response = self.client.post(
+            reverse("dashboard:task-action", args=[self.task.pk, "generate-content"]),
+            self._command_data(self.task),
+        )
+
+        self.assertRedirects(response, reverse("dashboard:task-detail", args=[self.task.pk]))
+        call = generate.call_args.kwargs
+        self.assertEqual(call["task"].pk, self.task.pk)
+        self.assertEqual(call["principal"].pk, self.operator.pk)
+        self.assertEqual(call["permission_grant"].pk, self.operator_grant.pk)
+        self.assertNotIn("provider", call)
+
+    @patch("dashboard.views.validate_inline_content_evidence_manifest")
+    def test_inline_content_is_visible_editable_and_sealed_as_exact_submission(self, validate_manifest):
+        self._assign_and_start()
+        version = self._inline_content_version(body="Hook\n\nBody\n\nCTA")
+
+        detail = self.client.get(reverse("dashboard:task-detail", args=[self.task.pk]))
+        self.assertContains(detail, "Hook")
+        self.assertContains(detail, "复制完整内容")
+        self.assertContains(detail, "另存为新版本")
+        self.assertContains(detail, "送审系统内的完整内容")
+
+        response = self.client.post(
+            reverse("dashboard:task-action", args=[self.task.pk, "deliver"]),
+            self._command_data(
+                self.task,
+                delivery_mode="SYSTEM_CONTENT",
+                content_version=str(version.pk),
+                submission_note="Exact inline copy is ready.",
+                criterion__plain_language=TaskCheckRun.Result.PASS,
+            ),
+        )
+
+        self.assertEqual(response.status_code, 302)
+        self.task.refresh_from_db()
+        self.assertEqual(self.task.current_state, Task.State.UNDER_REVIEW)
+        submission = self.task.submissions.get()
+        self.assertEqual(submission.primary_asset_version_id, version.pk)
+        self.assertEqual(version.content_asset.versions.count(), 1)
+        validate_manifest.assert_called_once_with(asset_version=version, lock=True)
+
+    @patch(
+        "dashboard.views.validate_inline_content_evidence_manifest",
+        side_effect=ValidationError(
+            "该内容版本引用的外部需求证据已经作废、过期或发生变化，请重新生成内容后再继续。"
+        ),
+    )
+    def test_inline_content_with_stale_evidence_cannot_be_submitted(self, validate_manifest):
+        self._assign_and_start()
+        version = self._inline_content_version(body="Content grounded in evidence that is now invalid")
+
+        response = self.client.post(
+            reverse("dashboard:task-action", args=[self.task.pk, "deliver"]),
+            self._command_data(
+                self.task,
+                delivery_mode="SYSTEM_CONTENT",
+                content_version=str(version.pk),
+                submission_note="This must fail before sealing.",
+                criterion__plain_language=TaskCheckRun.Result.PASS,
+            ),
+            follow=True,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "外部需求证据已经作废")
+        validate_manifest.assert_called_once_with(asset_version=version, lock=True)
+        self.assertFalse(TaskSubmission.objects.filter(task=self.task).exists())
+        self.assertFalse(self.task.check_runs.filter(check_kind=TaskCheckRun.Kind.DOD).exists())
+        self.task.refresh_from_db()
+        self.assertEqual(self.task.current_state, Task.State.IN_PROGRESS)
+
+    def test_stale_inline_submission_is_rejected_without_partial_facts(self):
+        self._assign_and_start()
+        version = self._inline_content_version(body="Current complete content")
+
+        response = self.client.post(
+            reverse("dashboard:task-action", args=[self.task.pk, "deliver"]),
+            self._command_data(
+                self.task,
+                expected_state_version=self.task.state_version - 1,
+                delivery_mode="SYSTEM_CONTENT",
+                content_version=str(version.pk),
+                submission_note="This browser tab is stale.",
+                criterion__plain_language=TaskCheckRun.Result.PASS,
+            ),
+            follow=True,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "任务状态已经变化")
+        self.assertFalse(TaskSubmission.objects.filter(task=self.task).exists())
+        self.assertFalse(self.task.check_runs.filter(check_kind=TaskCheckRun.Kind.DOD).exists())
+        self.task.refresh_from_db()
+        self.assertEqual(self.task.current_state, Task.State.IN_PROGRESS)
+
+    @patch("dashboard.views.revise_task_content_draft")
+    def test_edit_action_passes_latest_exact_version_to_immutable_revision_service(self, revise):
+        self._assign_and_start()
+        version = self._inline_content_version(body="Original complete content")
+        revise.return_value = SimpleNamespace(
+            asset_version=SimpleNamespace(version_number=2),
+            created=True,
+        )
+
+        response = self.client.post(
+            reverse("dashboard:task-action", args=[self.task.pk, "revise-content"]),
+            self._command_data(
+                self.task,
+                source_version=str(version.pk),
+                inline_content="Human-edited complete content",
+            ),
+        )
+
+        self.assertRedirects(response, reverse("dashboard:task-detail", args=[self.task.pk]))
+        call = revise.call_args.kwargs
+        self.assertEqual(call["source_version"].pk, version.pk)
+        self.assertEqual(call["inline_content"], "Human-edited complete content")
+        self.assertEqual(call["permission_grant"].pk, self.operator_grant.pk)
 
     def test_operator_can_withdraw_unreviewed_submission_and_resubmit_as_v2(self):
         self._assign_and_start()

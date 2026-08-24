@@ -256,6 +256,7 @@ class ReviewReleaseUISliceTests(TestCase):
         self,
         *,
         object_key=None,
+        inline_content=None,
         mime_type="text/uri-list",
         metadata=None,
     ):
@@ -311,19 +312,34 @@ class ReviewReleaseUISliceTests(TestCase):
             permission_grant=self.operator_edit,
             recorded_by_principal=self.operator,
         )
-        version = ContentAssetVersion.create_next(
-            content_asset=asset,
-            object_key=object_key,
-            mime_type=mime_type,
-            byte_size=len(object_key.encode("utf-8")),
-            content_sha256=hashlib.sha256(object_key.encode("utf-8")).hexdigest(),
-            metadata=metadata,
-            command_id=uuid.uuid4(),
-            actor_principal=self.operator,
-            acting_role=self.operator.role,
-            permission_grant=self.operator_edit,
-            recorded_by_principal=self.operator,
-        )
+        if inline_content is None:
+            version = ContentAssetVersion.create_next(
+                content_asset=asset,
+                representation_kind=ContentAssetVersion.RepresentationKind.EXTERNAL_URL,
+                object_key=object_key,
+                mime_type=mime_type,
+                byte_size=len(object_key.encode("utf-8")),
+                content_sha256=hashlib.sha256(object_key.encode("utf-8")).hexdigest(),
+                metadata=metadata,
+                command_id=uuid.uuid4(),
+                actor_principal=self.operator,
+                acting_role=self.operator.role,
+                permission_grant=self.operator_edit,
+                recorded_by_principal=self.operator,
+            )
+        else:
+            version = ContentAssetVersion.create_next(
+                content_asset=asset,
+                representation_kind=ContentAssetVersion.RepresentationKind.INLINE_TEXT,
+                inline_content=inline_content,
+                mime_type="text/plain; charset=utf-8",
+                metadata={"source": "generated-inline-content", "title": "Exact Quora answer"},
+                command_id=uuid.uuid4(),
+                actor_principal=self.operator,
+                acting_role=self.operator.role,
+                permission_grant=self.operator_edit,
+                recorded_by_principal=self.operator,
+            )
         dod = TaskCheckRun.record_completed(
             task=task,
             check_kind=TaskCheckRun.Kind.DOD,
@@ -469,8 +485,21 @@ class ReviewReleaseUISliceTests(TestCase):
         self.assertContains(detail, "打开这份交付内容")
         self.assertNotContains(detail, "/files/assets/")
 
+    def test_review_page_displays_exact_inline_content(self):
+        inline_task = self._under_review_task(
+            inline_content="Exact hook\n\nExact reviewed body\n\nExact CTA",
+        )
+        self.client.force_login(self.reviewer)
+
+        detail = self.client.get(reverse("dashboard:review-detail", args=[inline_task.pk]))
+
+        self.assertContains(detail, "Exact reviewed body")
+        self.assertContains(detail, "复制完整内容")
+        self.assertContains(detail, "精确送审内容")
+        self.assertNotContains(detail, "V1 已停止支持该旧文件交付")
+
     def test_review_page_does_not_turn_a_legacy_object_key_into_a_link(self):
-        legacy_object_key = "legacy-media/answer.txt"
+        legacy_object_key = "https://legacy.example/answer.txt"
         legacy_task = self._under_review_task(
             object_key=legacy_object_key,
             mime_type="text/plain",
@@ -520,6 +549,21 @@ class ReviewReleaseUISliceTests(TestCase):
         self.assertContains(response, f'href="{self.asset_url}"')
         self.assertContains(response, "打开待发布内容")
         self.assertNotContains(response, "/files/assets/")
+
+    def test_release_page_displays_copyable_exact_inline_content(self):
+        inline_task = self._under_review_task(
+            inline_content="Approved hook\n\nApproved body\n\nApproved CTA",
+        )
+        self.task = inline_task
+        self._approve()
+        self._gate_via_ui()
+
+        response = self.client.get(reverse("dashboard:release-detail", args=[inline_task.pk]))
+
+        self.assertContains(response, "Approved body")
+        self.assertContains(response, "复制完整内容去发布")
+        self.assertContains(response, "审核通过的精确内容")
+        self.assertNotContains(response, "V1 已停止支持该旧文件交付")
 
     def test_release_page_exposes_three_controlled_modes_and_explicit_confirmation(self):
         self._approve()

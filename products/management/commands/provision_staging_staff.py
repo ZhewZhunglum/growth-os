@@ -89,9 +89,9 @@ class Command(BaseCommand):
             "--publish-account-code",
             default="",
             help=(
-                "Optional existing ACTIVE ChannelAccount code. When supplied, the Operator receives "
-                "one account-scoped HIGH-risk PUBLISH grant after its current Staging binding and OPEN "
-                "manual-publish capability are verified."
+                "Optional existing ACTIVE ChannelAccount code. When supplied, Owner, Admin, and Operator "
+                "each receive an explicit bounded account-scoped HIGH-risk PUBLISH grant after the current "
+                "Staging binding and OPEN manual-publish capability are verified."
             ),
         )
 
@@ -602,18 +602,21 @@ class Command(BaseCommand):
                     )
 
             if publish_context:
-                self._ensure_grant(
-                    principal=principals["operator"],
-                    grantor=owner,
-                    action=PermissionGrant.Action.PUBLISH,
-                    scope_kind=PermissionGrant.ScopeKind.ACCOUNT,
-                    risk_level=PermissionGrant.RiskLevel.HIGH,
-                    product=product,
-                    publish_context=publish_context,
-                    # Supplying --publish-account-code is the explicit request
-                    # to create this separately controlled high-risk grant.
-                    allow_create=True,
-                )
+                # Supplying --publish-account-code is the explicit controlled
+                # request to create three independent high-risk capabilities.
+                # Runtime authorization still resolves the exact Grant; Admin
+                # receiving a Grant here does not let Admin mint or revoke one.
+                for key in ("owner", "admin", "operator"):
+                    self._ensure_grant(
+                        principal=principals[key],
+                        grantor=owner,
+                        action=PermissionGrant.Action.PUBLISH,
+                        scope_kind=PermissionGrant.ScopeKind.ACCOUNT,
+                        risk_level=PermissionGrant.RiskLevel.HIGH,
+                        product=product,
+                        publish_context=publish_context,
+                        allow_create=True,
+                    )
 
             if not apply_changes:
                 transaction.set_rollback(True)

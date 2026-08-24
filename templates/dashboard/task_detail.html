@@ -39,6 +39,43 @@
 </section>
 {% endif %}
 
+{% if may_edit_content %}
+<section class="detail-panel spaced-panel" aria-label="{% ui '内容制作区' 'Content workspace' %}">
+    <p class="eyebrow">{% ui '内容制作' 'Content creation' %}</p>
+    {% if generate_form %}
+        <h3>{% ui '根据已确认的数据生成一份完整草稿' 'Generate a complete draft from the approved data' %}</h3>
+        <p class="action-explanation">{% ui '本轮只使用本机离线生成器，不会连接 DeepSeek 或任何付费 API。结果只是可编辑草稿，保存、送审、发布仍然是独立人工步骤。' 'This round uses the offline generator only. It does not connect to DeepSeek or any paid API. The result is an editable draft; saving, review, and publishing remain separate human steps.' %}</p>
+        <form action="{% url 'dashboard:task-action' task.id 'generate-content' %}" method="post">
+            {% csrf_token %}{{ generate_form.command_id }}{{ generate_form.expected_state_version }}
+            <button class="button button-primary" type="submit">{% ui '生成完整内容草稿' 'Generate complete content draft' %}</button>
+        </form>
+    {% elif latest_inline_version and revision_form %}
+        <h3>{% ui '完整内容草稿' 'Complete content draft' %} · v{{ latest_inline_version.version_number }}</h3>
+        <p class="action-explanation">
+            {% ui '下方是本次真正准备送审和发布的完整内容。你可以直接复制，也可以修改后“另存为新版本”；系统不会覆盖旧版本。' 'This is the complete content intended for review and publishing. Copy it as-is or edit and save a new version; the previous version is never overwritten.' %}
+            {% if latest_inline_version.metadata.provider == 'dry-run' or latest_inline_version.metadata.execution_status == 'DRY_RUN' %}<br><strong>{% ui '来源：本机离线测试草稿（未调用 DeepSeek）' 'Source: offline test draft (DeepSeek was not called)' %}</strong>{% endif %}
+        </p>
+        {% if latest_inline_version.metadata.production_notes %}
+        <details class="compact-details">
+            <summary>{% ui '制作提醒（不会包含在发布正文里）' 'Production notes (not included in publishable copy)' %}</summary>
+            <p>{{ latest_inline_version.metadata.production_notes }}</p>
+        </details>
+        {% endif %}
+        <form class="task-action-form" action="{% url 'dashboard:task-action' task.id 'revise-content' %}" method="post">
+            {% csrf_token %}{{ revision_form.command_id }}{{ revision_form.expected_state_version }}{{ revision_form.source_version }}{{ revision_form.non_field_errors }}
+            <div class="field-row">
+                {{ revision_form.inline_content.label_tag }}{{ revision_form.inline_content }}{{ revision_form.inline_content.errors }}
+                {% if revision_form.inline_content.help_text %}<small>{{ revision_form.inline_content.help_text }}</small>{% endif %}
+            </div>
+            <div>
+                <button class="button button-secondary" id="copy-inline-content" type="button">{% ui '复制完整内容' 'Copy complete content' %}</button>
+                <button class="button button-primary" type="submit">{% ui '另存为新版本' 'Save as a new version' %}</button>
+            </div>
+        </form>
+    {% endif %}
+</section>
+{% endif %}
+
 <section class="detail-columns">
     <article class="detail-panel">
         <p class="eyebrow">{% ui '任务合同' 'Task contract' %}</p><h3>{% ui '开始前与交付时要核对什么' 'What to check before starting and before delivery' %}</h3>
@@ -67,13 +104,13 @@
                 {% for field in action_form.visible_fields %}<div class="field-row"><label for="{{ field.id_for_label }}">{% ui '分配给哪位执行人员' 'Assign to' %}</label>{{ field }}{{ field.errors }}</div>{% endfor %}<button class="button button-primary" type="submit">{% ui '确认分配' 'Confirm assignment' %}</button>
             </form>
         {% elif action_kind == "start" %}
-            <h3>{% ui '确认开始执行' 'Confirm that work is starting' %}</h3><p class="action-explanation">{% ui '点击后任务进入“执行中”，届时才能提交交付链接并填写交付检查。' 'The task moves to In progress. You can then submit the delivery link and complete the delivery check.' %}</p>
+            <h3>{% ui '确认开始执行' 'Confirm that work is starting' %}</h3><p class="action-explanation">{% ui '点击后任务进入“执行中”，你可以生成并修改完整内容，也可以继续使用外部内容链接，然后填写交付检查并送审。' 'The task moves to In progress. You can generate and edit complete content here or keep using an external link, then complete the delivery check and submit it.' %}</p>
             <form action="{% url 'dashboard:task-action' task.id 'start' %}" method="post">{% csrf_token %}{{ action_form.command_id }}{{ action_form.expected_state_version }}<button class="button button-primary" type="submit">{% ui '开始执行' 'Start work' %}</button></form>
         {% elif action_kind == "resume-work" %}
-            <h3>{% ui '审核要求修改，恢复制作新版本' 'A reviewer requested changes; create a new version' %}</h3><p class="action-explanation">{% ui '旧链接、旧交付检查和旧提交会原样保留。恢复后请提交新的内容链接，并重新逐项填写交付检查。' 'The previous link, delivery check, and submission remain unchanged. Submit a new link and complete a new delivery check.' %}</p>
+            <h3>{% ui '审核要求修改，恢复制作新版本' 'A reviewer requested changes; create a new version' %}</h3><p class="action-explanation">{% ui '旧内容、旧交付检查和旧提交会原样保留。恢复后请修改或生成新的完整内容版本，再重新填写交付检查。' 'The previous content, delivery check, and submission remain unchanged. Revise or generate a new complete content version, then complete a new delivery check.' %}</p>
             <form action="{% url 'dashboard:task-action' task.id 'resume-work' %}" method="post">{% csrf_token %}{{ action_form.command_id }}{{ action_form.expected_state_version }}<button class="button button-primary" type="submit">{% ui '恢复制作' 'Resume work' %}</button></form>
         {% elif action_kind == "deliver" %}
-            <h3>{% ui '提交本次交付链接，并逐项确认是否完成' 'Submit the delivery link and confirm each completion item' %}</h3><p class="action-explanation">{% ui '系统会把链接作为不可变交付版本封存。链接变化必须创建新版本并重新送审；选择“尚未准备好”会保留本次结果，但不会送审。' 'The system seals the link as an immutable delivery version. A changed link creates a new version and requires another review. Selecting Not ready keeps the result without sending it for review.' %}</p>
+            <h3>{% ui '选择这次送审的完整内容，并逐项确认' 'Choose the complete content to submit and confirm each item' %}</h3><p class="action-explanation">{% ui '优先选择上方刚保存的系统内内容；如果内容放在其他工具，也可改选外部链接。系统会封存你选择的确切版本，之后不会悄悄改变。' 'Prefer the content version saved above. If the content lives in another tool, choose an external link instead. The system seals the exact selected version so it cannot change silently.' %}</p>
             <form class="task-action-form" action="{% url 'dashboard:task-action' task.id 'deliver' %}" method="post">
                 {% csrf_token %}{{ action_form.command_id }}{{ action_form.expected_state_version }}{{ action_form.non_field_errors }}
                 {% for field in action_form.visible_fields %}
@@ -83,7 +120,7 @@
                     {{ field.errors }}{% if field.help_text %}<small>{{ field.help_text }}</small>{% endif %}
                 </div>
                 {% endfor %}
-                <button class="button button-primary" type="submit">{% ui '封存交付并送审' 'Seal delivery and send for review' %}</button>
+                <button class="button button-primary" type="submit">{% ui '封存这份内容并送审' 'Seal this content and send for review' %}</button>
             </form>
         {% elif task.current_state == "UNDER_REVIEW" %}
             <h3>{% ui '交付已送入人工审核' 'Delivery sent for human review' %}</h3><p class="action-explanation">{% ui '现在无需在本页操作。等待具备审核权限的人员处理；本页没有审核、门禁或发布按钮。' 'No action is needed here. Wait for an authorized reviewer. This page has no review, release-check, or publishing controls.' %}</p>
@@ -117,4 +154,24 @@
         {% endif %}
     </article>
 </section>
+{% if revision_form %}
+<script>
+(function () {
+    const button = document.getElementById("copy-inline-content");
+    const content = document.getElementById("id_inline_content");
+    if (!button || !content) return;
+    button.addEventListener("click", async function () {
+        try {
+            await navigator.clipboard.writeText(content.value);
+            button.textContent = "{% ui '已复制' 'Copied' %}";
+        } catch (error) {
+            content.focus();
+            content.select();
+            document.execCommand("copy");
+            button.textContent = "{% ui '已复制' 'Copied' %}";
+        }
+    });
+})();
+</script>
+{% endif %}
 {% endblock %}

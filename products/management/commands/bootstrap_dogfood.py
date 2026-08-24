@@ -124,8 +124,8 @@ class Command(BaseCommand):
             "--full-demo",
             action="store_true",
             help=(
-                "Request owner, admin, operator, and a rule evaluator. The operator receives an explicit "
-                "account-scoped Publisher capability. "
+                "Request owner, admin, operator, and a rule evaluator. Each canonical staff identity receives "
+                "its own explicit, bounded account-scoped Publisher capability. "
                 "New human identities require their distinct BOOTSTRAP_*_PASSWORD environment variables."
             ),
         )
@@ -821,12 +821,21 @@ class Command(BaseCommand):
                 )
 
         # Publisher is an independently scoped high-risk capability, never a
-        # fourth role and never inferred from the Operator template.  The
-        # streamlined three-human demo assigns it to the designated Operator;
-        # the strict/legacy fixture retains its separate Publisher identity.
+        # fourth role and never inferred from a role template.  The streamlined
+        # three-human demo gives Owner, Admin, and Operator separate exact
+        # grants so higher-tier staff can also execute ordinary publishing work
+        # without turning the role name into a runtime authorization shortcut.
+        # The strict/legacy fixture retains its separate Publisher identity.
         publisher = principals.get("publisher")
-        if publisher is None and options["full_demo"] and not options["strict_separation_demo"]:
-            publisher = principals.get("operator")
+        if options["full_demo"] and not options["strict_separation_demo"]:
+            for key in ("owner", "admin", "operator"):
+                principal = principals.get(key)
+                if principal is not None:
+                    self._ensure_grant(
+                        principal=principal, action=PermissionGrant.Action.PUBLISH, owner=owner,
+                        scope_kind=PermissionGrant.ScopeKind.ACCOUNT, product=product,
+                        platform_code=channel.platform_code, account_ref=channel.account_code,
+                    )
         if publisher is not None:
             self._ensure_grant(
                 principal=publisher, action=PermissionGrant.Action.PUBLISH, owner=owner,

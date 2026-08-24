@@ -180,7 +180,7 @@ class PostgreSQLConcurrencyAcceptanceTests(TransactionTestCase):
         payload = b"postgresql concurrency acceptance payload"
         asset_version = ContentAssetVersion.create_next(
             content_asset=asset,
-            object_key=f"acceptance/tasks/{self.task.pk}/primary-v1.mp4",
+            object_key=f"https://drafts.example.com/acceptance/tasks/{self.task.pk}/primary-v1.mp4",
             mime_type="video/mp4",
             byte_size=len(payload),
             content_sha256=hashlib.sha256(payload).hexdigest(),

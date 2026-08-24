@@ -116,6 +116,47 @@ class PermissionGrantLifecycleTests(TestCase):
                     valid_until=self.now + timedelta(hours=1),
                 )
 
+    def test_admin_cannot_renew_or_revoke_an_existing_publish_grant(self):
+        account = ChannelAccount.objects.create(
+            platform_code="pinterest",
+            account_code="admin-boundary-account",
+            external_account_ref="pinterest-admin-boundary",
+            display_name="Admin boundary account",
+            created_by_principal=self.owner,
+            updated_by_principal=self.owner,
+        )
+        grant = issue_permission_grant(
+            actor=self.owner,
+            principal=self.admin,
+            scope=GrantScope(
+                scope_kind=PermissionGrant.ScopeKind.ACCOUNT,
+                account_ref=account.account_code,
+            ),
+            action=PermissionGrant.Action.PUBLISH,
+            effect=PermissionGrant.Effect.ALLOW,
+            risk_level=PermissionGrant.RiskLevel.HIGH,
+            valid_from=self.now,
+            valid_until=self.now + timedelta(hours=8),
+        )
+
+        with self.assertRaises(PermissionDenied):
+            renew_permission_grant(
+                actor=self.admin,
+                grant_id=grant.pk,
+                valid_from=self.now + timedelta(hours=8),
+                valid_until=self.now + timedelta(hours=16),
+            )
+        with self.assertRaises(PermissionDenied):
+            revoke_permission_grant(
+                actor=self.admin,
+                grant_id=grant.pk,
+                reason="Admin must not control PUBLISH grants.",
+            )
+
+        grant.refresh_from_db()
+        self.assertEqual(grant.grant_status, PermissionGrant.GrantStatus.ACTIVE)
+        self.assertFalse(PermissionGrant.objects.filter(supersedes_grant=grant).exists())
+
     def test_renewal_creates_a_new_exact_grant(self):
         original = issue_permission_grant(
             actor=self.owner,

@@ -18,6 +18,8 @@ from contentops.models import ContentAsset, ContentAssetVersion, ReviewDecision,
 from dashboard.forms import (
     AssignmentForm,
     CancelTaskForm,
+    ContentGenerateForm,
+    ContentRevisionForm,
     DeliveryDoDForm,
     DoRForm,
     ResumeDraftForm,
@@ -25,6 +27,11 @@ from dashboard.forms import (
     TaskCreateForm,
     WithdrawSubmissionForm,
     criterion_label,
+)
+from dailyops.content_generation import (
+    generate_task_content_draft,
+    revise_task_content_draft,
+    validate_inline_content_evidence_manifest,
 )
 from intelligence.models import TaskCompilationContext
 from products.models import ProductProfileVersion
@@ -154,6 +161,24 @@ def _decorate_task(task: Task) -> None:
     ]
 
 
+def _inline_content_versions(task: Task):
+    """Return only the latest editable inline version for this task."""
+
+    latest_id = (
+        ContentAssetVersion.objects.filter(
+            content_asset__task=task,
+            content_asset__asset_key="publishable-content",
+            representation_kind=ContentAssetVersion.RepresentationKind.INLINE_TEXT,
+        )
+        .order_by("-version_number", "-created_at", "-id")
+        .values_list("pk", flat=True)
+        .first()
+    )
+    if latest_id is None:
+        return ContentAssetVersion.objects.none()
+    return ContentAssetVersion.objects.select_related("content_asset").filter(pk=latest_id)
+
+
 def _action_form(task: Task, user: Principal):
     common = {"state_version": task.state_version}
     can_edit = _authorization(user, task, PermissionGrant.Action.EDIT).allowed
@@ -170,7 +195,11 @@ def _action_form(task: Task, user: Principal):
     if task.current_state == Task.State.HUMAN_REWORK and task.current_assignee_principal_id == user.pk and can_edit:
         return "resume-work", StartWorkForm(**common)
     if task.current_state == Task.State.IN_PROGRESS and task.current_assignee_principal_id == user.pk and can_edit:
-        return "deliver", DeliveryDoDForm(criteria=task.contract_version.dod_criteria, **common)
+        return "deliver", DeliveryDoDForm(
+            criteria=task.contract_version.dod_criteria,
+            content_versions=_inline_content_versions(task),
+            **common,
+        )
     return "", None
 
 
@@ -182,6 +211,8 @@ def _detail_context(
     action_form=None,
     cancel_form=None,
     withdraw_form=None,
+    generate_form=None,
+    revision_form=None,
 ) -> dict:
     _decorate_task(task)
     if action_kind is None:
@@ -195,6 +226,13 @@ def _detail_context(
         .filter(task_id=task.pk)
         .first()
     )
+    inline_versions = _inline_content_versions(task)
+    latest_inline_version = inline_versions.first()
+    may_edit_content = bool(
+        task.current_state == Task.State.IN_PROGRESS
+        and task.current_assignee_principal_id == user.pk
+        and _authorization(user, task, PermissionGrant.Action.EDIT).allowed
+    )
     return {
         "task": task,
         "compilation_context": compilation_context,
@@ -207,6 +245,25 @@ def _detail_context(
         "action_kind": action_kind,
         "action_form": action_form,
         "submission": task.submissions.order_by("-submission_number").first(),
+        "latest_inline_version": latest_inline_version,
+        "may_edit_content": may_edit_content,
+        "generate_form": generate_form if generate_form is not None else (
+            ContentGenerateForm(state_version=task.state_version)
+            if may_edit_content and latest_inline_version is None and compilation_context is not None
+            else None
+        ),
+        "revision_form": revision_form if revision_form is not None else (
+            ContentRevisionForm(
+                source_versions=inline_versions,
+                state_version=task.state_version,
+                initial={
+                    "source_version": latest_inline_version,
+                    "inline_content": latest_inline_version.inline_content,
+                },
+            )
+            if may_edit_content and latest_inline_version is not None
+            else None
+        ),
         "cancel_form": cancel_form if cancel_form is not None else (
             CancelTaskForm(state_version=task.state_version)
             if task.current_state == Task.State.DRAFT
@@ -403,9 +460,10 @@ def _replayed_submission_result(
     task: Task,
     user: Principal,
     form: DeliveryDoDForm,
-    external_url: str,
-    content_sha256: str,
-    byte_size: int,
+    selected_version: ContentAssetVersion | None = None,
+    external_url: str = "",
+    content_sha256: str = "",
+    byte_size: int = 0,
 ) -> str | None:
     """Return the prior result for an exact link-delivery command replay."""
 
@@ -424,23 +482,32 @@ def _replayed_submission_result(
     actual_criteria = dict(
         existing.dod_check_run.results.values_list("criterion_key", "result")
     )
+    same_delivery = (
+        existing.primary_asset_version_id == selected_version.pk
+        if selected_version is not None
+        else all(
+            (
+                existing.primary_asset_version.object_key == external_url,
+                existing.primary_asset_version.content_sha256 == content_sha256,
+                existing.primary_asset_version.byte_size == byte_size,
+                existing.primary_asset_version.mime_type == EXTERNAL_URL_MIME_TYPE,
+                existing.primary_asset_version.metadata == EXTERNAL_URL_METADATA,
+            )
+        )
+    )
     is_exact_replay = all(
         (
             existing.task_id == task.pk,
             existing.expected_task_version == form.cleaned_data["expected_state_version"],
             existing.submitted_by_principal_id == user.pk,
-            existing.primary_asset_version.object_key == external_url,
-            existing.primary_asset_version.content_sha256 == content_sha256,
-            existing.primary_asset_version.byte_size == byte_size,
-            existing.primary_asset_version.mime_type == EXTERNAL_URL_MIME_TYPE,
-            existing.primary_asset_version.metadata == EXTERNAL_URL_METADATA,
+            same_delivery,
             existing.submission_note == form.cleaned_data["submission_note"],
             actual_criteria == _criterion_results(form),
         )
     )
     if not is_exact_replay:
         raise ValidationError(
-            "该 command_id 已用于另一份交付链接或表单；请刷新页面后使用新的命令。"
+            "该 command_id 已用于另一份交付内容或表单；请刷新页面后使用新的命令。"
         )
     return existing.dod_check_run.aggregate_result
 
@@ -448,14 +515,21 @@ def _replayed_submission_result(
 def _deliver_and_submit(task: Task, user: Principal, grant, form: DeliveryDoDForm) -> str:
     if task.current_assignee_principal_id != user.pk:
         raise PermissionDenied("ONLY_CURRENT_ASSIGNEE_CAN_SUBMIT")
-    external_url = form.cleaned_data["external_url"]
+    delivery_mode = form.cleaned_data["delivery_mode"]
+    selected_version = (
+        form.cleaned_data["content_version"]
+        if delivery_mode == DeliveryDoDForm.DeliveryMode.SYSTEM_CONTENT
+        else None
+    )
+    external_url = form.cleaned_data.get("external_url") or ""
     encoded_url = external_url.encode("utf-8")
-    content_sha256 = hashlib.sha256(encoded_url).hexdigest()
+    content_sha256 = hashlib.sha256(encoded_url).hexdigest() if external_url else ""
     byte_size = len(encoded_url)
     replayed_result = _replayed_submission_result(
         task=task,
         user=user,
         form=form,
+        selected_version=selected_version,
         external_url=external_url,
         content_sha256=content_sha256,
         byte_size=byte_size,
@@ -463,62 +537,98 @@ def _deliver_and_submit(task: Task, user: Principal, grant, form: DeliveryDoDFor
     if replayed_result is not None:
         return replayed_result
 
-    supersedes_submission = task.submissions.order_by("-submission_number").first()
-    triggering_review = None
-    if supersedes_submission is not None:
-        try:
-            triggering_review = supersedes_submission.final_review
-        except ObjectDoesNotExist:
-            was_withdrawn = supersedes_submission.withdrawal_events.filter(
-                event_type=TaskStateEvent.EventType.SUBMISSION_WITHDRAWN,
-                task_id=task.pk,
-            ).exists()
-            if not was_withdrawn:
-                raise ValidationError(
-                    "重新提交前，上一份交付必须已被审核要求修改，或由执行负责人正式撤回。"
-                ) from None
-        else:
-            if triggering_review.decision != ReviewDecision.Decision.CHANGES_REQUESTED:
-                raise ValidationError("只有明确要求修改的审核结论才能创建返工版本。")
-
     root_command = form.cleaned_data["command_id"]
     with transaction.atomic():
-        asset = task.content_assets.filter(asset_key="primary-deliverable").first()
-        if asset is None:
-            asset = ContentAsset.create_idempotent(
-                task=task,
-                asset_key="primary-deliverable",
-                title=f"Primary delivery for {task.title}",
-                asset_kind=ContentAsset.AssetKind.OTHER,
-                description="Primary external delivery link submitted through the task UI.",
-                command_id=_subcommand_id(root_command, "content-asset"),
+        # Serialize content revision and submission on the Task before touching
+        # its asset/version rows. This prevents a stale browser tab from
+        # submitting v1 while another request has already saved v2.
+        task = Task.objects.select_for_update().get(pk=task.pk)
+        if task.current_state != Task.State.IN_PROGRESS:
+            raise ValidationError("只有正在执行的任务才能提交交付内容。")
+        if task.current_assignee_principal_id != user.pk:
+            raise PermissionDenied("ONLY_CURRENT_ASSIGNEE_CAN_SUBMIT")
+        if task.state_version != form.cleaned_data["expected_state_version"]:
+            raise ValidationError("任务状态已经变化，请刷新页面后再提交。")
+
+        supersedes_submission = task.submissions.order_by("-submission_number").first()
+        triggering_review = None
+        if supersedes_submission is not None:
+            try:
+                triggering_review = supersedes_submission.final_review
+            except ObjectDoesNotExist:
+                was_withdrawn = supersedes_submission.withdrawal_events.filter(
+                    event_type=TaskStateEvent.EventType.SUBMISSION_WITHDRAWN,
+                    task_id=task.pk,
+                ).exists()
+                if not was_withdrawn:
+                    raise ValidationError(
+                        "重新提交前，上一份交付必须已被审核要求修改，或由执行负责人正式撤回。"
+                    ) from None
+            else:
+                if triggering_review.decision != ReviewDecision.Decision.CHANGES_REQUESTED:
+                    raise ValidationError("只有明确要求修改的审核结论才能创建返工版本。")
+
+        if selected_version is not None:
+            locked_asset = ContentAsset.objects.select_for_update().get(
+                pk=selected_version.content_asset_id
+            )
+            version = ContentAssetVersion.objects.select_related("content_asset").get(
+                pk=selected_version.pk,
+                content_asset=locked_asset,
+            )
+            latest = ContentAssetVersion.objects.filter(content_asset=locked_asset).order_by(
+                "-version_number"
+            ).first()
+            if (
+                version.content_asset.task_id != task.pk
+                or version.representation_kind != ContentAssetVersion.RepresentationKind.INLINE_TEXT
+                or latest is None
+                or latest.pk != version.pk
+            ):
+                raise ValidationError("请选择这项任务刚保存的最新系统内内容版本。")
+            validate_inline_content_evidence_manifest(
+                asset_version=version,
+                lock=True,
+            )
+        else:
+            asset = task.content_assets.filter(asset_key="primary-deliverable").first()
+            if asset is None:
+                asset = ContentAsset.create_idempotent(
+                    task=task,
+                    asset_key="primary-deliverable",
+                    title=f"Primary delivery for {task.title}",
+                    asset_kind=ContentAsset.AssetKind.OTHER,
+                    description="Primary external delivery link submitted through the task UI.",
+                    command_id=_subcommand_id(root_command, "content-asset"),
+                    actor_principal=user,
+                    acting_role=user.role,
+                    permission_grant=grant,
+                    recorded_by_principal=user,
+                )
+            version = ContentAssetVersion.create_next(
+                content_asset=asset,
+                representation_kind=ContentAssetVersion.RepresentationKind.EXTERNAL_URL,
+                object_key=external_url,
+                mime_type=EXTERNAL_URL_MIME_TYPE,
+                byte_size=byte_size,
+                content_sha256=content_sha256,
+                metadata=EXTERNAL_URL_METADATA,
+                command_id=_subcommand_id(root_command, "content-asset-version"),
                 actor_principal=user,
                 acting_role=user.role,
                 permission_grant=grant,
                 recorded_by_principal=user,
             )
-        version = ContentAssetVersion.create_next(
-            content_asset=asset,
-            object_key=external_url,
-            mime_type=EXTERNAL_URL_MIME_TYPE,
-            byte_size=byte_size,
-            content_sha256=content_sha256,
-            metadata=EXTERNAL_URL_METADATA,
-            command_id=_subcommand_id(root_command, "content-asset-version"),
-            actor_principal=user,
-            acting_role=user.role,
-            permission_grant=grant,
-            recorded_by_principal=user,
-        )
         run = TaskCheckRun.record_completed(
             task=task,
             check_kind=TaskCheckRun.Kind.DOD,
             results=form.result_rows(
                 evidence={
                     "asset_version_id": str(version.pk),
-                    "external_url": external_url,
-                    "content_sha256": content_sha256,
-                    "byte_size": byte_size,
+                    "representation_kind": version.representation_kind,
+                    "external_url": external_url or None,
+                    "content_sha256": version.content_sha256,
+                    "byte_size": version.byte_size,
                 }
             ),
             command_id=_subcommand_id(root_command, "dod-check"),
@@ -635,10 +745,60 @@ def task_action(request: HttpRequest, task_id, action: str) -> HttpResponse:
                 return render(request, "dashboard/task_detail.html", _detail_context(task, request.user, action_kind=action, action_form=form), status=400)
             _start_task(task, request.user, grant, form)
             messages.success(request, "返工任务已恢复制作；请完成新版本后重新填写 DoD。")
+        elif action == "generate-content":
+            form = ContentGenerateForm(request.POST, state_version=task.state_version)
+            if not form.is_valid():
+                return render(
+                    request,
+                    "dashboard/task_detail.html",
+                    _detail_context(task, request.user, generate_form=form),
+                    status=400,
+                )
+            result = generate_task_content_draft(
+                task=task,
+                command_id=form.cleaned_data["command_id"],
+                principal=request.user,
+                acting_role=request.user.role,
+                permission_grant=grant,
+            )
+            messages.success(
+                request,
+                "完整内容草稿已在本机离线生成。请先阅读和修改，再选择该版本送审。"
+                if result.created
+                else "这次生成请求已经处理过，已返回原内容版本。",
+            )
+        elif action == "revise-content":
+            source_versions = _inline_content_versions(task)
+            form = ContentRevisionForm(
+                request.POST,
+                source_versions=source_versions,
+                state_version=task.state_version,
+            )
+            if not form.is_valid():
+                return render(
+                    request,
+                    "dashboard/task_detail.html",
+                    _detail_context(task, request.user, revision_form=form),
+                    status=400,
+                )
+            result = revise_task_content_draft(
+                task=task,
+                source_version=form.cleaned_data["source_version"],
+                inline_content=form.cleaned_data["inline_content"],
+                command_id=form.cleaned_data["command_id"],
+                principal=request.user,
+                acting_role=request.user.role,
+                permission_grant=grant,
+            )
+            messages.success(
+                request,
+                f"修改已另存为内容 v{result.asset_version.version_number}；旧版本仍保持不变。",
+            )
         elif action == "deliver":
             form = DeliveryDoDForm(
                 request.POST,
                 criteria=task.contract_version.dod_criteria,
+                content_versions=_inline_content_versions(task),
                 state_version=task.state_version,
             )
             if not form.is_valid():
@@ -646,7 +806,7 @@ def task_action(request: HttpRequest, task_id, action: str) -> HttpResponse:
             result = _deliver_and_submit(task, request.user, grant, form)
             messages.success(
                 request,
-                "交付链接已封存并送入人工审核。" if result == TaskCheckRun.Result.PASS else "交付链接和本次 DoD 已保留，但仍有阻塞项，尚未送审。",
+                "交付内容已封存并送入人工审核。" if result == TaskCheckRun.Result.PASS else "交付内容和本次检查已保留，但仍有阻塞项，尚未送审。",
             )
         elif action == "cancel":
             form = CancelTaskForm(request.POST, state_version=task.state_version)

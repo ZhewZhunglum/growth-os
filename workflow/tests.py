@@ -520,7 +520,7 @@ class WorkflowFoundationTests(TestCase):
         body = b"An exact immutable answer draft."
         version = ContentAssetVersion.create_next(
             content_asset=asset,
-            object_key=f"tasks/{self.task.pk}/answer-v1.txt",
+            object_key=f"https://assets.example.com/tasks/{self.task.pk}/answer-v1.txt",
             mime_type="text/plain",
             byte_size=len(body),
             content_sha256=hashlib.sha256(body).hexdigest(),

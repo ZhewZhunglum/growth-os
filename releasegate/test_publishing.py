@@ -6,7 +6,7 @@ from datetime import timedelta
 from unittest.mock import patch
 
 from django.core.exceptions import ValidationError
-from django.test import TestCase
+from django.test import SimpleTestCase, TestCase
 from django.utils import timezone
 
 from accounts.models import PermissionGrant
@@ -14,6 +14,7 @@ from contentops.models import ContentAssetVersion
 from integrations.connectors.types import Platform
 from integrations.publishing import (
     DryRunPublicationTransport,
+    PublicationAssetRepresentation,
     PublicationDispatchResult,
     PublicationDispatchStatus,
     PublicationMode,
@@ -23,6 +24,7 @@ from integrations.publishing import (
 
 from .models import CapabilityState, Publication, PublicationEvent
 from .publishing import (
+    _lock_policy_catalog_for_final_dispatch,
     dispatch_confirmed_publication,
     prepare_human_publication_confirmation,
 )
@@ -49,6 +51,28 @@ class _SuccessfulTransport:
             external_url="https://www.tiktok.com/@puko/video/confirmed-123",
             external_publication_id="confirmed-123",
         )
+
+
+class PolicyCatalogLockTests(SimpleTestCase):
+    @patch("releasegate.publishing.connection")
+    def test_postgresql_locks_definition_and_version_catalogs_before_dispatch(self, connection):
+        connection.vendor = "postgresql"
+        connection.ops.quote_name.side_effect = lambda value: f'"{value}"'
+        cursor = connection.cursor.return_value.__enter__.return_value
+
+        _lock_policy_catalog_for_final_dispatch()
+
+        cursor.execute.assert_called_once_with(
+            'LOCK TABLE "releasegate_policydefinition", "releasegate_policyversion" IN SHARE MODE'
+        )
+
+    @patch("releasegate.publishing.connection")
+    def test_non_postgresql_local_test_database_does_not_issue_table_lock(self, connection):
+        connection.vendor = "sqlite"
+
+        _lock_policy_catalog_for_final_dispatch()
+
+        connection.cursor.assert_not_called()
 
 
 class HumanConfirmedPublicationTests(TestCase):
@@ -159,16 +183,38 @@ class HumanConfirmedPublicationTests(TestCase):
         self.assertEqual(self.publication.events.count(), before)
 
     def test_manual_fallback_records_human_supplied_url_without_transport(self):
+        command_id = uuid.uuid4()
+        confirmation = self.confirmation(PublicationMode.MANUAL)
         result = dispatch_confirmed_publication(
             publication=self.publication,
             publisher_principal=self.fixture.publisher,
-            confirmation=self.confirmation(PublicationMode.MANUAL),
-            command_id=uuid.uuid4(),
+            confirmation=confirmation,
+            command_id=command_id,
             manual_external_url="https://www.tiktok.com/@puko/video/manual-1",
             manual_external_publication_id="manual-1",
         )
         self.assertEqual(result.status, PublicationDispatchStatus.SUCCEEDED)
         self.assertEqual(result.publication_event.external_publication_id, "manual-1")
+
+        replay = dispatch_confirmed_publication(
+            publication=self.publication,
+            publisher_principal=self.fixture.publisher,
+            confirmation=confirmation,
+            command_id=command_id,
+            manual_external_url="https://www.tiktok.com/@puko/video/manual-1",
+            manual_external_publication_id="manual-1",
+        )
+        self.assertEqual(replay.publication_event.pk, result.publication_event.pk)
+
+        with self.assertRaises(ValidationError):
+            dispatch_confirmed_publication(
+                publication=self.publication,
+                publisher_principal=self.fixture.publisher,
+                confirmation=confirmation,
+                command_id=command_id,
+                manual_external_url="https://www.tiktok.com/@puko/video/different",
+                manual_external_publication_id="different",
+            )
 
     def test_capability_change_after_confirmation_blocks_before_transport(self):
         confirmation = self.confirmation()
@@ -257,3 +303,116 @@ class HumanConfirmedPublicationTests(TestCase):
                 command_id=uuid.uuid4(),
                 runtime=self.runtime(_SuccessfulTransport()),
             )
+
+
+class InlineHumanConfirmedPublicationTests(TestCase):
+    def setUp(self):
+        fixture = _ReleaseFixture()
+        create_next = ContentAssetVersion.create_next
+
+        def inline_create_next(**kwargs):
+            kwargs.update(
+                representation_kind=ContentAssetVersion.RepresentationKind.INLINE_TEXT,
+                object_key="",
+                inline_content="Hook: A calmer way to frame your daily focus routine.\n\n"
+                "Body: Start with one repeatable cue, then make the next useful action obvious.",
+                mime_type="text/plain; charset=utf-8",
+                byte_size=None,
+                content_sha256=None,
+            )
+            return create_next(**kwargs)
+
+        with patch.object(ContentAssetVersion, "create_next", side_effect=inline_create_next):
+            releasegate_tests.ReleaseGateDomainTests.setUp(fixture)
+        self.fixture = fixture
+        gate_result = orchestrate_v1_release_gate(
+            task=fixture.task,
+            submission=fixture.submission,
+            publisher_principal=fixture.publisher,
+            channel_account=fixture.channel_account,
+            runtime_environment=fixture.environment,
+            command_id=uuid.uuid4(),
+        )
+        self.publication = gate_result.publication
+
+    def confirmation(self, mode):
+        return prepare_human_publication_confirmation(
+            publication=self.publication,
+            publisher_principal=self.fixture.publisher,
+            mode=mode,
+            confirmation_id=uuid.uuid4(),
+            confirmed=True,
+        )
+
+    def test_api_transport_receives_exact_inline_content_and_representation(self):
+        transport = _SuccessfulTransport()
+        runtime = PublicationRuntime(
+            PublicationRuntimeConfig({(Platform.TIKTOK, PublicationMode.API): transport})
+        )
+        with patch(
+            "dailyops.content_generation.validate_inline_content_evidence_manifest",
+            return_value=[],
+        ):
+            result = dispatch_confirmed_publication(
+                publication=self.publication,
+                publisher_principal=self.fixture.publisher,
+                confirmation=self.confirmation(PublicationMode.API),
+                command_id=uuid.uuid4(),
+                runtime=runtime,
+            )
+        self.assertEqual(result.status, PublicationDispatchStatus.SUCCEEDED)
+        self.assertEqual(len(transport.calls), 1)
+        dispatched = transport.calls[0]
+        self.assertEqual(
+            dispatched.asset_representation_kind,
+            PublicationAssetRepresentation.INLINE_TEXT,
+        )
+        self.assertEqual(
+            dispatched.asset_inline_content,
+            self.fixture.asset_version.inline_content,
+        )
+        self.assertEqual(dispatched.asset_external_url, "")
+        self.assertEqual(
+            dispatched.metadata["asset_content_sha256"],
+            self.fixture.asset_version.content_sha256,
+        )
+
+    def test_manual_inline_publication_never_requires_a_draft_url_or_transport(self):
+        transport = _SuccessfulTransport()
+        runtime = PublicationRuntime(
+            PublicationRuntimeConfig({(Platform.TIKTOK, PublicationMode.API): transport})
+        )
+        with patch(
+            "dailyops.content_generation.validate_inline_content_evidence_manifest",
+            return_value=[],
+        ):
+            result = dispatch_confirmed_publication(
+                publication=self.publication,
+                publisher_principal=self.fixture.publisher,
+                confirmation=self.confirmation(PublicationMode.MANUAL),
+                command_id=uuid.uuid4(),
+                runtime=runtime,
+                manual_external_publication_id="manual-inline-123",
+            )
+        self.assertEqual(result.status, PublicationDispatchStatus.SUCCEEDED)
+        self.assertEqual(result.publication_event.external_publication_id, "manual-inline-123")
+        self.assertEqual(transport.calls, [])
+
+    def test_stale_inline_evidence_manifest_blocks_before_transport(self):
+        transport = _SuccessfulTransport()
+        runtime = PublicationRuntime(
+            PublicationRuntimeConfig({(Platform.TIKTOK, PublicationMode.API): transport})
+        )
+        with patch(
+            "dailyops.content_generation.validate_inline_content_evidence_manifest",
+            side_effect=ValidationError("STALE_INLINE_EVIDENCE_MANIFEST"),
+        ):
+            with self.assertRaisesMessage(ValidationError, "STALE_INLINE_EVIDENCE_MANIFEST"):
+                dispatch_confirmed_publication(
+                    publication=self.publication,
+                    publisher_principal=self.fixture.publisher,
+                    confirmation=self.confirmation(PublicationMode.API),
+                    command_id=uuid.uuid4(),
+                    runtime=runtime,
+                )
+        self.assertEqual(transport.calls, [])

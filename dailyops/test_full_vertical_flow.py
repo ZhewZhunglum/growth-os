@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import hashlib
 import uuid
 from datetime import timedelta
 from decimal import Decimal
+from unittest.mock import patch
 
 from django.core.exceptions import ValidationError
 from django.test import TestCase
@@ -21,6 +21,11 @@ from dailyops.runtime import (
     DailyOperationsRuntime,
     build_daily_operations_runtime,
 )
+from dailyops.content_generation import (
+    generate_task_content_draft,
+    revise_task_content_draft,
+)
+from dailyops.evidence_services import invalidate_evidence
 from dailyops.services import (
     accept_daily_analysis,
     compile_channel_plan_task,
@@ -65,6 +70,7 @@ from integrations.connectors.types import (
     ConnectorRunStatus,
     Platform,
 )
+from integrations.ai.providers import FakeAIProvider
 from integrations.publishing import PublicationDispatchStatus, PublicationMode
 from intelligence.models import (
     ChannelPlan,
@@ -141,6 +147,16 @@ class _OfflineSevenPlatformRunner:
                                 "afternoon focus routine."
                             ),
                             "attributes": {"fixture": "daily-operations-v1"},
+                        },
+                        {
+                            "external_id": "pin-offline-daily-v2",
+                            "url": "https://www.pinterest.com/pin/offline-daily-v2/",
+                            "title": "People compare simple afternoon focus habits",
+                            "content_text": (
+                                "A second bounded fixture so partial evidence invalidation "
+                                "can be exercised without removing the whole demand set."
+                            ),
+                            "attributes": {"fixture": "daily-operations-v1-secondary"},
                         },
                     ),
                     provenance=({"transport": "offline-fake", "network": False},),
@@ -325,9 +341,9 @@ class FullDailyOperationsVerticalFlowTests(TestCase):
         self.contract = TaskContractVersion.objects.create(
             product_profile_version=profile,
             version_number=1,
-            title="Daily Operations link-only publication",
+            title="Daily Operations inline content publication",
             dor_criteria=[{"key": "source_ready", "required": True}],
-            dod_criteria=[{"key": "external_link", "required": True}],
+            dod_criteria=[{"key": "primary_deliverable", "required": True}],
             release_gate_criteria=[{"key": "exact_release_context", "required": True}],
             success_criteria=[{"key": "published_url", "required": True}],
             sealed_at=self.now,
@@ -478,8 +494,12 @@ class FullDailyOperationsVerticalFlowTests(TestCase):
             sum(run.status == CollectionRun.Status.BLOCKED for run in automatic.runs),
             6,
         )
-        evidence_item = ExternalEvidenceItem.objects.get(collection_run__in=automatic.runs)
-        raw_artifact = RawArtifact.objects.get(collection_run=evidence_item.collection_run)
+        evidence_items = list(
+            ExternalEvidenceItem.objects.filter(collection_run__in=automatic.runs).order_by("id")
+        )
+        self.assertEqual(len(evidence_items), 2)
+        evidence_item, evidence_to_invalidate = evidence_items
+        raw_artifact = evidence_item.artifact_links.get().raw_artifact
         self.assertTrue(
             EvidenceArtifactLink.objects.filter(
                 evidence_item=evidence_item,
@@ -498,7 +518,10 @@ class FullDailyOperationsVerticalFlowTests(TestCase):
         )
         self.assertEqual(proposal.method, "AI_PROPOSAL")
         self.assertEqual(proposal.decision_state, "PROPOSED")
-        self.assertEqual(proposal.value["evidence_ids"], [str(evidence_item.pk)])
+        self.assertEqual(
+            set(proposal.value["evidence_ids"]),
+            {str(item.pk) for item in evidence_items},
+        )
         self.assertFalse(ProductOpportunity.objects.exists())
         opportunity = accept_daily_analysis(
             proposal=proposal,
@@ -590,8 +613,9 @@ class FullDailyOperationsVerticalFlowTests(TestCase):
             "LEGACY_WRONG_CAPABILITY",
         )
 
-        # Execute the compiled Task with an explicit assignee and a link-only
-        # immutable ContentAssetVersion; no media bytes are uploaded.
+        # Execute the compiled Task with an explicit assignee.  Content is
+        # generated in deterministic offline mode, then edited into a new
+        # immutable inline ContentAssetVersion; no media bytes or paid API are used.
         TaskCheckRun.record_completed(
             task=task,
             check_kind=TaskCheckRun.Kind.DOR,
@@ -639,44 +663,212 @@ class FullDailyOperationsVerticalFlowTests(TestCase):
             grant=self.operator_edit,
             reason="Operator started work.",
         )
-        external_draft_url = "https://docs.example.test/puko/daily-v1"
-        asset = ContentAsset.create_idempotent(
+        base_fake_output = {
+            "platform": Platform.TIKTOK.value,
+            "content_type": "short-video-script",
+            "title": "Bounded draft",
+            "hook": "A measured hook.",
+            "body": "A body grounded in the exact external evidence.",
+            "call_to_action": "Save this for later.",
+            "hashtags": ["PUKO"],
+            "production_notes": "Human review required.",
+            "claim_keys": [],
+            "evidence_ids": [str(uuid.uuid4())],
+            "language_code": "en",
+        }
+        asset_count = ContentAsset.objects.count()
+        version_count = ContentAssetVersion.objects.count()
+        with self.assertRaisesMessage(
+            ValidationError,
+            "任务需求链之外或已经作废",
+        ):
+            generate_task_content_draft(
+                task=task,
+                command_id=uuid.uuid4(),
+                principal=self.operator,
+                acting_role=self.operator.role,
+                permission_grant=self.operator_edit,
+                provider=FakeAIProvider([base_fake_output]),
+            )
+        self.assertEqual(ContentAsset.objects.count(), asset_count)
+        self.assertEqual(ContentAssetVersion.objects.count(), version_count)
+
+        prohibited_output = dict(base_fake_output)
+        prohibited_output["evidence_ids"] = [str(evidence_item.pk)]
+        prohibited_output["body"] = "This product can cure the problem."
+        with self.assertRaisesMessage(ValidationError, "内容包含禁用"):
+            generate_task_content_draft(
+                task=task,
+                command_id=uuid.uuid4(),
+                principal=self.operator,
+                acting_role=self.operator.role,
+                permission_grant=self.operator_edit,
+                provider=FakeAIProvider([prohibited_output]),
+            )
+        self.assertEqual(ContentAsset.objects.count(), asset_count)
+        self.assertEqual(ContentAssetVersion.objects.count(), version_count)
+
+        with patch.object(
+            PolicyVersion,
+            "normalized_rules",
+            return_value=[{"rule_code": "future_required_content_rule", "required": True}],
+        ):
+            with self.assertRaisesMessage(ValidationError, "尚未实现的必选规则"):
+                generate_task_content_draft(
+                    task=task,
+                    command_id=uuid.uuid4(),
+                    principal=self.operator,
+                    acting_role=self.operator.role,
+                    permission_grant=self.operator_edit,
+                )
+        self.assertEqual(ContentAsset.objects.count(), asset_count)
+        self.assertEqual(ContentAssetVersion.objects.count(), version_count)
+
+        generation_command_id = uuid.uuid4()
+        generated = generate_task_content_draft(
             task=task,
-            asset_key="primary-link",
-            title="Daily TikTok deliverable",
-            asset_kind=ContentAsset.AssetKind.VIDEO,
-            description="Link-only external draft; Growth OS stores no media file.",
-            command_id=uuid.uuid4(),
-            actor_principal=self.operator,
+            command_id=generation_command_id,
+            principal=self.operator,
             acting_role=self.operator.role,
             permission_grant=self.operator_edit,
-            recorded_by_principal=self.operator,
         )
-        asset_version = ContentAssetVersion.create_next(
-            content_asset=asset,
-            object_key=external_draft_url,
-            mime_type="text/uri-list",
-            byte_size=len(external_draft_url.encode("utf-8")),
-            content_sha256=hashlib.sha256(external_draft_url.encode("utf-8")).hexdigest(),
-            metadata={
-                "storage_mode": "LINK_ONLY",
-                "provider": "external-docs",
-                "version_reference": "daily-v1",
-            },
-            command_id=uuid.uuid4(),
-            actor_principal=self.operator,
+        generated_version = generated.asset_version
+        self.assertEqual(
+            generated_version.representation_kind,
+            ContentAssetVersion.RepresentationKind.INLINE_TEXT,
+        )
+        self.assertEqual(generated_version.metadata["provider"], "dry-run")
+        self.assertEqual(generated_version.metadata["execution_status"], "DRY_RUN")
+        self.assertIn("Offline test draft", generated_version.metadata["production_notes"])
+        self.assertNotIn("Offline test draft", generated_version.inline_content)
+        self.assertNotIn("Production notes", generated_version.inline_content)
+        self.assertEqual(
+            {item["id"] for item in generated_version.metadata["evidence_manifest"]},
+            {str(item.pk) for item in evidence_items},
+        )
+        generation_replay = generate_task_content_draft(
+            task=task,
+            command_id=generation_command_id,
+            principal=self.operator,
             acting_role=self.operator.role,
             permission_grant=self.operator_edit,
-            recorded_by_principal=self.operator,
+        )
+        self.assertFalse(generation_replay.created)
+        self.assertEqual(generation_replay.asset_version.pk, generated_version.pk)
+        with self.assertRaisesMessage(ValidationError, "不要重复生成"):
+            generate_task_content_draft(
+                task=task,
+                command_id=uuid.uuid4(),
+                principal=self.operator,
+                acting_role=self.operator.role,
+                permission_grant=self.operator_edit,
+            )
+
+        revised_content = (
+            generated_version.inline_content
+            + "\n\nHuman edit: keep the wording measured and show a real afternoon routine."
+        )
+        revision_command_id = uuid.uuid4()
+        revised = revise_task_content_draft(
+            task=task,
+            source_version=generated_version,
+            inline_content=revised_content,
+            command_id=revision_command_id,
+            principal=self.operator,
+            acting_role=self.operator.role,
+            permission_grant=self.operator_edit,
+        )
+        asset_version = revised.asset_version
+        self.assertEqual(asset_version.version_number, generated_version.version_number + 1)
+        self.assertEqual(asset_version.metadata["source"], "human-edited-inline-content")
+        generated_version.refresh_from_db()
+        self.assertNotIn("Human edit:", generated_version.inline_content)
+        revision_replay = revise_task_content_draft(
+            task=task,
+            source_version=generated_version,
+            inline_content=revised_content,
+            command_id=revision_command_id,
+            principal=self.operator,
+            acting_role=self.operator.role,
+            permission_grant=self.operator_edit,
+        )
+        self.assertFalse(revision_replay.created)
+        self.assertEqual(revision_replay.asset_version.pk, asset_version.pk)
+
+        # Invalidate only one item after v1/v2 were created. Both immutable
+        # versions stay in history, but neither may be revised or submitted.
+        invalidate_evidence(
+            evidence_id=evidence_to_invalidate.pk,
+            product=self.product,
+            batch_key=batch_key,
+            command_id=uuid.uuid4(),
+            reason="The secondary fixture was linked to the wrong source.",
+            principal=self.owner,
+            acting_role=self.owner.role,
+        )
+        stale_version_count = ContentAssetVersion.objects.count()
+        with self.assertRaisesMessage(ValidationError, "外部需求证据已经作废"):
+            revise_task_content_draft(
+                task=task,
+                source_version=asset_version,
+                inline_content=asset_version.inline_content + "\n\nThis stale edit must not persist.",
+                command_id=uuid.uuid4(),
+                principal=self.operator,
+                acting_role=self.operator.role,
+                permission_grant=self.operator_edit,
+            )
+        self.assertEqual(ContentAssetVersion.objects.count(), stale_version_count)
+
+        # A fresh offline generation is allowed because the latest immutable
+        # version is stale. It reuses the asset but writes a new version whose
+        # exact manifest excludes the invalidated evidence. A subsequent human
+        # revision inherits that current manifest, never the stale one.
+        regenerated = generate_task_content_draft(
+            task=task,
+            command_id=uuid.uuid4(),
+            principal=self.operator,
+            acting_role=self.operator.role,
+            permission_grant=self.operator_edit,
+        )
+        self.assertEqual(
+            regenerated.asset_version.metadata["evidence_manifest"],
+            [
+                {
+                    "id": str(evidence_item.pk),
+                    "provenance_sha256": evidence_item.provenance_sha256,
+                    "source_id": str(evidence_item.source_id),
+                }
+            ],
+        )
+        fresh_revision = revise_task_content_draft(
+            task=task,
+            source_version=regenerated.asset_version,
+            inline_content=(
+                regenerated.asset_version.inline_content
+                + "\n\nHuman edit after refreshing the current evidence manifest."
+            ),
+            command_id=uuid.uuid4(),
+            principal=self.operator,
+            acting_role=self.operator.role,
+            permission_grant=self.operator_edit,
+        )
+        asset_version = fresh_revision.asset_version
+        self.assertEqual(
+            asset_version.metadata["evidence_manifest"],
+            regenerated.asset_version.metadata["evidence_manifest"],
+        )
+        self.assertNotIn(
+            str(evidence_to_invalidate.pk),
+            {item["id"] for item in asset_version.metadata["evidence_manifest"]},
         )
         dod = TaskCheckRun.record_completed(
             task=task,
             check_kind=TaskCheckRun.Kind.DOD,
             results=[
                 {
-                    "criterion_key": "external_link",
+                    "criterion_key": "primary_deliverable",
                     "result": TaskCheckRun.Result.PASS,
-                    "evidence": {"url": external_draft_url},
+                    "evidence": {"content_asset_version_id": str(asset_version.pk)},
                 }
             ],
             command_id=uuid.uuid4(),
@@ -689,7 +881,7 @@ class FullDailyOperationsVerticalFlowTests(TestCase):
             task=task,
             dod_check_run=dod,
             primary_asset_version=asset_version,
-            submission_note="Stable external version link for human review.",
+            submission_note="Exact inline content version for human review.",
             command_id=uuid.uuid4(),
             expected_task_version=task.state_version,
             actor_principal=self.operator,
@@ -702,7 +894,7 @@ class FullDailyOperationsVerticalFlowTests(TestCase):
             Task.State.SUBMITTED,
             actor=self.operator,
             grant=self.operator_edit,
-            reason="Exact link-only version submitted.",
+            reason="Exact inline content version submitted.",
         )
         self._transition_task(
             task,
@@ -730,8 +922,8 @@ class FullDailyOperationsVerticalFlowTests(TestCase):
         review = ReviewDecision.record_final(
             submission=submission,
             decision=ReviewDecision.Decision.APPROVED,
-            rationale="A different human reviewer approved the exact linked version.",
-            criteria_results={"external_link": "PASS"},
+            rationale="A different human reviewer approved the exact inline version.",
+            criteria_results={"primary_deliverable": "PASS"},
             command_id=uuid.uuid4(),
             expected_task_version=task.state_version,
             reviewer_principal=self.reviewer,

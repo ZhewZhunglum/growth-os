@@ -184,6 +184,7 @@ class DailyOperationsRuntimeTests(unittest.TestCase):
                         )
                     },
                     browser_clients={Platform.QUORA: browser},
+                    browser_clocks={Platform.QUORA: lambda: NOW},
                 )
             )
         )

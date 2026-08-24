@@ -7,6 +7,7 @@ from django.core import signing
 from django.utils.translation import get_language
 
 from accounts.models import Principal
+from contentops.models import ContentAssetVersion
 from core.ids import uuid7
 from products.models import ProductProfileVersion
 from workflow.models import TaskCheckRun, TaskContractVersion
@@ -36,6 +37,9 @@ FORM_TEXT = {
     "description": ("为什么做 / 任务说明", "Purpose / task instructions"),
     "assignee": ("分配给哪位执行负责人", "Assign to"),
     "external_url": ("本次交付链接", "Delivery link"),
+    "delivery_mode": ("这次送审哪份内容", "Content to submit"),
+    "content_version": ("系统内完整内容", "Complete content in Growth OS"),
+    "inline_content": ("完整发布内容", "Complete publishable content"),
     "submission_note": ("交付说明", "Delivery note"),
 }
 
@@ -45,8 +49,12 @@ FORM_HELP = {
         "Explain the context and goal in plain language. Readiness and delivery checks come from the selected contract.",
     ),
     "external_url": (
-        "必填。请填写可供审核和发布人员打开的内容链接。链接变化时需提交新版本。",
-        "Required. Add a link that reviewers and publishers can open. Submit a new version whenever the link changes.",
+        "仅在选择“外部链接”时填写。链接变化时需提交新版本。",
+        "Complete this only when External link is selected. A changed link requires a new submission.",
+    ),
+    "content_version": (
+        "选择系统刚生成或你刚保存的最新完整内容版本。送审后该版本不会被改写。",
+        "Select the latest complete version generated or saved here. The submitted version cannot be rewritten.",
     ),
 }
 
@@ -256,6 +264,32 @@ class StartWorkForm(CommandForm):
     pass
 
 
+class ContentGenerateForm(CommandForm):
+    """Explicit offline generation command; the view never selects a live provider."""
+
+
+class ContentRevisionForm(CommandForm):
+    source_version = forms.ModelChoiceField(
+        queryset=ContentAssetVersion.objects.none(),
+        widget=forms.HiddenInput,
+    )
+    inline_content = forms.CharField(
+        label="完整发布内容",
+        min_length=1,
+        max_length=50_000,
+        widget=forms.Textarea(attrs={"rows": 18}),
+        help_text="保存会创建不可变的新版本；旧版本仍会保留，不会被覆盖。",
+    )
+
+    def __init__(self, *args, source_versions, state_version: int, **kwargs):
+        super().__init__(*args, state_version=state_version, **kwargs)
+        self.fields["source_version"].queryset = source_versions
+        if _is_english():
+            self.fields["inline_content"].help_text = (
+                "Saving creates a new immutable version. The previous version remains unchanged."
+            )
+
+
 class ResumeDraftForm(CommandForm):
     pass
 
@@ -281,10 +315,30 @@ class WithdrawSubmissionForm(CommandForm):
 
 
 class DeliveryDoDForm(CriteriaCommandForm):
+    class DeliveryMode:
+        SYSTEM_CONTENT = "SYSTEM_CONTENT"
+        EXTERNAL_URL = "EXTERNAL_URL"
+
+    delivery_mode = forms.ChoiceField(
+        label="这次送审哪份内容",
+        choices=(
+            ("SYSTEM_CONTENT", "送审系统内的完整内容"),
+            ("EXTERNAL_URL", "送审外部内容链接"),
+        ),
+        widget=forms.RadioSelect,
+    )
+    content_version = forms.ModelChoiceField(
+        queryset=ContentAssetVersion.objects.none(),
+        label="系统内完整内容",
+        required=False,
+        empty_label="请选择最新内容版本",
+        help_text="选择系统刚生成或你刚保存的最新完整内容版本。送审后该版本不会被改写。",
+    )
     external_url = forms.URLField(
         label="本次交付链接",
+        required=False,
         max_length=1024,
-        help_text="必填。请填写可供审核和发布人员打开的内容链接。链接变化时需提交新版本。",
+        help_text="仅在选择“外部链接”时填写。链接变化时需提交新版本。",
     )
     submission_note = forms.CharField(
         label="交付说明",
@@ -292,3 +346,49 @@ class DeliveryDoDForm(CriteriaCommandForm):
         max_length=2000,
         widget=forms.Textarea(attrs={"rows": 3}),
     )
+
+    def __init__(self, *args, content_versions=None, state_version: int, **kwargs):
+        if args and args[0] is not None and "delivery_mode" not in args[0]:
+            # Backward-compatible server-side inference for existing clients.
+            # The current UI always posts the explicit radio choice.
+            data = args[0].copy()
+            if data.get("external_url"):
+                data["delivery_mode"] = self.DeliveryMode.EXTERNAL_URL
+            elif data.get("content_version"):
+                data["delivery_mode"] = self.DeliveryMode.SYSTEM_CONTENT
+            args = (data, *args[1:])
+        super().__init__(*args, state_version=state_version, **kwargs)
+        queryset = content_versions or ContentAssetVersion.objects.none()
+        self.fields["content_version"].queryset = queryset
+        has_system_content = queryset.exists()
+        self.fields["delivery_mode"].initial = (
+            self.DeliveryMode.SYSTEM_CONTENT if has_system_content else self.DeliveryMode.EXTERNAL_URL
+        )
+        if not has_system_content:
+            self.fields["content_version"].disabled = True
+            self.fields["content_version"].empty_label = "请先生成完整内容"
+        if _is_english():
+            self.fields["delivery_mode"].choices = (
+                (self.DeliveryMode.SYSTEM_CONTENT, "Submit complete content saved in Growth OS"),
+                (self.DeliveryMode.EXTERNAL_URL, "Submit an external content link"),
+            )
+            self.fields["content_version"].empty_label = (
+                "Generate complete content first" if not has_system_content else "Select the latest content version"
+            )
+
+    def clean(self):
+        cleaned = super().clean()
+        mode = cleaned.get("delivery_mode")
+        content_version = cleaned.get("content_version")
+        external_url = cleaned.get("external_url")
+        if mode == self.DeliveryMode.SYSTEM_CONTENT:
+            if content_version is None:
+                self.add_error("content_version", "请先生成或保存一份系统内完整内容。")
+            if external_url:
+                self.add_error("external_url", "送审系统内内容时不要同时填写外部链接。")
+        elif mode == self.DeliveryMode.EXTERNAL_URL:
+            if not external_url:
+                self.add_error("external_url", "选择外部链接时必须填写网址。")
+            if content_version is not None:
+                self.add_error("content_version", "送审外部链接时不要同时选择系统内内容。")
+        return cleaned

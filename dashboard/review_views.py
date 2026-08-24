@@ -38,6 +38,13 @@ def _is_link_delivery(asset_version) -> bool:
     )
 
 
+def _is_inline_delivery(asset_version) -> bool:
+    return bool(
+        asset_version.representation_kind == "INLINE_TEXT"
+        and asset_version.inline_content.strip()
+    )
+
+
 def _subcommand(root: uuid.UUID, label: str) -> uuid.UUID:
     return uuid.uuid5(root, f"growth-os:dashboard-review-release:{label}")
 
@@ -208,6 +215,7 @@ def _review_context(task: Task, *, form=None):
         "submission": submission,
         "asset_version": asset_version,
         "is_link_delivery": _is_link_delivery(asset_version),
+        "is_inline_delivery": _is_inline_delivery(asset_version),
         "review_form": form or ReviewDecisionForm(state_version=task.state_version),
     }
 
@@ -259,6 +267,7 @@ def _release_context(task: Task, user: Principal, *, gate_form=None, proof_form=
         "can_publish": can_publish,
         "can_view_asset": _can_view_asset_version(user, task, submission),
         "is_link_delivery": _is_link_delivery(asset_version),
+        "is_inline_delivery": _is_inline_delivery(asset_version),
         "readable_proof_event_ids": readable_proof_event_ids,
     }
 
@@ -325,6 +334,9 @@ def review_history_detail(request: HttpRequest, review_id) -> HttpResponse:
             "task": review.submission.task,
             "asset_version": review.submission.primary_asset_version,
             "is_link_delivery": _is_link_delivery(
+                review.submission.primary_asset_version
+            ),
+            "is_inline_delivery": _is_inline_delivery(
                 review.submission.primary_asset_version
             ),
             "can_view_asset": _can_view_asset_version(

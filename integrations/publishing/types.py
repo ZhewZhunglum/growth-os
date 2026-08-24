@@ -16,6 +16,13 @@ class PublicationMode(StrEnum):
     MANUAL = "MANUAL"
 
 
+class PublicationAssetRepresentation(StrEnum):
+    """Exact form of the immutable asset sent to a publication route."""
+
+    EXTERNAL_URL = "EXTERNAL_URL"
+    INLINE_TEXT = "INLINE_TEXT"
+
+
 class PublicationDispatchStatus(StrEnum):
     SUCCEEDED = "SUCCEEDED"
     DRY_RUN = "DRY_RUN"
@@ -74,7 +81,9 @@ class PublicationDispatchRequest:
     operation_key: str
     account_ref: str
     asset_version_id: str
+    asset_representation_kind: PublicationAssetRepresentation
     asset_external_url: str
+    asset_inline_content: str
     gate_id: str
     gate_context_sha256: str
     human_confirmation_id: str
@@ -84,6 +93,11 @@ class PublicationDispatchRequest:
     def __post_init__(self) -> None:
         if not isinstance(self.platform, Platform) or not isinstance(self.mode, PublicationMode):
             raise ValueError("Publication platform and mode must use the declared V1 enums")
+        try:
+            representation_kind = PublicationAssetRepresentation(self.asset_representation_kind)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Publication asset representation is unsupported") from exc
+        object.__setattr__(self, "asset_representation_kind", representation_kind)
         if not _OPERATION_KEY.fullmatch(self.operation_key):
             raise ValueError("operation_key has an invalid format")
         if not all(
@@ -98,11 +112,19 @@ class PublicationDispatchRequest:
             )
         ):
             raise ValueError("Publication dispatch references must be non-empty")
-        parsed = urlsplit(self.asset_external_url)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            raise ValueError("V1 publication requires an external HTTP(S) asset link")
-        if parsed.username or parsed.password:
-            raise ValueError("Asset links must not embed credentials")
+        if representation_kind is PublicationAssetRepresentation.EXTERNAL_URL:
+            parsed = urlsplit(self.asset_external_url)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                raise ValueError("An external publication asset requires an HTTP(S) link")
+            if parsed.username or parsed.password:
+                raise ValueError("Asset links must not embed credentials")
+            if self.asset_inline_content:
+                raise ValueError("An external publication asset cannot also contain inline text")
+        else:
+            if self.asset_external_url:
+                raise ValueError("An inline publication asset cannot also contain an external URL")
+            if not self.asset_inline_content.strip():
+                raise ValueError("An inline publication asset requires non-blank content")
         object.__setattr__(self, "metadata", MappingProxyType(dict(self.metadata)))
 
 

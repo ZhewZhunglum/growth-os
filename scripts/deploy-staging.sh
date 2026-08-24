@@ -201,22 +201,32 @@ print("Exact-three Staging identity gate: PASS")
         --product-code "$STAGING_PRODUCT_CODE" \
         --publish-account-code "$STAGING_PUBLISH_ACCOUNT_CODE"
 
-    # The dry run may model a missing PUBLISH Grant and roll it back. Prove one
-    # exact bounded HIGH Grant was already committed.
+    # The dry run may model missing PUBLISH Grants and roll them back. Prove
+    # Owner, Admin, and Operator each already have their own exact, bounded,
+    # Owner-granted, account-scoped HIGH Grant.
     compose exec -T web python -c '
 import sys
+from datetime import timedelta
 from django.db.models import Q
 from django.utils import timezone
 from accounts.models import PermissionGrant, Principal
 
-operator = Principal.objects.get(username=sys.argv[1])
+usernames = sys.argv[1:4]
+account_ref = sys.argv[4]
+principals = {
+    principal.username: principal
+    for principal in Principal.objects.filter(username__in=usernames)
+}
+if set(principals) != set(usernames):
+    raise SystemExit("UPGRADE_PUBLISH_PRINCIPAL_SET_NOT_EXACT")
+owner = principals[usernames[0]]
 now = timezone.now()
 grants = list(PermissionGrant.objects.filter(
-    principal=operator,
+    principal__in=principals.values(),
     scope_kind=PermissionGrant.ScopeKind.ACCOUNT,
     product__isnull=True,
     platform_code="",
-    account_ref=sys.argv[2],
+    account_ref=account_ref,
     surface_ref="",
     action=PermissionGrant.Action.PUBLISH,
     effect=PermissionGrant.Effect.ALLOW,
@@ -224,10 +234,20 @@ grants = list(PermissionGrant.objects.filter(
     grant_status=PermissionGrant.GrantStatus.ACTIVE,
     valid_from__lte=now,
 ).filter(Q(valid_until__isnull=True) | Q(valid_until__gt=now)))
-if len(grants) != 1 or grants[0].valid_until is None:
-    raise SystemExit("UPGRADE_EXACT_BOUNDED_PUBLISH_GRANT_MISSING")
-print("Exact bounded Operator PUBLISH Grant: PASS")
-' "$STAGING_OPERATOR_USERNAME" "$STAGING_PUBLISH_ACCOUNT_CODE"
+for username in usernames:
+    exact = [grant for grant in grants if grant.principal_id == principals[username].pk]
+    if len(exact) != 1:
+        raise SystemExit(f"UPGRADE_EXACT_BOUNDED_PUBLISH_GRANT_MISSING:{username}")
+    grant = exact[0]
+    if (
+        grant.valid_until is None
+        or grant.valid_until - grant.valid_from > timedelta(days=31)
+        or grant.granted_by_principal_id != owner.pk
+    ):
+        raise SystemExit(f"UPGRADE_PUBLISH_GRANT_NOT_OWNER_GRANTED_OR_BOUNDED:{username}")
+print("Exact bounded Owner/Admin/Operator PUBLISH Grants: PASS")
+' "$STAGING_OWNER_USERNAME" "$STAGING_ADMIN_USERNAME" "$STAGING_OPERATOR_USERNAME" \
+    "$STAGING_PUBLISH_ACCOUNT_CODE"
 }
 
 invalidate_all_sessions() {
@@ -240,34 +260,69 @@ print(f"Staging sessions invalidated: {deleted}")
 '
 }
 
-verify_link_only_content_versions() {
+verify_content_representations() {
     compose exec -T web python -c '
+import hashlib
+from urllib.parse import urlsplit
+
 from contentops.models import ContentAssetVersion
 
 invalid_count = 0
 sample_ids = []
 total = 0
+legacy_count = 0
+external_url_count = 0
+inline_text_count = 0
 for version in ContentAssetVersion.objects.only(
-    "id", "mime_type", "metadata", "object_key"
+    "id", "payload_schema_version", "representation_kind", "object_key",
+    "inline_content", "byte_size", "content_sha256"
 ).iterator():
     total += 1
-    metadata = version.metadata
-    if (
-        version.mime_type != "text/uri-list"
-        or not isinstance(metadata, dict)
-        or metadata.get("source") != "external-url"
-        or not version.object_key.startswith(("http://", "https://"))
-    ):
+    valid = False
+    if version.payload_schema_version == ContentAssetVersion.PayloadSchemaVersion.V1:
+        # Historical V1 rows keep their original object-key payload and hashes.
+        # They are compatibility-only; current code can create V2 rows only.
+        legacy_count += 1
+        valid = (
+            version.representation_kind == ContentAssetVersion.RepresentationKind.EXTERNAL_URL
+            and bool(version.object_key)
+            and not version.inline_content
+        )
+    elif version.payload_schema_version == ContentAssetVersion.PayloadSchemaVersion.V2:
+        if version.representation_kind == ContentAssetVersion.RepresentationKind.EXTERNAL_URL:
+            parsed = urlsplit(version.object_key)
+            external_url_count += 1
+            valid = (
+                parsed.scheme in {"http", "https"}
+                and bool(parsed.netloc)
+                and not parsed.username
+                and not parsed.password
+                and not version.inline_content
+            )
+        elif version.representation_kind == ContentAssetVersion.RepresentationKind.INLINE_TEXT:
+            encoded = version.inline_content.encode("utf-8")
+            inline_text_count += 1
+            valid = (
+                not version.object_key
+                and bool(version.inline_content.strip())
+                and version.byte_size == len(encoded)
+                and version.content_sha256 == hashlib.sha256(encoded).hexdigest()
+            )
+    if not valid:
         invalid_count += 1
         if len(sample_ids) < 5:
             sample_ids.append(str(version.pk))
 if invalid_count:
     rendered_ids = ",".join(sample_ids)
     raise SystemExit(
-        "LINK_ONLY_CONTENT_VERSION_GATE_FAILED: "
+        "CONTENT_REPRESENTATION_GATE_FAILED: "
         f"invalid_count={invalid_count}; sample_ids={rendered_ids}"
     )
-print(f"Link-only ContentAssetVersion gate: PASS ({total} versions)")
+print(
+    "ContentAssetVersion representation gate: PASS "
+    f"(total={total}, legacy_v1={legacy_count}, external_url_v2={external_url_count}, "
+    f"inline_text_v2={inline_text_count})"
+)
 '
 }
 
@@ -372,7 +427,7 @@ then
     [ "$current_health" = "healthy" ] \
         || fail "The current loopback web container must be healthy for pre-migration upgrade verification."
     verify_exact_staging_staff_and_grants
-    verify_link_only_content_versions
+    verify_content_representations
     invalidate_all_sessions
     echo "Pre-migration upgrade data gate: PASS"
 fi
@@ -488,7 +543,7 @@ done
 # The replacement web remains loopback-only. Bootstrap retains the strict zero
 # legacy-data gate. Upgrade revalidates the exact live identities/Grants and
 # invalidates sessions again before the edge may return.
-verify_link_only_content_versions
+verify_content_representations
 if [ "$deploy_mode" = "bootstrap" ]
 then
     verify_bootstrap_zero_state

@@ -586,6 +586,7 @@ class ConnectorRuntimeConfig:
     api_routes: Mapping[Platform, JSONAPIRouteConfig] = field(default_factory=dict)
     browser_routes: Mapping[Platform, BrowserRouteConfig] = field(default_factory=dict)
     browser_clients: Mapping[Platform, BrowserWorkerClient] = field(default_factory=dict)
+    browser_clocks: Mapping[Platform, Callable[[], datetime]] = field(default_factory=dict)
     api_transports: Mapping[Platform, ReadOnlyJSONTransport] = field(default_factory=dict)
 
 
@@ -624,7 +625,11 @@ def build_connector_registry(config: ConnectorRuntimeConfig | None = None) -> di
         )
         routes_by_mode = {
             AcquisitionMode.API: api_route,
-            AcquisitionMode.BROWSER: BrowserRoute(browser_config, client=config.browser_clients.get(platform)),
+            AcquisitionMode.BROWSER: BrowserRoute(
+                browser_config,
+                client=config.browser_clients.get(platform),
+                clock=config.browser_clocks.get(platform),
+            ),
             AcquisitionMode.CSV: CSVRoute(platform, providers[AcquisitionMode.CSV]),
             AcquisitionMode.MANUAL: ManualRoute(platform, providers[AcquisitionMode.MANUAL]),
         }
