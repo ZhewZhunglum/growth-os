@@ -8,6 +8,7 @@ from urllib.parse import urlparse
 
 from django.core.exceptions import PermissionDenied, ValidationError
 from django.db import transaction
+from django.db.models import Q
 from django.utils import timezone
 
 from accounts.authorization import require_authorization
@@ -38,6 +39,14 @@ GEO_PANEL_MANAGER_ROLES = {
     Principal.Role.OWNER,
     Principal.Role.OPERATIONS_ADMIN,
 }
+LOCAL_TEST_GEO_PANEL_KEY = "local-test-puko-geo"
+
+
+def _is_local_test_geo_item(item: GEOProbePanelItem) -> bool:
+    return bool(
+        item.panel.panel_key == LOCAL_TEST_GEO_PANEL_KEY
+        or (item.intent or "").upper().startswith("LOCAL_")
+    )
 
 
 def _sha256(payload) -> str:
@@ -455,6 +464,9 @@ def evidence_choices(*, actor, limit: int = 80):
     ).order_by("-created_at")[:limit]
     geo = GEOMetricObservation.objects.select_related(
         "probe_result__panel_item__panel__product", "metric_definition"
+    ).exclude(
+        Q(probe_result__panel_item__panel__panel_key=LOCAL_TEST_GEO_PANEL_KEY)
+        | Q(probe_result__panel_item__intent__istartswith="LOCAL_")
     ).order_by("-created_at")[:limit]
     choices = []
     for item in channel:
@@ -503,6 +515,10 @@ def _resolve_learning_evidence(*, product, evidence_ref: str):
         evidence = GEOMetricObservation.objects.select_related(
             "probe_result__panel_item__panel"
         ).get(pk=identifier)
+        if _is_local_test_geo_item(evidence.probe_result.panel_item):
+            raise ValidationError(
+                {"evidence_ref": "本地 GEO 测试结果不能进入正式学习或需求。"}
+            )
         if evidence.probe_result.panel_item.panel.product_id != product.pk:
             raise ValidationError({"evidence_ref": "GEO 证据不属于所选产品。"})
         return LearningEvidenceLink.SourceKind.GEO, evidence

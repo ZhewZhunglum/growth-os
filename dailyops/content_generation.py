@@ -78,7 +78,6 @@ def _context_for_task(task_id) -> TaskCompilationContext:
 def _latest_generated_content(task_id) -> ContentAssetVersion | None:
     return ContentAssetVersion.objects.select_related("content_asset").filter(
         content_asset__task_id=task_id,
-        content_asset__asset_key="publishable-content",
         representation_kind=ContentAssetVersion.RepresentationKind.INLINE_TEXT,
     ).order_by("-version_number", "-created_at", "-id").first()
 
@@ -529,6 +528,26 @@ def generate_task_content_draft(
             task=locked_task,
             asset_key="publishable-content",
         ).first()
+        if asset is None:
+            # A legacy Daily Operations submission may have been approved as
+            # an EXTERNAL_URL.  When an Owner/Admin explicitly returns that
+            # exact submission, keep one immutable version chain by creating
+            # the new INLINE_TEXT version on its original primary asset.
+            returned_submission = (
+                locked_task.submissions.select_related(
+                    "primary_asset_version__content_asset"
+                )
+                .filter(
+                    withdrawal_events__event_type="APPROVED_REWORK_REQUESTED"
+                )
+                .order_by("-submission_number")
+                .first()
+            )
+            if returned_submission is not None:
+                asset = ContentAsset.objects.select_for_update().filter(
+                    pk=returned_submission.primary_asset_version.content_asset_id,
+                    task=locked_task,
+                ).first()
         if asset is None:
             asset = ContentAsset.create_idempotent(
                 task=locked_task,

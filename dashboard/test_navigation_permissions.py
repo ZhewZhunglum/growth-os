@@ -75,4 +75,5 @@ class PermissionAwareNavigationTests(TestCase):
         with_publish = self.client.get(reverse("dashboard:home"))
         self.assertContains(with_publish, f'href="{review_url}"')
         self.assertContains(with_publish, f'href="{release_url}"')
-        self.assertContains(with_publish, "更多")
+        self.assertContains(with_publish, "功能中心")
+        self.assertNotContains(with_publish, "更多")

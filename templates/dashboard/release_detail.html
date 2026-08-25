@@ -1,24 +1,150 @@
 {% extends "base.html" %}
 {% load dashboard_display ui_i18n %}
 {% block title %}{% ui '发布' 'Publish' %} {{ task.title }} · PUKO Growth OS{% endblock %}
-{% block page_title %}{% ui '发布检查与受控发布' 'Release checks and controlled publishing' %}{% endblock %}
+{% block page_title %}{% ui '发布检查与人工发布' 'Release checks and manual publishing' %}{% endblock %}
 {% block content %}
 <a class="back-link" href="{% url 'dashboard:release-queue' %}">← {% ui '返回发布队列' 'Back to publishing queue' %}</a>
-<section class="task-detail-hero"><div><p class="eyebrow">{{ task.product.name }} · {% ui '第' 'Submission' %} {{ submission.submission_number }} {% ui '次提交' '' %}</p><h2>{{ task.title }}</h2><p>{% ui '先核对待发布的精确内容，再让系统检查当前账号、环境、权限和完整规则集合。检查通过后再选择人工、API 或受控浏览器路径，并由你本人做最后确认；未配置路径会直接拒绝。' 'First verify the exact content, then let the system check the current account, environment, access, and complete mandatory policy set. After the checks pass, choose manual, API, or controlled-browser publishing and personally give final confirmation. Unconfigured paths are rejected.' %}</p>{% if can_view_asset and is_link_delivery %}<a class="button" href="{{ submission.primary_asset_version.object_key }}" target="_blank" rel="noopener noreferrer">{% ui '打开待发布内容' 'Open content to publish' %}</a>{% elif can_view_asset and is_inline_delivery %}<p class="read-only-note">{% ui '下方显示审核通过的精确系统内正文。请复制到对应平台，发布后再登记网址或内容 ID。' 'The exact approved text is shown below. Copy it to the platform, then record the published URL or content ID.' %}</p>{% elif can_view_asset %}<p class="read-only-note">{% ui 'V1 已停止支持该旧文件交付。' 'V1 no longer supports this legacy file delivery.' %}</p>{% endif %}</div><div class="detail-status-stack"><span class="task-state task-state-approved">{% ui_task_state task.current_state %}</span><small>{% ui '状态版本' 'State version' %} {{ task.state_version }}</small></div></section>
-{% if can_view_asset and is_inline_delivery %}
+
+<section class="task-detail-hero">
+    <div>
+        <p class="eyebrow">{{ task.product.name }} · {% ui '第' 'Submission' %} {{ submission.submission_number }} {% ui '次提交' '' %}</p>
+        <h2>{{ task.title }}</h2>
+        <p>{% ui '按下面四步完成：先确认审核通过的正文，再运行发布检查，然后去平台发布，最后回来记录发布结果。系统不会在你看不到正文时要求你发布。' 'Complete the four steps below: verify the approved copy, run release checks, publish on the platform, then return to record the result. The system never asks you to publish content you cannot see.' %}</p>
+    </div>
+    <div class="detail-status-stack"><span class="task-state task-state-approved">{% ui_task_state task.current_state %}</span><small>{% ui '状态版本' 'State version' %} {{ task.state_version }}</small></div>
+</section>
+
 <section class="detail-panel spaced-panel">
-    <p class="eyebrow">{% ui '审核通过的精确内容' 'Exact approved content' %}</p>
-    <h3>{{ submission.primary_asset_version.metadata.title|default:task.title }} · v{{ submission.primary_asset_version.version_number }}</h3>
-    <div class="field-row"><textarea id="release-inline-content" rows="18" readonly>{{ submission.primary_asset_version.inline_content }}</textarea></div>
-    <button class="button button-secondary" id="copy-release-content" type="button">{% ui '复制完整内容去发布' 'Copy complete content to publish' %}</button>
+    <p class="eyebrow">{% ui '第 1 步 · 查看正文' 'Step 1 · Review the content' %}</p>
+    {% if can_view_asset and is_inline_delivery %}
+        <h3>{% ui '这是已经审核通过、准备发布的完整正文' 'This is the complete approved content to publish' %}</h3>
+        <p class="action-explanation">{% ui '请先读一遍。确认无误后，可以复制到对应平台；发布检查不会修改这份内容。' 'Read it first. When it is correct, copy it to the platform. Release checks never modify this content.' %}</p>
+        <h4>{{ submission.primary_asset_version.metadata.title|default:task.title }} · v{{ submission.primary_asset_version.version_number }}</h4>
+        <div class="field-row"><textarea id="release-inline-content" rows="18" readonly>{{ submission.primary_asset_version.inline_content }}</textarea></div>
+        <button class="button button-secondary" id="copy-release-content" type="button">{% ui '复制完整正文' 'Copy complete content' %}</button>
+    {% elif can_view_asset and is_link_delivery %}
+        <div class="release-blocked-card" role="alert">
+            <strong>{% ui '不能继续发布：这次审核通过的只有一个外部链接，系统内没有完整正文。' 'Publishing cannot continue: this submission contains only an external link and no complete in-system copy.' %}</strong>
+            <p>{% ui '这个链接可能是资料或问题页面，并不等于准备发布的内容。请退回制作，生成或填写完整正文，再重新送审。旧提交和审核记录会保留。' 'The link may be source material or a question page; it is not necessarily publishable copy. Return it to production, create or enter the complete content, and submit it for review again. Existing submission and review records remain intact.' %}</p>
+            <p><a class="button button-secondary" href="{{ submission.primary_asset_version.object_key }}" target="_blank" rel="noopener noreferrer">{% ui '查看这次提交的外部链接' 'View the submitted external link' %}</a></p>
+            {% if can_return_to_rework and rework_form %}
+            <form class="task-action-form" action="{% url 'dashboard:release-rework-action' task.id %}" method="post">
+                {% csrf_token %}{{ rework_form.command_id }}{{ rework_form.expected_state_version }}{{ rework_form.non_field_errors }}
+                {% for field in rework_form.visible_fields %}<div class="field-row">{{ field.label_tag }}{{ field }}{{ field.errors }}{% if field.help_text %}<small>{{ field.help_text }}</small>{% endif %}</div>{% endfor %}
+                <button class="button button-primary" type="submit">{% ui '退回制作完整正文' 'Return to create complete content' %}</button>
+            </form>
+            {% else %}
+            <p class="action-explanation">{% ui '请让有权限的负责人退回制作。' 'Ask an authorized owner to return this item to production.' %}</p>
+            {% endif %}
+        </div>
+    {% elif can_view_asset %}
+        <div class="release-blocked-card" role="alert"><strong>{% ui '不能继续发布：这是旧版文件交付，当前 V1 不再支持。' 'Publishing cannot continue: this is a legacy file delivery that V1 no longer supports.' %}</strong></div>
+    {% else %}
+        <div class="release-blocked-card" role="alert"><strong>{% ui '你当前没有权限查看这份正文，因此不能继续发布。' 'You cannot view this content with your current access, so publishing cannot continue.' %}</strong></div>
+    {% endif %}
 </section>
+
+<section class="detail-panel action-panel spaced-panel">
+    <p class="eyebrow">{% ui '第 2 步 · 发布检查' 'Step 2 · Release checks' %}</p>
+    {% if not release_content_ready %}
+        <h3>{% ui '请先补齐完整正文' 'Complete the content first' %}</h3>
+        <p class="action-explanation">{% ui '第 1 步未通过，账号、环境和权限检查暂不开放。' 'Step 1 is incomplete, so account, environment, and access checks are not available yet.' %}</p>
+    {% elif current_gate_is_valid %}
+        <div class="release-success-card" role="status">
+            <strong>✓ {% ui '发布检查已通过' 'Release checks passed' %}</strong>
+            <p>{% ui '发布账号' 'Publishing account' %}: {{ current_gate.channel_account.display_name }}<br>{% ui '运行环境' 'Runtime environment' %}: {{ current_gate.runtime_environment.environment_code }}<br>{% ui '检查时间' 'Checked at' %}: {{ current_gate.evaluated_at }}</p>
+            <p>{% ui '这条状态会一直保留在页面上。真正记录发布结果时，服务器仍会再次检查最新权限、账号能力、环境、证据和完整规则集合。' 'This status remains visible. Before recording the publishing result, the server still rechecks current access, account capability, environment, evidence, and the complete policy set.' %}</p>
+        </div>
+        {% if can_publish %}
+        <details class="compact-details spaced-panel">
+            <summary>{% ui '需要时重新运行发布检查' 'Run release checks again if needed' %}</summary>
+            <form class="task-action-form" action="{% url 'dashboard:release-gate-action' task.id %}" method="post">
+                {% csrf_token %}{{ gate_form.command_id }}{{ gate_form.expected_state_version }}{{ gate_form.non_field_errors }}
+                {% for field in gate_form.visible_fields %}<div class="field-row">{{ field.label_tag }}{{ field }}{{ field.errors }}</div>{% endfor %}
+                <button class="button button-secondary" type="submit">{% ui '重新运行发布检查' 'Run release checks again' %}</button>
+            </form>
+        </details>
+        {% endif %}
+    {% else %}
+        {% if current_gate %}
+        <div class="release-blocked-card" role="alert">
+            <strong>{% ui '之前的发布检查已经失效' 'The previous release check is no longer valid' %}</strong>
+            <p>{% ui '权限、账号能力、环境、内容或规则已经发生变化。系统已隐藏发布证明入口，请重新检查。' 'Access, account capability, environment, content, or policy has changed. The proof form is hidden until checks pass again.' %}</p>
+            {% if current_gate_blockers %}<details class="compact-details"><summary>{% ui '查看技术原因' 'View technical reasons' %}</summary><ul>{% for blocker in current_gate_blockers %}<li>{{ blocker }}</li>{% endfor %}</ul></details>{% endif %}
+        </div>
+        {% endif %}
+        {% if can_publish %}
+        <h3>{% ui '选择实际账号与运行环境' 'Choose the actual account and runtime' %}</h3>
+        <p class="action-explanation">{% ui '系统只允许使用这项任务编译时封存的精确账号和环境。' 'Only the exact account and environment sealed when this task was compiled are allowed.' %}</p>
+        <form class="task-action-form" action="{% url 'dashboard:release-gate-action' task.id %}" method="post">
+            {% csrf_token %}{{ gate_form.command_id }}{{ gate_form.expected_state_version }}{{ gate_form.non_field_errors }}
+            {% for field in gate_form.visible_fields %}<div class="field-row">{{ field.label_tag }}{{ field }}{{ field.errors }}</div>{% endfor %}
+            <button class="button button-primary" type="submit">{% ui '运行发布检查' 'Run release checks' %}</button>
+        </form>
+        {% else %}
+        <p class="action-explanation">{% ui '你没有与当前任务账号匹配的发布权限。' 'You do not have publishing access matching this task account.' %}</p>
+        {% endif %}
+    {% endif %}
+</section>
+
+<section class="detail-panel spaced-panel">
+    <p class="eyebrow">{% ui '第 3 步 · 去平台发布' 'Step 3 · Publish on the platform' %}</p>
+    {% if release_content_ready and current_gate_is_valid %}
+        {% if proof_recorded %}
+        <div class="release-success-card" role="status"><strong>✓ {% ui '平台发布结果已经记录' 'The platform publishing result has been recorded' %}</strong></div>
+        {% else %}
+        <h3>{% ui '复制上面的正文，前往对应平台人工发布' 'Copy the content above and publish it manually on the platform' %}</h3>
+        <ol class="release-instruction-list">
+            <li>{% ui '点击第 1 步的“复制完整正文”。' 'Click “Copy complete content” in Step 1.' %}</li>
+            <li>{% ui '打开上面显示的发布账号对应的平台。' 'Open the platform for the publishing account shown above.' %}</li>
+            <li>{% ui '粘贴、核对并由你本人点击平台上的发布按钮。Growth OS 本轮不会自动发布。' 'Paste and check the content, then personally click the platform publish button. Growth OS does not publish automatically in this round.' %}</li>
+        </ol>
+        {% endif %}
+    {% else %}
+        <h3>{% ui '等待前两步完成' 'Waiting for the first two steps' %}</h3>
+        <p class="action-explanation">{% ui '只有完整正文可见且发布检查有效时，才可以进行平台发布。' 'Platform publishing is available only when the complete content is visible and release checks are valid.' %}</p>
+    {% endif %}
+</section>
+
+{% if proof_form %}
+<section class="detail-panel action-panel spaced-panel">
+    <p class="eyebrow">{% ui '第 4 步 · 记录发布证明' 'Step 4 · Record publishing proof' %}</p>
+    <h3>{% ui '已经在平台发布完成后，再填写结果' 'Enter the result only after publishing on the platform' %}</h3>
+    <p class="action-explanation">{% ui '还没有发布就先不要填。发布完成后，点击下面一行，登记已发布内容网址或平台内容 ID。' 'Do not fill this in before publishing. After publishing, open the section below and record the published URL or platform content ID.' %}</p>
+    <details class="compact-details" {% if proof_form.errors %}open{% endif %}>
+        <summary>{% ui '我已经在平台发布，继续登记结果' 'I published on the platform; record the result' %}</summary>
+        <form class="task-action-form spaced-panel" action="{% url 'dashboard:release-proof-action' task.id %}" method="post">
+            {% csrf_token %}{{ proof_form.command_id }}{{ proof_form.publication }}{{ proof_form.non_field_errors }}
+            {% for field in proof_form.visible_fields %}<div class="field-row{% if field.name == 'confirmed' %} confirmation-row{% endif %}">{{ field.label_tag }}{{ field }}{{ field.errors }}{% if field.help_text %}<small>{{ field.help_text }}</small>{% endif %}</div>{% endfor %}
+            <button class="button button-primary" type="submit">{% ui '保存发布结果' 'Save publishing result' %}</button>
+        </form>
+    </details>
+</section>
+{% elif release_content_ready and current_gate_is_valid and not proof_recorded %}
+<section class="detail-panel spaced-panel"><p class="eyebrow">{% ui '第 4 步 · 记录发布证明' 'Step 4 · Record publishing proof' %}</p><p class="action-explanation">{% ui '当前账号不能记录这次发布结果，或发布检查需要重新执行。' 'This account cannot record the result, or the release checks must be run again.' %}</p></section>
 {% endif %}
-<section class="detail-columns">
-    <article class="detail-panel action-panel"><p class="eyebrow">{% ui '第 1 步 · 发布检查' 'Step 1 · Release checks' %}</p><h3>{% ui '选择实际账号与运行环境' 'Choose the actual account and runtime' %}</h3>{% if can_publish %}<form class="task-action-form" action="{% url 'dashboard:release-gate-action' task.id %}" method="post">{% csrf_token %}{{ gate_form.command_id }}{{ gate_form.expected_state_version }}{{ gate_form.non_field_errors }}{% for field in gate_form.visible_fields %}<div class="field-row">{{ field.label_tag }}{{ field }}{{ field.errors }}</div>{% endfor %}<button class="button button-primary" type="submit">{% ui '运行发布检查' 'Run release checks' %}</button></form>{% else %}<p class="action-explanation">{% ui '你没有与当前可用账号匹配的发布权限。' 'You do not have publishing access that matches an available account.' %}</p>{% endif %}</article>
-    <article class="detail-panel"><p class="eyebrow">{% ui '检查与发布历史' 'Release-check and publishing history' %}</p><h3>{% ui '当前发布记录' 'Current publishing records' %}</h3>{% for publication in publications %}<div class="criteria-block"><span class="task-label">{% ui_publication_status publication.status %}</span><p>{% ui '发布负责人' 'Publisher' %}: {{ publication.requested_by_principal.display_name|default:publication.requested_by_principal.username }}</p>{% if publication.current_gate %}<p>{% ui '账号' 'Account' %}: {{ publication.current_gate.channel_account.display_name }}<br>{% ui '环境' 'Environment' %}: {{ publication.current_gate.runtime_environment.environment_code }}</p>{% endif %}{% for event in publication.events.all %}{% if event.id in readable_proof_event_ids %}<p>{% if event.external_url %}<a class="button" href="{{ event.external_url }}" target="_blank" rel="noopener noreferrer">{% ui '打开已发布内容' 'Open published content' %}</a>{% endif %}{% if event.external_publication_id %}<br>{% ui '平台内容 ID' 'Platform content ID' %}: {{ event.external_publication_id }}{% endif %}</p>{% endif %}{% endfor %}</div>{% empty %}<p class="action-explanation">{% ui '尚未创建发布意图，也没有发生任何外部发布。' 'No publishing intent exists, and nothing has been published externally.' %}</p>{% endfor %}</article>
+
+<section class="detail-panel spaced-panel">
+    <p class="eyebrow">{% ui '检查与发布历史' 'Release-check and publishing history' %}</p>
+    <h3>{% ui '当前发布记录' 'Current publishing records' %}</h3>
+    {% for publication in publications %}
+    <div class="criteria-block"><span class="task-label">{% ui_publication_status publication.status %}</span><p>{% ui '发布负责人' 'Publisher' %}: {{ publication.requested_by_principal.display_name|default:publication.requested_by_principal.username }}</p>{% if publication.current_gate %}<p>{% ui '账号' 'Account' %}: {{ publication.current_gate.channel_account.display_name }}<br>{% ui '环境' 'Environment' %}: {{ publication.current_gate.runtime_environment.environment_code }}</p>{% endif %}{% for event in publication.events.all %}{% if event.id in readable_proof_event_ids %}<p>{% if event.external_url %}<a class="button button-secondary" href="{{ event.external_url }}" target="_blank" rel="noopener noreferrer">{% ui '打开已发布内容' 'Open published content' %}</a>{% endif %}{% if event.external_publication_id %}<br>{% ui '平台内容 ID' 'Platform content ID' %}: {{ event.external_publication_id }}{% endif %}</p>{% endif %}{% endfor %}</div>
+    {% empty %}<p class="action-explanation">{% ui '尚未创建发布检查记录，也没有发生任何外部发布。' 'No release-check record exists, and nothing has been published externally.' %}</p>{% endfor %}
 </section>
-{% if proof_form %}<section class="detail-panel action-panel spaced-panel"><p class="eyebrow">{% ui '第 2 步 · 最终人工确认' 'Step 2 · Final human confirmation' %}</p><h3>{% ui '选择发布方式，并由你本人确认执行' 'Choose a publishing method and personally confirm it' %}</h3><p class="action-explanation">{% ui '人工方式：你先在平台完成发布，再登记网址或内容 ID。API 与受控浏览器方式当前默认关闭；即使前端选择它们，服务端也会重新检查精确权限、账号能力、环境、规则和当前检查记录，未配置时直接拒绝，不会联网。' 'Manual method: publish on the platform first, then record the URL or content ID. API and controlled-browser methods are off by default. The server rechecks exact access, account capability, environment, rules, and the current release record, and rejects unconfigured paths without connecting.' %}</p><form class="task-action-form" action="{% url 'dashboard:release-proof-action' task.id %}" method="post">{% csrf_token %}{{ proof_form.command_id }}{{ proof_form.publication }}{{ proof_form.non_field_errors }}{% for field in proof_form.visible_fields %}<div class="field-row{% if field.name == 'confirmed' %} confirmation-row{% endif %}">{{ field.label_tag }}{{ field }}{{ field.errors }}{% if field.help_text %}<small>{{ field.help_text }}</small>{% endif %}</div>{% endfor %}<button class="button button-primary" type="submit">{% ui '我确认执行所选发布方式' 'Confirm the selected publishing method' %}</button></form></section>{% endif %}
-{% if done_form %}<section class="detail-panel action-panel spaced-panel"><p class="eyebrow">{% ui '第 3 步 · 负责人确认' 'Step 3 · Owner confirmation' %}</p><h3>{% ui '核对证明并完成任务' 'Check the proof and complete the task' %}</h3><p class="action-explanation">{% ui '只有拥有独立完成权限的负责人，且存在不可变人工发布证明时，才能完成任务。' 'The task can be completed only by someone with independent completion access and after immutable manual publishing proof exists.' %}</p><form action="{% url 'dashboard:release-done-action' task.id %}" method="post">{% csrf_token %}{{ done_form.command_id }}{{ done_form.expected_state_version }}<button class="button button-primary" type="submit">{% ui '证明已核对，标记完成' 'Proof checked; mark complete' %}</button></form></section>{% endif %}
+
+{% if can_stop_publication and stop_form %}
+<details class="compact-details spaced-panel">
+    <summary>{% ui '停止这次发布流程' 'Stop this publishing flow' %}</summary>
+    <form class="task-action-form" action="{% url 'dashboard:release-stop-action' task.id %}" method="post">
+        {% csrf_token %}{{ stop_form.command_id }}{{ stop_form.expected_state_version }}{{ stop_form.non_field_errors }}
+        {% for field in stop_form.visible_fields %}<div class="field-row">{{ field.label_tag }}{{ field }}{{ field.errors }}{% if field.help_text %}<small>{{ field.help_text }}</small>{% endif %}</div>{% endfor %}
+        <button class="button button-secondary" type="submit">{% ui '确认停止发布' 'Confirm stop' %}</button>
+    </form>
+</details>
+{% endif %}
+
+{% if done_form %}<section class="detail-panel action-panel spaced-panel"><p class="eyebrow">{% ui '第 5 步 · 负责人确认完成' 'Step 5 · Owner completion' %}</p><h3>{% ui '核对证明并完成任务' 'Check the proof and complete the task' %}</h3><p class="action-explanation">{% ui '只有拥有独立完成权限的负责人，且存在不可变人工发布证明时，才能完成任务。' 'The task can be completed only by someone with independent completion access and after immutable manual publishing proof exists.' %}</p><form action="{% url 'dashboard:release-done-action' task.id %}" method="post">{% csrf_token %}{{ done_form.command_id }}{{ done_form.expected_state_version }}<button class="button button-primary" type="submit">{% ui '证明已核对，标记完成' 'Proof checked; mark complete' %}</button></form></section>{% endif %}
+
 {% if can_view_asset and is_inline_delivery %}
 <script>
 (function () {
@@ -28,7 +154,7 @@
     button.addEventListener("click", async function () {
         try { await navigator.clipboard.writeText(content.value); }
         catch (error) { content.focus(); content.select(); document.execCommand("copy"); }
-        button.textContent = "{% ui '已复制' 'Copied' %}";
+        button.textContent = "{% ui '已复制完整正文' 'Complete content copied' %}";
     });
 })();
 </script>

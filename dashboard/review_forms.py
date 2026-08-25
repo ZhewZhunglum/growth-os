@@ -107,6 +107,50 @@ class ReleaseGateForm(CommandVersionForm):
             self.fields["runtime_environment"].empty_label = "Select an environment"
 
 
+class StopPublicationForm(CommandVersionForm):
+    reason = forms.CharField(
+        label="停止发布原因",
+        max_length=1000,
+        widget=forms.Textarea(attrs={"rows": 3}),
+        help_text="不会删除任务、审核或门禁历史；停止后旧门禁不可继续使用。",
+    )
+    confirmed = forms.BooleanField(
+        label="我确认停止这项发布工作",
+        required=True,
+    )
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if _is_english():
+            self.fields["reason"].label = "Reason for stopping publication"
+            self.fields["reason"].help_text = (
+                "The task, review and gate history stay intact; the old gate cannot be reused."
+            )
+            self.fields["confirmed"].label = "I confirm that this publication should stop"
+
+
+class ReturnToInlineContentForm(CommandVersionForm):
+    reason = forms.CharField(
+        label="退回制作原因",
+        max_length=1000,
+        widget=forms.Textarea(attrs={"rows": 3}),
+        help_text="保留旧链接、提交、审核和门禁；下一版必须提交完整正文。",
+    )
+    confirmed = forms.BooleanField(
+        label="我确认退回制作完整内容",
+        required=True,
+    )
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if _is_english():
+            self.fields["reason"].label = "Reason for returning to production"
+            self.fields["reason"].help_text = (
+                "The old link, submission, review and gate stay intact; the next version must contain the full text."
+            )
+            self.fields["confirmed"].label = "I confirm return for complete inline content"
+
+
 class PublicationProofForm(forms.Form):
     command_id = forms.UUIDField(widget=forms.HiddenInput)
     publication = forms.ModelChoiceField(

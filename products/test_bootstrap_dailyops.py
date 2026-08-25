@@ -7,6 +7,7 @@ from django.core.management import call_command
 from django.test import TestCase
 
 from accounts.models import PermissionGrant, Principal
+from insights.models import GEOProbePanel, GEOProbePanelItem
 from intelligence.models import SourceRegistry
 from products.models import Product
 from releasegate.models import ChannelAccount
@@ -113,6 +114,11 @@ class BootstrapDailyOperationsTests(TestCase):
             ).exists()
         )
         self.assertEqual(SourceRegistry.objects.filter(source_key__startswith="daily-").count(), 28)
+        geo_panel = GEOProbePanel.objects.get(panel_key="local-test-puko-geo", version_number=1)
+        self.assertEqual(geo_panel.product, product)
+        geo_item = GEOProbePanelItem.objects.get(panel=geo_panel, item_number=1)
+        self.assertIn("[LOCAL TEST ONLY]", geo_item.question)
+        self.assertEqual(geo_item.intent, "LOCAL_DOGFOOD_GEO_VISIBILITY")
         self.assertFalse(Task.objects.exists())
 
     def test_replay_does_not_duplicate_context_sources_or_grants(self):
@@ -122,6 +128,8 @@ class BootstrapDailyOperationsTests(TestCase):
             "grants": PermissionGrant.objects.count(),
             "sources": SourceRegistry.objects.count(),
             "contracts": TaskContractVersion.objects.count(),
+            "geo_panels": GEOProbePanel.objects.count(),
+            "geo_items": GEOProbePanelItem.objects.count(),
         }
 
         self._run()
@@ -130,3 +138,5 @@ class BootstrapDailyOperationsTests(TestCase):
         self.assertEqual(PermissionGrant.objects.count(), counts["grants"])
         self.assertEqual(SourceRegistry.objects.count(), counts["sources"])
         self.assertEqual(TaskContractVersion.objects.count(), counts["contracts"])
+        self.assertEqual(GEOProbePanel.objects.count(), counts["geo_panels"])
+        self.assertEqual(GEOProbePanelItem.objects.count(), counts["geo_items"])

@@ -19,6 +19,7 @@ from workflow.services import guard_review, guard_submission
 
 
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+DAILY_OPERATIONS_MIN_INLINE_CHARS = 20
 
 
 def canonical_sha256(payload: Any) -> str:
@@ -31,6 +32,14 @@ def canonical_sha256(payload: Any) -> str:
 def validate_sha256(value: str) -> None:
     if not SHA256_PATTERN.fullmatch(value):
         raise ValidationError("Expected a lowercase 64-character SHA-256 digest.")
+
+
+def _task_requires_inline_primary(task_id) -> bool:
+    """Use the typed compilation context as the Daily Operations marker."""
+
+    from intelligence.models import TaskCompilationContext
+
+    return TaskCompilationContext.objects.filter(task_id=task_id).exists()
 
 
 class ActingRole(models.TextChoices):
@@ -579,9 +588,28 @@ class TaskSubmission(AppendOnlyFact):
         except ReviewDecision.DoesNotExist:
             final_review = None
         withdrawal = previous.withdrawal_events.filter(event_type="SUBMISSION_WITHDRAWN").first()
+        approved_rework = previous.withdrawal_events.filter(
+            event_type="APPROVED_REWORK_REQUESTED"
+        ).first()
         if final_review is not None:
-            if final_review.decision != ReviewDecision.Decision.CHANGES_REQUESTED:
-                raise ValidationError({"supersedes_submission": "Only CHANGES_REQUESTED may trigger human rework."})
+            valid_review_trigger = (
+                final_review.decision == ReviewDecision.Decision.CHANGES_REQUESTED
+                and approved_rework is None
+            ) or (
+                final_review.decision == ReviewDecision.Decision.APPROVED
+                and approved_rework is not None
+                and approved_rework.task_id == self.task_id
+                and approved_rework.submission_id == previous.pk
+            )
+            if not valid_review_trigger:
+                raise ValidationError(
+                    {
+                        "supersedes_submission": (
+                            "Rework requires exact CHANGES_REQUESTED review or an authorized "
+                            "approved-submission rework event."
+                        )
+                    }
+                )
             if self.triggering_review_id != final_review.pk:
                 raise ValidationError({"triggering_review": "Human rework must bind the exact final review."})
             if withdrawal is not None:
@@ -603,6 +631,29 @@ class TaskSubmission(AppendOnlyFact):
         if self.primary_asset_version_id and self.task_id:
             if self.primary_asset_version.content_asset.task_id != self.task_id:
                 raise ValidationError({"primary_asset_version": "The primary asset belongs to a different task."})
+            if _task_requires_inline_primary(self.task_id):
+                if (
+                    self.primary_asset_version.representation_kind
+                    != ContentAssetVersion.RepresentationKind.INLINE_TEXT
+                ):
+                    raise ValidationError(
+                        {
+                            "primary_asset_version": (
+                                "Daily Operations requires complete inline text as the primary "
+                                "deliverable; external URLs may be supporting references only."
+                            )
+                        }
+                    )
+                normalized_inline = self.primary_asset_version.inline_content.strip()
+                if len(normalized_inline) < DAILY_OPERATIONS_MIN_INLINE_CHARS:
+                    raise ValidationError(
+                        {
+                            "primary_asset_version": (
+                                "Daily Operations publishable content must contain at least "
+                                f"{DAILY_OPERATIONS_MIN_INLINE_CHARS} non-whitespace characters."
+                            )
+                        }
+                    )
         if self.dod_check_run_id and self.task_id:
             self._validate_passing_dod()
         normalized = self._normalized_asset_manifest()

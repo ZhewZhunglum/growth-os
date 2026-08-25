@@ -11,6 +11,7 @@ from django.utils import timezone
 
 from accounts.models import PermissionGrant, Principal
 from accounts.services import revoke_permission_grant
+from contentops.models import ContentAssetVersion
 from dailyops.models import DailyBatchDispositionEvent
 from dailyops.services import PLATFORMS, ensure_default_sources
 from integrations.connectors.types import Platform
@@ -153,9 +154,9 @@ class DailyOperationsUITests(TestCase):
         contract = TaskContractVersion.objects.create(
             product_profile_version=profile,
             version_number=1,
-            title="Daily link-first task",
+            title="Daily complete-content task",
             dor_criteria=[{"key": "source_ready", "required": True}],
-            dod_criteria=[{"key": "external_link", "required": True}],
+            dod_criteria=[{"key": "primary_deliverable", "required": True}],
             release_gate_criteria=[{"key": "policy_pass", "required": True}],
             success_criteria=[{"key": "published_url", "required": True}],
             sealed_at=timezone.now(),
@@ -170,7 +171,7 @@ class DailyOperationsUITests(TestCase):
         policy = PolicyVersion.objects.create(
             policy_definition=definition,
             version_number=1,
-            rules=[{"rule_code": "NO_UNSUPPORTED_CLAIMS", "required": True}],
+            rules=[{"rule_code": "exact_release_context", "required": True}],
             created_by_principal=self.owner,
             recorded_by_principal=self.owner,
         )
@@ -1059,12 +1060,22 @@ class DailyOperationsUITests(TestCase):
             command_data(),
         )
         self.assertEqual(started.status_code, 302)
+        generated = self.client.post(
+            reverse("dashboard:task-action", args=[task.pk, "generate-content"]),
+            command_data(),
+        )
+        self.assertEqual(generated.status_code, 302)
+        content_version = ContentAssetVersion.objects.get(
+            content_asset__task=task,
+            representation_kind=ContentAssetVersion.RepresentationKind.INLINE_TEXT,
+        )
         submitted = self.client.post(
             reverse("dashboard:task-action", args=[task.pk, "deliver"]),
             command_data(
-                external_url="https://docs.example.test/daily-flow/v1",
+                delivery_mode="SYSTEM_CONTENT",
+                content_version=str(content_version.pk),
                 submission_note="Ready for independent admin review.",
-                criterion__external_link=TaskCheckRun.Result.PASS,
+                criterion__primary_deliverable=TaskCheckRun.Result.PASS,
             ),
         )
         self.assertEqual(submitted.status_code, 302)

@@ -14,7 +14,13 @@ from django.views.decorators.http import require_POST
 
 from accounts.authorization import require_authorization, resolve_authorization
 from accounts.models import PermissionGrant, Principal
-from contentops.models import ContentAsset, ContentAssetVersion, ReviewDecision, TaskSubmission
+from contentops.models import (
+    DAILY_OPERATIONS_MIN_INLINE_CHARS,
+    ContentAsset,
+    ContentAssetVersion,
+    ReviewDecision,
+    TaskSubmission,
+)
 from dashboard.forms import (
     AssignmentForm,
     CancelTaskForm,
@@ -338,15 +344,21 @@ def _decorate_task(task: Task) -> None:
     ]
 
 
+def _requires_inline_primary(task: Task) -> bool:
+    return TaskCompilationContext.objects.filter(task_id=task.pk).exists()
+
+
 def _inline_content_versions(task: Task):
     """Return only the latest editable inline version for this task."""
 
+    candidates = ContentAssetVersion.objects.filter(
+        content_asset__task=task,
+        representation_kind=ContentAssetVersion.RepresentationKind.INLINE_TEXT,
+    )
+    if not _requires_inline_primary(task):
+        candidates = candidates.filter(content_asset__asset_key="publishable-content")
     latest_id = (
-        ContentAssetVersion.objects.filter(
-            content_asset__task=task,
-            content_asset__asset_key="publishable-content",
-            representation_kind=ContentAssetVersion.RepresentationKind.INLINE_TEXT,
-        )
+        candidates
         .order_by("-version_number", "-created_at", "-id")
         .values_list("pk", flat=True)
         .first()
@@ -375,6 +387,7 @@ def _action_form(task: Task, user: Principal):
         return "deliver", DeliveryDoDForm(
             criteria=task.contract_version.dod_criteria,
             content_versions=_inline_content_versions(task),
+            require_inline_primary=_requires_inline_primary(task),
             **common,
         )
     return "", None
@@ -762,6 +775,14 @@ def _deliver_and_submit(task: Task, user: Principal, grant, form: DeliveryDoDFor
     if task.current_assignee_principal_id != user.pk:
         raise PermissionDenied("ONLY_CURRENT_ASSIGNEE_CAN_SUBMIT")
     delivery_mode = form.cleaned_data["delivery_mode"]
+    requires_inline_primary = _requires_inline_primary(task)
+    if (
+        requires_inline_primary
+        and delivery_mode != DeliveryDoDForm.DeliveryMode.SYSTEM_CONTENT
+    ):
+        raise ValidationError(
+            "Daily Operations 发布任务必须送审系统内完整正文；外部链接只能作为参考。"
+        )
     selected_version = (
         form.cleaned_data["content_version"]
         if delivery_mode == DeliveryDoDForm.DeliveryMode.SYSTEM_CONTENT
@@ -811,8 +832,20 @@ def _deliver_and_submit(task: Task, user: Principal, grant, form: DeliveryDoDFor
                         "重新提交前，上一份交付必须已被审核要求修改，或由执行负责人正式撤回。"
                     ) from None
             else:
-                if triggering_review.decision != ReviewDecision.Decision.CHANGES_REQUESTED:
-                    raise ValidationError("只有明确要求修改的审核结论才能创建返工版本。")
+                approved_rework = supersedes_submission.withdrawal_events.filter(
+                    event_type=TaskStateEvent.EventType.APPROVED_REWORK_REQUESTED,
+                    task_id=task.pk,
+                ).exists()
+                if not (
+                    triggering_review.decision == ReviewDecision.Decision.CHANGES_REQUESTED
+                    or (
+                        triggering_review.decision == ReviewDecision.Decision.APPROVED
+                        and approved_rework
+                    )
+                ):
+                    raise ValidationError(
+                        "上一份交付必须被审核要求修改，或由 Owner/Admin 正式退回制作。"
+                    )
 
         if selected_version is not None:
             locked_asset = ContentAsset.objects.select_for_update().get(
@@ -828,6 +861,11 @@ def _deliver_and_submit(task: Task, user: Principal, grant, form: DeliveryDoDFor
             if (
                 version.content_asset.task_id != task.pk
                 or version.representation_kind != ContentAssetVersion.RepresentationKind.INLINE_TEXT
+                or (
+                    requires_inline_primary
+                    and len(version.inline_content.strip())
+                    < DAILY_OPERATIONS_MIN_INLINE_CHARS
+                )
                 or latest is None
                 or latest.pk != version.pk
             ):
@@ -1062,6 +1100,7 @@ def task_action(request: HttpRequest, task_id, action: str) -> HttpResponse:
                 request.POST,
                 criteria=task.contract_version.dod_criteria,
                 content_versions=_inline_content_versions(task),
+                require_inline_primary=_requires_inline_primary(task),
                 state_version=task.state_version,
             )
             if not form.is_valid():

@@ -30,6 +30,7 @@ from .forms import PerformanceCsvForm
 from .services import (
     add_geo_panel_item,
     create_geo_panel_version,
+    evidence_choices,
     propose_learning,
     record_geo_result,
     record_performance_rows,
@@ -303,7 +304,8 @@ class FeedbackUiTests(TestCase):
         response = self.client.get(reverse("feedback:home"))
         self.assertEqual(response.status_code, 200)
         self.assertContains(response, "真实的 0")
-        self.assertContains(response, "AI 搜索曝光与结果")
+        self.assertContains(response, "AI 搜索曝光（GEO）与结果")
+        self.assertContains(response, 'id="geo"')
         self.assertContains(response, "手动记录一次 AI 搜索结果")
         self.assertContains(response, "高级录入（通常不用打开）")
         response = self.client.post(
@@ -322,6 +324,62 @@ class FeedbackUiTests(TestCase):
         self.assertEqual(response.status_code, 302)
         self.assertTrue(ChannelPerformanceObservation.objects.filter(metric_definition__metric_key="shares").exists())
 
+    def test_local_geo_fixture_cannot_become_formal_learning_evidence(self):
+        local_panel = GEOProbePanel.objects.create(
+            panel_key="local-test-puko-geo",
+            version_number=1,
+            product=self.product,
+            market_code="US",
+            language_code="en",
+            created_by_principal=self.owner,
+        )
+        local_item = GEOProbePanelItem.objects.create(
+            panel=local_panel,
+            item_number=1,
+            question="[LOCAL TEST ONLY] Does an AI answer mention PUKO?",
+            intent="LOCAL_DOGFOOD_GEO_VISIBILITY",
+        )
+        result = record_geo_result(
+            actor=self.operator,
+            panel_item=local_item,
+            provider="DeepSeek",
+            model_reference="local-test",
+            availability_state=AvailabilityState.PRESENT,
+            response_text="Local fixture answer.",
+            brand_mentioned=True,
+            rank_position=1,
+            citation_urls=[],
+            operation_key=str(uuid.uuid4()),
+        )
+        evidence = GEOMetricObservation.objects.get(probe_result=result)
+
+        self.assertNotIn(
+            f"geo:{evidence.pk}",
+            {value for value, _label in evidence_choices(actor=self.operator)},
+        )
+        with self.assertRaises(ValidationError):
+            propose_learning(
+                actor=self.operator,
+                product=self.product,
+                learning_key="must-not-use-local-fixture",
+                title="Must not be saved",
+                conclusion="Local fixture data is not formal evidence.",
+                recommended_action="None",
+                confidence=Decimal("0.5000"),
+                evidence_ref=f"geo:{evidence.pk}",
+                evidence_note="",
+            )
+        self.assertFalse(
+            LearningVersion.objects.filter(
+                learning_key="manual-puko-feedback-must-not-use-local-fixture"
+            ).exists()
+        )
+
+        self.client.force_login(self.operator)
+        response = self.client.get(reverse("feedback:home"))
+        self.assertContains(response, "本地测试说明")
+        self.assertContains(response, "不会进入正式学习或需求")
+
     def test_feedback_page_switches_all_visible_ui_and_form_copy_to_english(self):
         self.client.force_login(self.operator)
         self.client.post(
@@ -332,7 +390,7 @@ class FeedbackUiTests(TestCase):
         response = self.client.get(reverse("feedback:home"))
 
         self.assertEqual(response.status_code, 200)
-        self.assertContains(response, "AI Search Visibility & Results")
+        self.assertContains(response, "AI Search Visibility (GEO) & Results")
         self.assertContains(response, "Will AI answers mention PUKO?")
         self.assertContains(response, "Record one AI search result")
         self.assertContains(response, "Where did you ask?")

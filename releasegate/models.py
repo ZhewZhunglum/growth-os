@@ -927,6 +927,32 @@ class ReleaseGateRecord(ImmutableFact):
     def current_blockers(self, *, at=None, include_gate_state=True) -> list[str]:
         at = at or timezone.now()
         blockers: list[str] = []
+        # Do not trust a possibly cached Task relation on the immutable
+        # submission. Gate evaluation can receive a Submission instance that
+        # was sealed before the Task reached APPROVED, so always reread the
+        # authoritative projection at the final side-effect boundary.
+        from workflow.models import Task
+
+        current_task_state = Task.objects.values_list("current_state", flat=True).get(
+            pk=self.task_submission.task_id
+        )
+        if current_task_state != Task.State.APPROVED:
+            blockers.append("TASK_NOT_APPROVED")
+        from contentops.models import (
+            DAILY_OPERATIONS_MIN_INLINE_CHARS,
+            ContentAssetVersion,
+        )
+        from intelligence.models import TaskCompilationContext
+
+        if TaskCompilationContext.objects.filter(
+            task_id=self.task_submission.task_id
+        ).exists() and (
+            self.primary_asset_version.representation_kind
+            != ContentAssetVersion.RepresentationKind.INLINE_TEXT
+            or len(self.primary_asset_version.inline_content.strip())
+            < DAILY_OPERATIONS_MIN_INLINE_CHARS
+        ):
+            blockers.append("DAILY_OPERATIONS_PRIMARY_DELIVERABLE_NOT_INLINE")
         latest_asset_version = self.primary_asset_version.content_asset.versions.order_by(
             "-version_number"
         ).first()

@@ -17,7 +17,9 @@ from dashboard.review_forms import (
     CompleteTaskForm,
     PublicationProofForm,
     ReleaseGateForm,
+    ReturnToInlineContentForm,
     ReviewDecisionForm,
+    StopPublicationForm,
 )
 from integrations.publishing import PublicationMode, get_publication_runtime
 from intelligence.models import TaskCompilationContext
@@ -152,6 +154,20 @@ def _can_complete(user: Principal, task: Task) -> bool:
     )
 
 
+def _can_manage_approved_publication(user: Principal, task: Task) -> bool:
+    """Allow an authorized Owner/Admin to open the page to stop or rework it."""
+
+    if user.role not in {
+        Principal.Role.OWNER,
+        Principal.Role.OPERATIONS_ADMIN,
+    }:
+        return False
+    return bool(
+        _product_decision(user, task, PermissionGrant.Action.EDIT).allowed
+        or _product_decision(user, task, PermissionGrant.Action.CANCEL_TASK).allowed
+    )
+
+
 def _latest_submission(task: Task) -> TaskSubmission:
     submission = task.submissions.select_related(
         "primary_asset_version__content_asset",
@@ -207,6 +223,15 @@ def _can_view_asset_version(
     ).allowed:
         return True
     if task.current_state == Task.State.APPROVED:
+        # A publisher with independent product VIEW access must be able to
+        # inspect the exact approved content before creating a release gate.
+        # Requiring an existing gate here creates a circular flow (gate first,
+        # content second), while PUBLISH alone must not imply content access.
+        if (
+            _product_decision(user, task, PermissionGrant.Action.VIEW).allowed
+            and _allowed_accounts(user, task).exists()
+        ):
+            return True
         publication = submission.publications.select_related(
             "current_gate__channel_account"
         ).filter(
@@ -265,6 +290,9 @@ def _release_context(task: Task, user: Principal, *, gate_form=None, proof_form=
         "current_gate__runtime_environment",
         "requested_by_principal",
     ).prefetch_related("events").order_by("-created_at", "-id")
+    current_release_publication = publications.filter(
+        requested_by_principal=user,
+    ).first()
     ready_publications = publications.filter(
         status=Publication.Status.READY_FOR_MANUAL_PUBLISH,
         requested_by_principal=user,
@@ -273,6 +301,46 @@ def _release_context(task: Task, user: Principal, *, gate_form=None, proof_form=
     can_publish = accounts.exists()
     publication_list = list(publications)
     asset_version = submission.primary_asset_version
+    can_view_asset = _can_view_asset_version(user, task, submission)
+    is_link_delivery = _is_link_delivery(asset_version)
+    is_inline_delivery = _is_inline_delivery(asset_version)
+    release_content_ready = can_view_asset and is_inline_delivery
+    is_owner_or_admin = user.role in {
+        Principal.Role.OWNER,
+        Principal.Role.OPERATIONS_ADMIN,
+    }
+    can_stop_publication = bool(
+        is_owner_or_admin
+        and _product_decision(user, task, PermissionGrant.Action.CANCEL_TASK).allowed
+    )
+    has_exact_approved_review = ReviewDecision.objects.filter(
+        submission=submission,
+        decision=ReviewDecision.Decision.APPROVED,
+    ).exists()
+    can_return_to_rework = bool(
+        is_owner_or_admin
+        and is_link_delivery
+        and has_exact_approved_review
+        and _product_decision(user, task, PermissionGrant.Action.EDIT).allowed
+    )
+    current_gate = (
+        current_release_publication.current_gate
+        if current_release_publication is not None
+        else None
+    )
+    current_gate_blockers = current_gate.current_blockers() if current_gate else []
+    current_gate_is_valid = bool(current_gate and not current_gate_blockers)
+    proof_recorded = bool(
+        current_release_publication
+        and current_release_publication.status
+        == Publication.Status.MANUAL_PUBLISHED_RECORDED
+    )
+    visible_proof_form = None
+    if release_content_ready and current_gate_is_valid and initial_publication and can_publish:
+        visible_proof_form = proof_form or PublicationProofForm(
+            publications=ready_publications,
+            initial_publication=initial_publication,
+        )
     readable_proof_event_ids = {
         event.pk
         for publication in publication_list
@@ -289,21 +357,33 @@ def _release_context(task: Task, user: Principal, *, gate_form=None, proof_form=
             environments=environments,
             state_version=task.state_version,
         ),
-        "proof_form": proof_form or (
-            PublicationProofForm(
-                publications=ready_publications,
-                initial_publication=initial_publication,
-            )
-            if initial_publication and can_publish
-            else None
-        ),
+        "proof_form": visible_proof_form,
         "done_form": done_form or (
             CompleteTaskForm(state_version=task.state_version) if _can_complete(user, task) else None
         ),
         "can_publish": can_publish,
-        "can_view_asset": _can_view_asset_version(user, task, submission),
-        "is_link_delivery": _is_link_delivery(asset_version),
-        "is_inline_delivery": _is_inline_delivery(asset_version),
+        "can_view_asset": can_view_asset,
+        "is_link_delivery": is_link_delivery,
+        "is_inline_delivery": is_inline_delivery,
+        "release_content_ready": release_content_ready,
+        "current_release_publication": current_release_publication,
+        "current_gate": current_gate,
+        "current_gate_blockers": current_gate_blockers,
+        "current_gate_is_valid": current_gate_is_valid,
+        "proof_recorded": proof_recorded,
+        "can_stop_publication": can_stop_publication,
+        "stop_form": (
+            StopPublicationForm(state_version=task.state_version)
+            if can_stop_publication
+            else None
+        ),
+        "can_return_to_rework": can_return_to_rework,
+        "rework_form": (
+            ReturnToInlineContentForm(state_version=task.state_version)
+            if can_return_to_rework
+            else None
+        ),
+        "requires_inline_rework": is_link_delivery,
         "readable_proof_event_ids": readable_proof_event_ids,
     }
 
@@ -448,7 +528,11 @@ def release_queue(request: HttpRequest) -> HttpResponse:
     for task in Task.objects.filter(current_state=Task.State.APPROVED).select_related(
         "product", "contract_version", "current_assignee_principal"
     ).order_by("updated_at", "title"):
-        if _allowed_accounts(request.user, task).exists() or _can_complete(request.user, task):
+        if (
+            _allowed_accounts(request.user, task).exists()
+            or _can_complete(request.user, task)
+            or _can_manage_approved_publication(request.user, task)
+        ):
             tasks.append(task)
     return render(request, "dashboard/release_queue.html", {"tasks": tasks})
 
@@ -467,6 +551,7 @@ def release_detail(request: HttpRequest, task_id) -> HttpResponse:
     if (
         not _allowed_accounts(request.user, task).exists()
         and not _can_complete(request.user, task)
+        and not _can_manage_approved_publication(request.user, task)
         and not has_prior_release_fact
     ):
         raise PermissionDenied("NO_RELEASE_QUEUE_PERMISSION")

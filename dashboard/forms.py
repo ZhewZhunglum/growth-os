@@ -381,7 +381,15 @@ class DeliveryDoDForm(CriteriaCommandForm):
         widget=forms.Textarea(attrs={"rows": 3}),
     )
 
-    def __init__(self, *args, content_versions=None, state_version: int, **kwargs):
+    def __init__(
+        self,
+        *args,
+        content_versions=None,
+        require_inline_primary: bool = False,
+        state_version: int,
+        **kwargs,
+    ):
+        self.require_inline_primary = require_inline_primary
         if args and args[0] is not None and "delivery_mode" not in args[0]:
             # Backward-compatible server-side inference for existing clients.
             # The current UI always posts the explicit radio choice.
@@ -392,19 +400,31 @@ class DeliveryDoDForm(CriteriaCommandForm):
                 data["delivery_mode"] = self.DeliveryMode.SYSTEM_CONTENT
             args = (data, *args[1:])
         super().__init__(*args, state_version=state_version, **kwargs)
+        if require_inline_primary:
+            self.fields["delivery_mode"].choices = (
+                (self.DeliveryMode.SYSTEM_CONTENT, "送审系统内的完整内容"),
+            )
+            self.fields["external_url"].widget = forms.HiddenInput()
+            self.fields["external_url"].disabled = True
         queryset = content_versions or ContentAssetVersion.objects.none()
         self.fields["content_version"].queryset = queryset
         has_system_content = queryset.exists()
         self.fields["delivery_mode"].initial = (
-            self.DeliveryMode.SYSTEM_CONTENT if has_system_content else self.DeliveryMode.EXTERNAL_URL
+            self.DeliveryMode.SYSTEM_CONTENT
+            if (has_system_content or require_inline_primary)
+            else self.DeliveryMode.EXTERNAL_URL
         )
         if not has_system_content:
             self.fields["content_version"].disabled = True
             self.fields["content_version"].empty_label = "请先生成完整内容"
         if _is_english():
             self.fields["delivery_mode"].choices = (
-                (self.DeliveryMode.SYSTEM_CONTENT, "Submit complete content saved in Growth OS"),
-                (self.DeliveryMode.EXTERNAL_URL, "Submit an external content link"),
+                ((self.DeliveryMode.SYSTEM_CONTENT, "Submit complete content saved in Growth OS"),)
+                if require_inline_primary
+                else (
+                    (self.DeliveryMode.SYSTEM_CONTENT, "Submit complete content saved in Growth OS"),
+                    (self.DeliveryMode.EXTERNAL_URL, "Submit an external content link"),
+                )
             )
             self.fields["content_version"].empty_label = (
                 "Generate complete content first" if not has_system_content else "Select the latest content version"
@@ -415,6 +435,11 @@ class DeliveryDoDForm(CriteriaCommandForm):
         mode = cleaned.get("delivery_mode")
         content_version = cleaned.get("content_version")
         external_url = cleaned.get("external_url")
+        if self.require_inline_primary and mode != self.DeliveryMode.SYSTEM_CONTENT:
+            self.add_error(
+                "delivery_mode",
+                "Daily Operations 发布任务必须送审系统内完整正文；外部链接只能作为参考。",
+            )
         if mode == self.DeliveryMode.SYSTEM_CONTENT:
             if content_version is None:
                 self.add_error("content_version", "请先生成或保存一份系统内完整内容。")

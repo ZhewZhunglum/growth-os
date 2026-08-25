@@ -198,7 +198,7 @@ class Task(TimeStampedModel):
         State.SUBMITTED: {State.UNDER_REVIEW},
         State.UNDER_REVIEW: {State.HUMAN_REWORK, State.APPROVED},
         State.HUMAN_REWORK: {State.IN_PROGRESS, State.CANCELLED},
-        State.APPROVED: {State.DONE},
+        State.APPROVED: {State.HUMAN_REWORK, State.DONE, State.CANCELLED},
         State.DONE: set(),
         State.CANCELLED: set(),
     }
@@ -460,6 +460,15 @@ class Task(TimeStampedModel):
                 )
             if to_state not in cls.TRANSITIONS.get(task.current_state, set()):
                 raise IllegalTaskTransition(f"{task.current_state} cannot transition to {to_state}.")
+            if task.current_state == cls.State.APPROVED and to_state == cls.State.HUMAN_REWORK:
+                raise IllegalTaskTransition(
+                    "Approved content must return through the exact approved-submission rework command."
+                )
+            if task.current_state == cls.State.APPROVED and to_state == cls.State.CANCELLED:
+                if acting_role not in {ActingRole.OWNER, ActingRole.OPERATIONS_ADMIN}:
+                    raise PermissionDenied("ONLY_OWNER_OR_ADMIN_CAN_STOP_PUBLICATION")
+                if not reason.strip():
+                    raise ValidationError("Stopping publication requires a reason.")
             # Projecting a newly-created assignment from READY is the
             # privileged assignment action.  Returning a BLOCKED task to its
             # recorded ASSIGNED state is only an unblock operation and must
@@ -521,6 +530,168 @@ class Task(TimeStampedModel):
             task.state_version = next_version
             task.updated_by_principal = recorded_by_principal
             task.save(update_fields=["current_state", "state_version", "blocked_from_state", "updated_by_principal", "updated_at"])
+            return event
+
+    @classmethod
+    def stop_publication(
+        cls,
+        *,
+        task_id,
+        command_id: uuid.UUID,
+        expected_state_version: int,
+        actor_principal,
+        acting_role: str,
+        permission_grant,
+        recorded_by_principal,
+        reason: str,
+    ) -> TaskStateEvent:
+        """Append an audited stop for an approved task without deleting facts."""
+
+        if acting_role not in {ActingRole.OWNER, ActingRole.OPERATIONS_ADMIN}:
+            raise PermissionDenied("ONLY_OWNER_OR_ADMIN_CAN_STOP_PUBLICATION")
+        if not reason.strip():
+            raise ValidationError("Stopping publication requires a reason.")
+        return cls.transition(
+            task_id=task_id,
+            to_state=cls.State.CANCELLED,
+            command_id=command_id,
+            expected_state_version=expected_state_version,
+            actor_principal=actor_principal,
+            acting_role=acting_role,
+            permission_grant=permission_grant,
+            recorded_by_principal=recorded_by_principal,
+            reason=reason.strip(),
+        )
+
+    @classmethod
+    def return_approved_submission_for_rework(
+        cls,
+        *,
+        task_id,
+        submission_id,
+        command_id: uuid.UUID,
+        expected_state_version: int,
+        actor_principal,
+        acting_role: str,
+        permission_grant,
+        recorded_by_principal,
+        reason: str,
+    ) -> TaskStateEvent:
+        """Return the exact approved link-only submission for a new inline version.
+
+        The old Submission, ReviewDecision, Gate and Publication intent remain
+        immutable.  The task lock serializes this command with final publication.
+        """
+
+        from contentops.models import ContentAssetVersion, ReviewDecision, TaskSubmission
+
+        with transaction.atomic():
+            task = cls.objects.select_for_update().get(pk=task_id)
+            submission = TaskSubmission.objects.select_for_update().select_related(
+                "primary_asset_version"
+            ).get(pk=submission_id)
+            payload = {
+                "task_id": str(task.pk),
+                "submission_id": str(submission.pk),
+                "expected_state_version": expected_state_version,
+                "actor_principal_id": str(actor_principal.pk),
+                "acting_role": acting_role,
+                "permission_grant_id": str(permission_grant.pk),
+                "reason": reason.strip(),
+            }
+            digest = payload_sha256(payload)
+            existing = TaskStateEvent.objects.filter(command_id=command_id).first()
+            if existing:
+                if (
+                    existing.event_type
+                    != TaskStateEvent.EventType.APPROVED_REWORK_REQUESTED
+                    or existing.submission_id != submission.pk
+                    or existing.payload_hash != digest
+                ):
+                    raise CommandReplayConflict(
+                        "command_id was already used with a different payload."
+                    )
+                return existing
+
+            if acting_role not in {ActingRole.OWNER, ActingRole.OPERATIONS_ADMIN}:
+                raise PermissionDenied("ONLY_OWNER_OR_ADMIN_CAN_RETURN_APPROVED_CONTENT")
+            if not reason.strip():
+                raise ValidationError("Returning approved content requires a reason.")
+            if task.state_version != expected_state_version:
+                raise OptimisticConcurrencyConflict(
+                    "Task version is stale; reread before returning content."
+                )
+            if task.current_state != cls.State.APPROVED:
+                raise IllegalTaskTransition(
+                    "Only an APPROVED task may return for complete inline content."
+                )
+            if submission.task_id != task.pk:
+                raise CheckGateRejected("The submission belongs to another task.")
+            latest = TaskSubmission.objects.filter(task=task).order_by(
+                "-submission_number"
+            ).first()
+            if latest is None or latest.pk != submission.pk:
+                raise CheckGateRejected("Only the latest exact submission may return for rework.")
+            try:
+                final_review = submission.final_review
+            except ReviewDecision.DoesNotExist:
+                final_review = None
+            if final_review is None or final_review.decision != ReviewDecision.Decision.APPROVED:
+                raise CheckGateRejected(
+                    "Returning content requires the exact final APPROVED human review."
+                )
+            if (
+                submission.primary_asset_version.representation_kind
+                != ContentAssetVersion.RepresentationKind.EXTERNAL_URL
+            ):
+                raise CheckGateRejected(
+                    "Only a link-only approved submission needs this rework path."
+                )
+            if TaskStateEvent.objects.filter(
+                event_type=TaskStateEvent.EventType.APPROVED_REWORK_REQUESTED,
+                submission=submission,
+            ).exists():
+                raise CheckGateRejected("This approved submission was already returned.")
+            validate_current_grant(
+                permission_grant,
+                principal=actor_principal,
+                acting_role=acting_role,
+                action="EDIT",
+                product_id=task.product_id,
+            )
+
+            previous = task.state_events.order_by("-event_sequence").first()
+            next_version = task.state_version + 1
+            event = TaskStateEvent.objects.create(
+                task=task,
+                event_type=TaskStateEvent.EventType.APPROVED_REWORK_REQUESTED,
+                submission=submission,
+                from_state=cls.State.APPROVED,
+                to_state=cls.State.HUMAN_REWORK,
+                command_id=command_id,
+                payload_hash=digest,
+                expected_state_version=expected_state_version,
+                resulting_state_version=next_version,
+                event_sequence=next_version,
+                previous_event=previous,
+                reason=reason.strip(),
+                actor_principal=actor_principal,
+                acting_role=acting_role,
+                permission_grant=permission_grant,
+                recorded_by_principal=recorded_by_principal,
+                event_at=timezone.now(),
+            )
+            task.current_state = cls.State.HUMAN_REWORK
+            task.state_version = next_version
+            task.updated_by_principal = recorded_by_principal
+            task.save(
+                update_fields=[
+                    "current_state",
+                    "state_version",
+                    "updated_by_principal",
+                    "updated_at",
+                ]
+            )
             return event
 
     @classmethod
@@ -844,6 +1015,10 @@ class TaskStateEvent(AppendOnlyFact):
     class EventType(models.TextChoices):
         STATE_TRANSITION = "STATE_TRANSITION", "State transition"
         SUBMISSION_WITHDRAWN = "SUBMISSION_WITHDRAWN", "Submission withdrawn"
+        APPROVED_REWORK_REQUESTED = (
+            "APPROVED_REWORK_REQUESTED",
+            "Approved submission returned for rework",
+        )
 
     task = models.ForeignKey(Task, on_delete=models.PROTECT, related_name="state_events")
     event_type = models.CharField(
@@ -898,6 +1073,12 @@ class TaskStateEvent(AppendOnlyFact):
                         from_state=Task.State.UNDER_REVIEW,
                         to_state=Task.State.IN_PROGRESS,
                     )
+                    | Q(
+                        event_type="APPROVED_REWORK_REQUESTED",
+                        submission__isnull=False,
+                        from_state=Task.State.APPROVED,
+                        to_state=Task.State.HUMAN_REWORK,
+                    )
                 ),
                 name="workflow_event_type_payload_shape",
             ),
@@ -905,6 +1086,11 @@ class TaskStateEvent(AppendOnlyFact):
                 fields=["submission"],
                 condition=Q(event_type="SUBMISSION_WITHDRAWN"),
                 name="workflow_one_withdrawal_per_submission",
+            ),
+            models.UniqueConstraint(
+                fields=["submission"],
+                condition=Q(event_type="APPROVED_REWORK_REQUESTED"),
+                name="workflow_one_approved_rework_per_submission",
             ),
         ]
 
@@ -923,6 +1109,22 @@ class TaskStateEvent(AppendOnlyFact):
                 raise ValidationError("A withdrawal event must move UNDER_REVIEW to IN_PROGRESS.")
             if self.task_id and self.submission.task_id != self.task_id:
                 raise ValidationError("The withdrawn submission belongs to another task.")
+        elif self.event_type == self.EventType.APPROVED_REWORK_REQUESTED:
+            if self.submission_id is None:
+                raise ValidationError(
+                    "An approved rework event must reference the exact submission."
+                )
+            if (
+                self.from_state != Task.State.APPROVED
+                or self.to_state != Task.State.HUMAN_REWORK
+            ):
+                raise ValidationError(
+                    "An approved rework event must move APPROVED to HUMAN_REWORK."
+                )
+            if self.task_id and self.submission.task_id != self.task_id:
+                raise ValidationError(
+                    "The returned submission belongs to another task."
+                )
         if self.event_sequence != self.resulting_state_version:
             raise ValidationError("Task event sequence must equal the resulting Task state version.")
         if self.event_sequence == 1:

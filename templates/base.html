@@ -10,18 +10,15 @@
 </head>
 <body>
     {% url 'set_language' as set_language_url %}
-    {% url 'dailyops:home' as dailyops_home_url %}
     {% url 'feedback:home' as feedback_home_url %}
-    {% url 'governanceui:home' as governance_home_url %}
     {% url 'dashboard:home' as dashboard_home_url %}
     {% url 'dashboard:review-queue' as review_queue_url %}
     {% url 'dashboard:release-queue' as release_queue_url %}
-    {% url 'dashboard:team-members' as team_members_url %}
-    {% url 'dashboard:configuration-home' as configuration_home_url %}
+    {% url 'dashboard:feature-center' as feature_center_url %}
     {% url 'dashboard:change-my-password' as change_password_url %}
     {% url 'dashboard:guide' as guide_url %}
     {% url 'logout' as logout_url %}
-    {% if user.is_authenticated %}{% action_center_for user as global_action_center %}{% endif %}
+    {% if user.is_authenticated %}{% action_center_for user as global_action_center %}{% feature_center_for user global_action_center as global_feature_center %}{% endif %}
     <div class="app-shell">
         <aside class="sidebar">
             <a class="brand" href="{{ dashboard_home_url|default:'#' }}" aria-label="{% ui '返回 Growth OS 今日任务' 'Back to Growth OS Today' %}">
@@ -30,9 +27,6 @@
             </a>
             <nav aria-label="{% ui '主导航' 'Main navigation' %}">
                 <a class="nav-item{% if request.resolver_match.namespace == 'dashboard' and request.resolver_match.url_name == 'home' %} is-active{% endif %}" href="{{ dashboard_home_url|default:'#' }}">{% ui '首页' 'Home' %}</a>
-                {% if user.role == "OWNER" or user.role == "OPERATIONS_ADMIN" %}
-                <a class="nav-item{% if request.resolver_match.namespace == 'dailyops' %} is-active{% endif %}" href="{{ dailyops_home_url|default:'#' }}">{% ui '机会与计划' 'Opportunities' %}</a>
-                {% endif %}
                 <a class="nav-item{% if request.resolver_match.namespace == 'dashboard' and request.resolver_match.url_name == 'task-detail' or request.resolver_match.url_name == 'task-create' %} is-active{% endif %}" href="{{ dashboard_home_url|default:'#' }}#my-tasks">{% ui '我的任务' 'My work' %}</a>
                 {% if global_action_center.can_open_review %}
                 <a class="nav-item{% if request.resolver_match.url_name == 'review-queue' or request.resolver_match.url_name == 'review-detail' or request.resolver_match.url_name == 'review-history-detail' %} is-active{% endif %}" href="{{ review_queue_url|default:'#' }}">{% ui '审核' 'Review' %}</a>
@@ -40,20 +34,10 @@
                 {% if global_action_center.can_open_publish or global_action_center.can_open_complete %}
                 <a class="nav-item{% if request.resolver_match.url_name == 'release-queue' or request.resolver_match.url_name == 'release-detail' %} is-active{% endif %}" href="{{ release_queue_url|default:'#' }}">{% ui '发布' 'Publish' %}</a>
                 {% endif %}
-                <details class="sidebar-nav-more"{% if request.resolver_match.namespace == 'feedback' or request.resolver_match.namespace == 'governanceui' or request.resolver_match.url_name == 'team-members' or request.resolver_match.url_name == 'team-member-detail' or request.resolver_match.url_name == 'configuration-home' or request.resolver_match.url_name == 'product-configuration' or request.resolver_match.url_name == 'runtime-configuration' or request.resolver_match.url_name == 'guide' %} open{% endif %}>
-                    <summary class="nav-item{% if request.resolver_match.namespace == 'feedback' or request.resolver_match.namespace == 'governanceui' or request.resolver_match.url_name == 'team-members' or request.resolver_match.url_name == 'team-member-detail' or request.resolver_match.url_name == 'configuration-home' or request.resolver_match.url_name == 'product-configuration' or request.resolver_match.url_name == 'runtime-configuration' or request.resolver_match.url_name == 'guide' %} is-active{% endif %}">{% ui '更多' 'More' %}<span aria-hidden="true">⌄</span></summary>
-                    <div class="sidebar-nav-more-links">
-                        {% if user.role == "OWNER" or user.role == "OPERATIONS_ADMIN" %}
-                        <a class="nav-item{% if request.resolver_match.namespace == 'feedback' %} is-active{% endif %}" href="{{ feedback_home_url|default:'#' }}">{% ui '查看结果' 'Results' %}</a>
-                        <a class="nav-item{% if request.resolver_match.namespace == 'governanceui' %} is-active{% endif %}" href="{{ governance_home_url|default:'#' }}">{% ui '问题与规则' 'Issues & rules' %}</a>
-                        <a class="nav-item{% if request.resolver_match.url_name == 'team-members' or request.resolver_match.url_name == 'team-member-detail' %} is-active{% endif %}" href="{{ team_members_url|default:'#' }}">{% ui '员工' 'Team' %}</a>
-                        {% endif %}
-                        {% if user.role == "OWNER" %}
-                        <a class="nav-item{% if request.resolver_match.url_name == 'configuration-home' or request.resolver_match.url_name == 'product-configuration' or request.resolver_match.url_name == 'runtime-configuration' %} is-active{% endif %}" href="{{ configuration_home_url|default:'#' }}">{% ui '设置' 'Settings' %}</a>
-                        {% endif %}
-                        <a class="nav-item{% if request.resolver_match.url_name == 'guide' %} is-active{% endif %}" href="{{ guide_url|default:'#' }}">{% ui '使用说明' 'Guide' %}</a>
-                    </div>
-                </details>
+                <a class="nav-item{% if request.resolver_match.url_name == 'feature-center' or request.resolver_match.namespace == 'dailyops' or request.resolver_match.namespace == 'governanceui' or request.resolver_match.url_name == 'team-members' or request.resolver_match.url_name == 'team-member-detail' or request.resolver_match.url_name == 'configuration-home' or request.resolver_match.url_name == 'product-configuration' or request.resolver_match.url_name == 'runtime-configuration' or request.resolver_match.url_name == 'guide' %} is-active{% endif %}" href="{{ feature_center_url|default:'#' }}">{% ui '功能中心' 'Feature center' %}</a>
+                {% if global_feature_center.can_open_geo %}
+                <a class="nav-item{% if request.resolver_match.namespace == 'feedback' %} is-active{% endif %}" href="{{ feedback_home_url|default:'#' }}#geo">{% ui 'AI 搜索曝光（GEO）' 'AI search visibility (GEO)' %}</a>
+                {% endif %}
             </nav>
             {% if user.is_authenticated %}
             <details class="sidebar-user-menu">
