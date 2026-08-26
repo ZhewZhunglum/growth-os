@@ -521,6 +521,7 @@ def generate_task_content_draft(
                 "input_tokens": result.usage.input_tokens,
                 "output_tokens": result.usage.output_tokens,
                 "total_tokens": result.usage.total_tokens,
+                "cached_input_tokens": result.usage.cached_input_tokens,
                 "estimated_cost_usd": result.usage.estimated_cost_usd,
             },
         }

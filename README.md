@@ -227,7 +227,7 @@ and the MANUAL publication route after human confirmation. This is the default.
 The DeepSeek adapter targets `deepseek-v4-flash`, but open model weights do not
 mean that DeepSeek's hosted API is automatically free. Live AI requires an
 explicit reviewed runtime factory, an ACTIVE stage-matched `SecretReference`, a
-read-only secret file, current official input/output prices, and hard request
+read-only secret file, current reviewed uncached-input/cache-hit/output prices, and hard request
 and dollar budgets. Missing or invalid configuration fails closed. Connector
 and publication networking follow the same rule: they remain disabled until a
 reviewed deployment factory supplies exact routes and transports. User form

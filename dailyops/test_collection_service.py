@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import uuid
+import tempfile
 from datetime import timedelta
+from pathlib import Path
 from unittest.mock import patch
 
 from django.core.exceptions import ImproperlyConfigured, PermissionDenied, ValidationError
@@ -846,7 +848,9 @@ class DeploymentCompositionTests(TestCase):
                 "DEPLOYMENT_STAGE": "STAGING",
                 "DAILYOPS_DEEPSEEK_ENABLED": True,
                 "DAILYOPS_DEEPSEEK_MODEL": "deepseek-v4-flash",
-                "DEEPSEEK_API_KEY_FILE": "C:/run/secrets/deepseek-api-key",
+                "DEEPSEEK_API_KEY_FILE": str(
+                    Path(tempfile.gettempdir()).resolve() / "deepseek-api-key"
+                ),
                 "DAILYOPS_DEEPSEEK_INPUT_USD_PER_MILLION": "1.00",
                 "DAILYOPS_DEEPSEEK_OUTPUT_USD_PER_MILLION": "2.00",
                 "DAILYOPS_DEEPSEEK_MAX_REQUESTS": 3,
@@ -875,7 +879,9 @@ class DeploymentCompositionTests(TestCase):
                 {
                     "DEPLOYMENT_STAGE": "STAGING",
                     "DAILYOPS_DEEPSEEK_ENABLED": True,
-                    "DEEPSEEK_API_KEY_FILE": "C:/run/secrets/deepseek-api-key",
+                    "DEEPSEEK_API_KEY_FILE": str(
+                        Path(tempfile.gettempdir()).resolve() / "deepseek-api-key"
+                    ),
                     "DAILYOPS_DEEPSEEK_INPUT_USD_PER_MILLION": "0",
                     "DAILYOPS_DEEPSEEK_OUTPUT_USD_PER_MILLION": "2.00",
                     "DAILYOPS_DEEPSEEK_MAX_REQUESTS": 1,
