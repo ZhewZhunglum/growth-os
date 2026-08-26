@@ -6,6 +6,7 @@ from django.contrib import messages
 from django.contrib.auth.decorators import login_required
 from django.core.exceptions import ImproperlyConfigured, PermissionDenied, ValidationError
 from django.db import transaction
+from django.core.paginator import Paginator
 from django.http import Http404, HttpRequest, HttpResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.views.decorators.http import require_POST
@@ -435,12 +436,18 @@ def review_queue(request: HttpRequest) -> HttpResponse:
     from dashboard.action_center import build_action_center
 
     waiting_reviews = build_action_center(request.user).waiting_items
+    review_paginator = Paginator(tasks, 10)
+    review_page = review_paginator.get_page(request.GET.get("review_page", 1))
+    history_paginator = Paginator(completed_reviews, 10)
+    history_page = history_paginator.get_page(request.GET.get("history_page", 1))
     return render(
         request,
         "dashboard/review_queue.html",
         {
-            "tasks": tasks,
-            "completed_reviews": completed_reviews,
+            "tasks": review_page.object_list,
+            "review_page_obj": review_page,
+            "completed_reviews": history_page.object_list,
+            "history_page_obj": history_page,
             "waiting_reviews": waiting_reviews,
         },
     )
@@ -592,7 +599,9 @@ def release_queue(request: HttpRequest) -> HttpResponse:
             or _can_manage_approved_publication(request.user, task)
         ):
             tasks.append(task)
-    return render(request, "dashboard/release_queue.html", {"tasks": tasks})
+    paginator = Paginator(tasks, 10)
+    page_obj = paginator.get_page(request.GET.get("page", 1))
+    return render(request, "dashboard/release_queue.html", {"tasks": page_obj.object_list, "page_obj": page_obj})
 
 
 @login_required

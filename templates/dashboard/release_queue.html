@@ -11,4 +11,11 @@
     <article class="task-card"><header class="task-card-header"><div><p class="task-meta">{{ task.product.name }}</p><h3>{{ task.title }}</h3></div><span class="task-state task-state-approved">{% ui_task_state task.current_state %}</span></header><div class="task-section"><span class="task-label">{% ui '下一步' 'Next step' %}</span><p>{% ui '打开后先查看完整正文，再运行发布检查。若只有资料链接或不再需要发布，有权限的负责人可以在详情页退回制作或停止发布。' 'Open the item to review the complete content before running release checks. If it contains only a source link or should no longer be published, an authorized owner can return it to production or stop publishing from the detail page.' %}</p></div><footer class="task-card-footer"><span>{% ui '正文 → 检查 → 平台发布 → 记录结果' 'Content → checks → platform publishing → result' %}</span><a class="button button-primary" href="{% url 'dashboard:release-detail' task.id %}">{% ui '打开发布流程' 'Open publishing flow' %}</a></footer></article>
     {% empty %}<article class="empty-state task-empty-state"><span class="empty-number">00</span><div><h3>{% ui '当前没有可处理的发布任务' 'No publishing tasks are ready' %}</h3><p>{% ui '你现在不需要做任何操作。' 'No action is needed.' %}</p></div></article>{% endfor %}
 </section>
+{% if page_obj and page_obj.paginator.num_pages > 1 %}
+<nav class="pagination" aria-label="{% ui '发布队列分页' 'Release queue pagination' %}">
+    {% if page_obj.has_previous %}<a href="?page={{ page_obj.previous_page_number }}">{% ui '上一页' 'Prev' %}</a>{% else %}<span class="is-disabled">{% ui '上一页' 'Prev' %}</span>{% endif %}
+    <span class="is-current">{{ page_obj.number }} / {{ page_obj.paginator.num_pages }}</span>
+    {% if page_obj.has_next %}<a href="?page={{ page_obj.next_page_number }}">{% ui '下一页' 'Next' %}</a>{% else %}<span class="is-disabled">{% ui '下一页' 'Next' %}</span>{% endif %}
+</nav>
+{% endif %}
 {% endblock %}

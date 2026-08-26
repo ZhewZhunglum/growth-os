@@ -81,7 +81,7 @@
     {% if generate_form %}
         <h3>{% ui '根据已确认的数据生成一份完整草稿' 'Generate a complete draft from the approved data' %}</h3>
         <p class="action-explanation">{% ui '本轮只使用本机离线生成器，不会连接 DeepSeek 或任何付费 API。结果只是可编辑草稿，保存、送审、发布仍然是独立人工步骤。' 'This round uses the offline generator only. It does not connect to DeepSeek or any paid API. The result is an editable draft; saving, review, and publishing remain separate human steps.' %}</p>
-        <form action="{% url 'dashboard:task-action' task.id 'generate-content' %}" method="post">
+        <form action="{% url 'dashboard:task-action' task.id 'generate-content' %}" method="post" data-async>
             {% csrf_token %}{{ generate_form.command_id }}{{ generate_form.expected_state_version }}
             <button class="button button-primary" type="submit">{% ui '生成完整内容草稿' 'Generate complete content draft' %}</button>
         </form>
@@ -97,10 +97,12 @@
             <p>{{ latest_inline_version.metadata.production_notes }}</p>
         </details>
         {% endif %}
-        <form class="task-action-form" action="{% url 'dashboard:task-action' task.id 'revise-content' %}" method="post">
+        <form class="task-action-form" action="{% url 'dashboard:task-action' task.id 'revise-content' %}" method="post" data-async>
             {% csrf_token %}{{ revision_form.command_id }}{{ revision_form.expected_state_version }}{{ revision_form.source_version }}{{ revision_form.non_field_errors }}
             <div class="field-row">
-                {{ revision_form.inline_content.label_tag }}{{ revision_form.inline_content }}{{ revision_form.inline_content.errors }}
+                {{ revision_form.inline_content.label_tag }}
+                <div data-md-editor>{{ revision_form.inline_content }}</div>
+                {{ revision_form.inline_content.errors }}
                 {% if revision_form.inline_content.help_text %}<small>{{ revision_form.inline_content.help_text }}</small>{% endif %}
             </div>
             <div>

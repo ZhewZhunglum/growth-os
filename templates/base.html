@@ -9,6 +9,10 @@
     <link rel="stylesheet" href="{% static 'css/app.css' %}">
 </head>
 <body>
+    <button class="nav-toggle" type="button" aria-label="{% ui '打开导航菜单' 'Open navigation menu' %}" aria-expanded="false">
+        <span></span><span></span><span></span>
+    </button>
+    <div class="nav-overlay" aria-hidden="true"></div>
     {% url 'set_language' as set_language_url %}
     {% url 'feedback:home' as feedback_home_url %}
     {% url 'dashboard:home' as dashboard_home_url %}
@@ -88,5 +92,6 @@
             {% block content %}{% endblock %}
         </main>
     </div>
+    <script src="{% static 'js/app.js' %}"></script>
 </body>
 </html>

@@ -23,6 +23,13 @@
     <article class="empty-state task-empty-state"><span class="empty-number">00</span><div><h3>{% ui '当前没有待审核任务' 'No tasks are waiting for review' %}</h3><p>{% ui '你不需要做任何操作。' 'No action is needed.' %}</p></div></article>
     {% endfor %}
 </section>
+{% if review_page_obj and review_page_obj.paginator.num_pages > 1 %}
+<nav class="pagination" aria-label="{% ui '待审核分页' 'Review queue pagination' %}">
+    {% if review_page_obj.has_previous %}<a href="?review_page={{ review_page_obj.previous_page_number }}">{% ui '上一页' 'Prev' %}</a>{% else %}<span class="is-disabled">{% ui '上一页' 'Prev' %}</span>{% endif %}
+    <span class="is-current">{{ review_page_obj.number }} / {{ review_page_obj.paginator.num_pages }}</span>
+    {% if review_page_obj.has_next %}<a href="?review_page={{ review_page_obj.next_page_number }}">{% ui '下一页' 'Next' %}</a>{% else %}<span class="is-disabled">{% ui '下一页' 'Next' %}</span>{% endif %}
+</nav>
+{% endif %}
 {% if waiting_reviews %}
 <section class="section-heading review-handoff-heading"><div><p class="eyebrow">{% ui '只读进度' 'Read-only progress' %}</p><h2>{% ui '我送审的内容正在等待他人' 'My submissions waiting on someone else' %}</h2></div><span class="section-note">{{ waiting_reviews|length }} {% ui '项' 'items' %}</span></section>
 <section class="task-list review-handoff-list" aria-label="{% ui '等待他人审核的提交' 'Submissions waiting for someone else to review' %}">
@@ -50,4 +57,11 @@
     <article class="empty-state task-empty-state"><span class="empty-number">00</span><div><h3>{% ui '还没有已完成的审核记录' 'No completed reviews yet' %}</h3><p>{% ui '完成审核后，历史结论会在这里以只读方式显示。' 'Completed reviews appear here as read-only records.' %}</p></div></article>
     {% endfor %}
 </section>
+{% if history_page_obj and history_page_obj.paginator.num_pages > 1 %}
+<nav class="pagination" aria-label="{% ui '审核历史分页' 'Review history pagination' %}">
+    {% if history_page_obj.has_previous %}<a href="?history_page={{ history_page_obj.previous_page_number }}">{% ui '上一页' 'Prev' %}</a>{% else %}<span class="is-disabled">{% ui '上一页' 'Prev' %}</span>{% endif %}
+    <span class="is-current">{{ history_page_obj.number }} / {{ history_page_obj.paginator.num_pages }}</span>
+    {% if history_page_obj.has_next %}<a href="?history_page={{ history_page_obj.next_page_number }}">{% ui '下一页' 'Next' %}</a>{% else %}<span class="is-disabled">{% ui '下一页' 'Next' %}</span>{% endif %}
+</nav>
+{% endif %}
 {% endblock %}

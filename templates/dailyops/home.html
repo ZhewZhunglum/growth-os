@@ -118,7 +118,7 @@
             <summary class="button button-secondary daily-disposition-trigger">
               {% if batch.has_formal_execution %}{% ui '从最近工作隐藏（任务保留）' 'Hide from Recent work (tasks remain)' %}{% else %}{% ui '删除这次草稿' 'Remove this draft' %}{% endif %}
             </summary>
-            <form method="post" action="{% url 'dailyops:batch-dispose' batch.product.id batch.batch_key %}" data-disposition-form>
+            <form method="post" action="{% url 'dailyops:batch-dispose' batch.product.id batch.batch_key %}" data-disposition-form data-confirm data-confirm-title="确认隐藏" data-confirm-message="确认从“最近的工作”隐藏这次记录吗？审计历史仍会保留。" data-confirm-text="确认隐藏" data-confirm-class="button-danger">
               {% csrf_token %}
               <input type="hidden" name="command_id" value="{{ batch.disposition_command_id }}">
               <p>
@@ -151,6 +151,13 @@
     {% endfor %}
     </div>
   </section>
+  {% if recent_page_obj and recent_page_obj.paginator.num_pages > 1 %}
+  <nav class="pagination" aria-label="{% ui '最近工作分页' 'Recent work pagination' %}">
+      {% if recent_page_obj.has_previous %}<a href="?page={{ recent_page_obj.previous_page_number }}">{% ui '上一页' 'Prev' %}</a>{% else %}<span class="is-disabled">{% ui '上一页' 'Prev' %}</span>{% endif %}
+      <span class="is-current">{{ recent_page_obj.number }} / {{ recent_page_obj.paginator.num_pages }}</span>
+      {% if recent_page_obj.has_next %}<a href="?page={{ recent_page_obj.next_page_number }}">{% ui '下一页' 'Next' %}</a>{% else %}<span class="is-disabled">{% ui '下一页' 'Next' %}</span>{% endif %}
+  </nav>
+  {% endif %}
 </div>
 <script>
 (() => {
@@ -165,14 +172,6 @@
       if (query) query.value = button.dataset.query || '';
       document.getElementById('daily-start-title')?.scrollIntoView({behavior: 'smooth'});
       query?.focus();
-    });
-  });
-  document.querySelectorAll('[data-disposition-form]').forEach((form) => {
-    form.addEventListener('submit', (event) => {
-      const prompt = document.documentElement.lang.startsWith('en')
-        ? 'Hide this run from Recent work? Its audit history will remain.'
-        : '确认从“最近的工作”隐藏这次记录吗？审计历史仍会保留。';
-      if (!window.confirm(prompt)) event.preventDefault();
     });
   });
 })();

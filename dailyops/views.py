@@ -9,6 +9,7 @@ from django.contrib.auth.decorators import login_required
 from django.core.exceptions import ImproperlyConfigured, PermissionDenied, ValidationError
 from django.db import transaction
 from django.db.models import Count, F, Q
+from django.core.paginator import Paginator
 from django.http import Http404, HttpRequest, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
@@ -353,12 +354,16 @@ def home(request: HttpRequest) -> HttpResponse:
         action=PermissionGrant.Action.MANAGE_ACCOUNT,
         scope_kind=PermissionGrant.ScopeKind.GLOBAL,
     ).allowed
+    all_recent = list(recent.values())
+    paginator = Paginator(all_recent, 10)
+    page_obj = paginator.get_page(request.GET.get("page", 1))
     return render(
         request,
         "dailyops/home.html",
         {
             "form": form,
-            "recent_batches": recent.values(),
+            "recent_batches": page_obj.object_list,
+            "recent_page_obj": page_obj,
             "data_recommendations": _data_recommendations(products=editable_products),
             "can_start_batch": editable_products.exists(),
             "configured_source_count": SourceRegistry.objects.filter(

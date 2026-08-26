@@ -8,8 +8,10 @@ from django.contrib.auth.decorators import login_required
 from django.core.exceptions import ObjectDoesNotExist, PermissionDenied, ValidationError
 from django.db import transaction
 from django.db.models import F
-from django.http import Http404, HttpRequest, HttpResponse
+from django.core.paginator import Paginator
+from django.http import Http404, HttpRequest, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
+from django.urls import reverse
 from django.views.decorators.http import require_POST
 
 from accounts.authorization import require_authorization, resolve_authorization
@@ -628,21 +630,24 @@ def _detail_context(
 @login_required
 def home(request: HttpRequest) -> HttpResponse:
     action_center = build_action_center(request.user)
-    tasks = list(action_center.tasks)
-    for task in tasks:
+    all_tasks = list(action_center.tasks)
+    for task in all_tasks:
         _decorate_task(task)
+    paginator = Paginator(all_tasks, 10)
+    page_number = request.GET.get("page", 1)
+    page_obj = paginator.get_page(page_number)
+    tasks = page_obj.object_list
     can_create_task = _editable_profiles(request.user).exists()
     return render(
         request,
         "dashboard/home.html",
         {
             "tasks": tasks,
-            "task_count": len(tasks),
-            "blocked_task_count": sum(task.current_state == Task.State.BLOCKED for task in tasks),
+            "page_obj": page_obj,
+            "task_count": len(all_tasks),
+            "blocked_task_count": sum(task.current_state == Task.State.BLOCKED for task in all_tasks),
             "can_create_task": can_create_task,
             "action_center": action_center,
-            # Keep these stable context keys for review/release slice tests and
-            # any internal links that already consume them.
             "pending_review_count": action_center.pending_review_count,
             "pending_publish_count": action_center.pending_publish_count,
             "pending_complete_count": action_center.pending_complete_count,
@@ -1282,4 +1287,6 @@ def task_action(request: HttpRequest, task_id, action: str) -> HttpResponse:
             raise Http404("Unknown task action.")
     except ValidationError as error:
         messages.error(request, _validation_text(error))
+    if request.headers.get("X-Requested-With") == "XMLHttpRequest":
+        return JsonResponse({"ok": True, "redirect": reverse("dashboard:task-detail", args=[task.pk]), "reload": True})
     return redirect("dashboard:task-detail", task_id=task.pk)

@@ -65,4 +65,12 @@
     </article>
     {% endfor %}
 </section>
+{% if page_obj and page_obj.paginator.num_pages > 1 %}
+<nav class="pagination" aria-label="{% ui '分页导航' 'Pagination' %}">
+    {% if page_obj.has_previous %}<a href="?page={{ page_obj.previous_page_number }}">{% ui '上一页' 'Prev' %}</a>{% else %}<span class="is-disabled">{% ui '上一页' 'Prev' %}</span>{% endif %}
+    {% for num in page_obj.paginator.page_range %}{% if num == page_obj.number %}<span class="is-current">{{ num }}</span>{% elif num > page_obj.number|add:"-3" and num < page_obj.number|add:"3" %}<a href="?page={{ num }}">{{ num }}</a>{% endif %}{% endfor %}
+    {% if page_obj.has_next %}<a href="?page={{ page_obj.next_page_number }}">{% ui '下一页' 'Next' %}</a>{% else %}<span class="is-disabled">{% ui '下一页' 'Next' %}</span>{% endif %}
+</nav>
+<p class="pagination-info">{% ui '共' 'Total' %} {{ page_obj.paginator.count }} {% ui '项，第' 'items, page' %} {{ page_obj.number }} / {{ page_obj.paginator.num_pages }}</p>
+{% endif %}
 {% endblock %}
