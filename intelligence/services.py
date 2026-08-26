@@ -4,12 +4,14 @@ import uuid
 from dataclasses import dataclass
 from typing import TypeVar
 
+from django.core.exceptions import ValidationError
 from django.db import transaction
 
 from accounts.authorization import require_authorization
 from accounts.models import PermissionGrant, Principal
 from intelligence.exceptions import CommandReplayConflict, IllegalStateTransition, StateVersionConflict
 from intelligence.models import (
+    AssessmentMethod,
     AvailabilityState,
     ChannelPlan,
     ChannelPlanStateEvent,
@@ -18,6 +20,7 @@ from intelligence.models import (
     InitiativeStateEvent,
     OpportunityStateEvent,
     ProductOpportunity,
+    SignalAssessment,
     SourceRegistry,
     canonical_sha256,
 )
@@ -38,6 +41,112 @@ class TransitionResult:
 class CollectionRunResult:
     run: CollectionRun
     created: bool
+
+
+def _lock_collection_batch(*, batch_key: uuid.UUID) -> tuple[CollectionRun, ...]:
+    """Use existing immutable run rows as the deterministic batch mutex."""
+
+    return tuple(
+        CollectionRun.objects.select_for_update()
+        .filter(batch_key=batch_key)
+        .order_by("created_at", "id")
+    )
+
+
+def _query_product_id(query_spec: dict) -> str:
+    if not isinstance(query_spec, dict):
+        return ""
+    value = query_spec.get("product_id")
+    return str(value).strip() if value is not None else ""
+
+
+def _authoritative_collection_batch_product_id(
+    *,
+    locked_runs: tuple[CollectionRun, ...],
+    query_spec: dict,
+) -> str:
+    """Keep one immutable Product identity for the lifetime of a batch.
+
+    The first run establishes whether the batch is Product-scoped or generic.
+    Once rows exist, their locked immutable payloads are authoritative; a new
+    caller may neither omit nor replace that Product identity.
+    """
+
+    incoming_product_id = _query_product_id(query_spec)
+    if not locked_runs:
+        return incoming_product_id
+
+    existing_product_ids = {
+        product_id
+        for run in locked_runs
+        if (product_id := _query_product_id(run.query_spec))
+    }
+    existing_runs_without_product = any(not _query_product_id(run.query_spec) for run in locked_runs)
+    if len(existing_product_ids) > 1 or (existing_product_ids and existing_runs_without_product):
+        raise ValidationError(
+            "The existing collection batch has inconsistent immutable Product identities; "
+            "manual repair is required."
+        )
+
+    authoritative_product_id = next(iter(existing_product_ids), "")
+    if incoming_product_id != authoritative_product_id:
+        if authoritative_product_id:
+            raise ValidationError(
+                "Every collection write must preserve the existing batch's exact Product identity."
+            )
+        raise ValidationError(
+            "A generic collection batch cannot later be converted into a Product-scoped batch."
+        )
+    return authoritative_product_id
+
+
+def _ensure_collection_batch_open_for_write(
+    *,
+    batch_key: uuid.UUID,
+    query_spec: dict,
+    locked_runs: tuple[CollectionRun, ...],
+) -> None:
+    """Freeze Daily Operations collection after its first durable human decision."""
+
+    product_id = _authoritative_collection_batch_product_id(
+        locked_runs=locked_runs,
+        query_spec=query_spec,
+    )
+    if not product_id:
+        return
+    assessment_key = f"daily-analysis-{batch_key.hex}"
+    human_decision_exists = False
+    assessments = SignalAssessment.objects.filter(
+        assessment_key=assessment_key,
+        method=AssessmentMethod.HUMAN,
+    ).select_related("evidence_item__collection_run")
+    for assessment in assessments:
+        assessment_run = assessment.evidence_item.collection_run
+        if assessment_run.batch_key != batch_key:
+            continue
+        if (
+            _query_product_id(assessment_run.query_spec) != product_id
+            or _query_product_id(assessment.value) != product_id
+        ):
+            raise ValidationError(
+                "The Daily Operations human decision does not match the batch's authoritative Product."
+            )
+        human_decision_exists = True
+    opportunity = (
+        ProductOpportunity.objects.filter(opportunity_key=f"daily-{batch_key.hex}")
+        .only("product_id")
+        .first()
+    )
+    if opportunity is not None and str(opportunity.product_id) != product_id:
+        raise ValidationError(
+            "The Daily Operations Opportunity does not match the batch's authoritative Product."
+        )
+    opportunity_exists = opportunity is not None
+    if human_decision_exists or opportunity_exists:
+        raise ValidationError(
+            "这次建议已经由人工采用，不能再采集、补录、更正或移除线索。"
+            "请返回机会与计划，新开一轮工作。"
+        )
 
 
 def record_collection_run(
@@ -96,6 +205,20 @@ def record_collection_run(
             if replay.operation_payload_hash != operation_hash:
                 raise CommandReplayConflict("The operation key was already used with a different collection payload.")
             return CollectionRunResult(replay, False)
+        locked_runs = _lock_collection_batch(batch_key=batch_key)
+        # A competing writer may have completed while this transaction waited
+        # for the batch mutex. Exact replay remains valid even after a later
+        # human decision freezes the batch.
+        replay = CollectionRun.objects.filter(operation_key=operation_key).first()
+        if replay is not None:
+            if replay.operation_payload_hash != operation_hash:
+                raise CommandReplayConflict("The operation key was already used with a different collection payload.")
+            return CollectionRunResult(replay, False)
+        _ensure_collection_batch_open_for_write(
+            batch_key=batch_key,
+            query_spec=query_spec,
+            locked_runs=locked_runs,
+        )
         run = CollectionRun.objects.create(
             source=source,
             batch_key=batch_key,

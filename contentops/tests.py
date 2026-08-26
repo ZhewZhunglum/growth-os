@@ -521,7 +521,7 @@ class ContentOpsInvariantTests(TestCase):
             self._submission(version=version, dod=dod)
         self.assertFalse(TaskSubmission.objects.exists())
 
-    def test_review_payload_v1_replays_without_rehashing_and_new_reviews_use_v2(self):
+    def test_review_payload_v1_v2_remain_stable_and_new_reviews_use_v3(self):
         asset = self._asset()
         submission = self._submission(version=self._version(asset, 1), dod=self._dod(1))
         self._move_to_review()
@@ -566,11 +566,47 @@ class ContentOpsInvariantTests(TestCase):
         self.assertEqual(legacy.payload_hash, original_hash)
         self.assertEqual(legacy.decision_sha256, original_hash)
 
-        # A fresh command is always reviewer-bound V2.
+        legacy_v2 = ReviewDecision(
+            submission=submission,
+            decision=ReviewDecision.Decision.APPROVED,
+            rationale="Legacy V2 approved review.",
+            criteria_results={"primary-deliverable": "PASS"},
+            command_id=uuid7(),
+            payload_schema_version=ReviewDecision.PayloadSchemaVersion.V2,
+            expected_task_version=self.task.state_version,
+            reviewer_principal=self.reviewer,
+            reviewer_acting_role=ActingRole.OPERATIONS_ADMIN,
+            reviewer_grant=self.review_grant,
+            recorded_by_principal=self.recorder,
+            decided_at=timezone.now(),
+        )
+        v2_payload = legacy_v2.command_payload()
+        self.assertEqual(
+            v2_payload,
+            {
+                "submission_id": str(submission.pk),
+                "decision": ReviewDecision.Decision.APPROVED,
+                "rationale": "Legacy V2 approved review.",
+                "criteria_results": {"primary-deliverable": "PASS"},
+                "expected_task_version": self.task.state_version,
+                "payload_schema_version": 2,
+                "reviewer_principal_id": str(self.reviewer.pk),
+                "reviewer_acting_role": ActingRole.OPERATIONS_ADMIN,
+                "reviewer_grant_id": str(self.review_grant.pk),
+            },
+        )
+        self.assertNotIn("owner_edit_grant_id", v2_payload)
+        v2_hash = canonical_sha256(v2_payload)
+        legacy_v2.owner_edit_grant_id = self.edit_grant.pk
+        self.assertEqual(canonical_sha256(legacy_v2.command_payload()), v2_hash)
+
+        # A fresh command is reviewer-bound V3, so the exact optional Owner
+        # EDIT grant participates in the immutable command hash.
         fresh = ReviewDecision()
-        self.assertEqual(fresh.payload_schema_version, ReviewDecision.PayloadSchemaVersion.V2)
+        self.assertEqual(fresh.payload_schema_version, ReviewDecision.PayloadSchemaVersion.V3)
         self.assertIn("payload_schema_version", fresh.command_payload())
         self.assertIn("reviewer_principal_id", fresh.command_payload())
+        self.assertIn("owner_edit_grant_id", fresh.command_payload())
 
     def test_legacy_integrity_audit_detects_self_review_and_invalid_chain(self):
         migration = importlib.import_module(
@@ -806,48 +842,232 @@ class ContentOpsInvariantTests(TestCase):
             )
         )
 
-        # The database exception is intentionally as narrow as the service
-        # rule.  Raw SQL/ORM bypasses cannot label an EDIT grant as REVIEW
-        # authority merely because the submitter happens to be an Owner.
-        raw_wrong_grant = ReviewDecision(
-            submission=submission,
+        def assert_raw_owner_approval_rejected(
+            grant,
+            *,
+            exact_edit_grant=None,
             decision=ReviewDecision.Decision.APPROVED,
-            rationale="Raw Owner approval with the wrong grant must fail.",
-            command_id=uuid7(),
-            expected_task_version=self.task.state_version,
-            reviewer_principal=self.owner,
-            reviewer_acting_role=ActingRole.OWNER,
-            reviewer_grant=owner_edit_grant,
-            recorded_by_principal=self.owner,
-            decided_at=timezone.now(),
+            rationale="Raw Owner approval bypass must fail.",
+        ):
+            raw_review = ReviewDecision(
+                submission=submission,
+                decision=decision,
+                rationale=rationale,
+                command_id=uuid7(),
+                expected_task_version=self.task.state_version,
+                reviewer_principal=self.owner,
+                reviewer_acting_role=ActingRole.OWNER,
+                reviewer_grant=grant,
+                owner_edit_grant=exact_edit_grant,
+                recorded_by_principal=self.owner,
+                decided_at=timezone.now(),
+            )
+            raw_review.payload_hash = canonical_sha256(raw_review.command_payload())
+            raw_review.decision_sha256 = raw_review.payload_hash
+            with self.assertRaises(IntegrityError), transaction.atomic():
+                models.Model.save_base(
+                    raw_review,
+                    raw=True,
+                    force_insert=True,
+                    using="default",
+                )
+
+        # The database exception is intentionally as narrow as the service
+        # rule. Raw SQL/ORM bypasses must satisfy the exact current Product
+        # REVIEW grant, a separate current Product EDIT allow, and DENY wins.
+        assert_raw_owner_approval_rejected(owner_review_grant)
+        assert_raw_owner_approval_rejected(
+            owner_edit_grant,
+            exact_edit_grant=owner_edit_grant,
         )
-        raw_wrong_grant.payload_hash = canonical_sha256(
-            raw_wrong_grant.command_payload()
+
+        other_product = Product.objects.create(
+            product_code="PUKO_CONTENTOPS_OTHER",
+            name="Other ContentOps Fixture",
+            market_code="US",
+            language_code="en",
+            created_by_principal=self.owner,
+            updated_by_principal=self.owner,
         )
-        raw_wrong_grant.decision_sha256 = raw_wrong_grant.payload_hash
-        with self.assertRaises(IntegrityError), transaction.atomic():
-            models.Model.save_base(
-                raw_wrong_grant,
-                raw=True,
-                force_insert=True,
-                using="default",
+        wrong_product_review = PermissionGrant.objects.create(
+            principal=self.owner,
+            scope_kind=PermissionGrant.ScopeKind.PRODUCT,
+            product=other_product,
+            action=PermissionGrant.Action.REVIEW,
+            valid_from=now - timedelta(minutes=1),
+            valid_until=now + timedelta(hours=1),
+            granted_by_principal=self.owner,
+        )
+        assert_raw_owner_approval_rejected(
+            wrong_product_review,
+            exact_edit_grant=owner_edit_grant,
+        )
+
+        expired_review = PermissionGrant.objects.create(
+            principal=self.owner,
+            scope_kind=PermissionGrant.ScopeKind.PRODUCT,
+            product=self.product,
+            action=PermissionGrant.Action.REVIEW,
+            valid_from=now - timedelta(hours=2),
+            valid_until=now - timedelta(hours=1),
+            granted_by_principal=self.owner,
+        )
+        assert_raw_owner_approval_rejected(
+            expired_review,
+            exact_edit_grant=owner_edit_grant,
+        )
+
+        approve_not_review = PermissionGrant.objects.create(
+            principal=self.owner,
+            scope_kind=PermissionGrant.ScopeKind.PRODUCT,
+            product=self.product,
+            action=PermissionGrant.Action.APPROVE,
+            valid_from=now - timedelta(minutes=1),
+            valid_until=now + timedelta(hours=1),
+            granted_by_principal=self.owner,
+        )
+        assert_raw_owner_approval_rejected(
+            approve_not_review,
+            exact_edit_grant=owner_edit_grant,
+        )
+        assert_raw_owner_approval_rejected(
+            owner_review_grant,
+            exact_edit_grant=owner_edit_grant,
+            rationale="   ",
+        )
+        assert_raw_owner_approval_rejected(
+            owner_review_grant,
+            exact_edit_grant=owner_edit_grant,
+            decision=ReviewDecision.Decision.CHANGES_REQUESTED,
+        )
+        assert_raw_owner_approval_rejected(
+            owner_review_grant,
+            exact_edit_grant=owner_edit_grant,
+            decision=ReviewDecision.Decision.REJECTED,
+        )
+
+        PermissionGrant.objects.filter(pk=owner_edit_grant.pk).update(
+            grant_status=PermissionGrant.GrantStatus.SUSPENDED
+        )
+        assert_raw_owner_approval_rejected(
+            owner_review_grant,
+            exact_edit_grant=owner_edit_grant,
+        )
+        PermissionGrant.objects.filter(pk=owner_edit_grant.pk).update(
+            grant_status=PermissionGrant.GrantStatus.ACTIVE
+        )
+
+        edit_deny = PermissionGrant.objects.create(
+            principal=self.owner,
+            scope_kind=PermissionGrant.ScopeKind.PRODUCT,
+            product=self.product,
+            action=PermissionGrant.Action.EDIT,
+            effect=PermissionGrant.Effect.DENY,
+            valid_from=now - timedelta(minutes=1),
+            valid_until=now + timedelta(hours=1),
+            granted_by_principal=self.owner,
+        )
+        assert_raw_owner_approval_rejected(
+            owner_review_grant,
+            exact_edit_grant=owner_edit_grant,
+        )
+        PermissionGrant.objects.filter(pk=edit_deny.pk).update(
+            grant_status=PermissionGrant.GrantStatus.SUSPENDED
+        )
+
+        review_deny = PermissionGrant.objects.create(
+            principal=self.owner,
+            scope_kind=PermissionGrant.ScopeKind.GLOBAL,
+            action=PermissionGrant.Action.REVIEW,
+            effect=PermissionGrant.Effect.DENY,
+            valid_from=now - timedelta(minutes=1),
+            valid_until=now + timedelta(hours=1),
+            granted_by_principal=self.owner,
+        )
+        assert_raw_owner_approval_rejected(
+            owner_review_grant,
+            exact_edit_grant=owner_edit_grant,
+        )
+        PermissionGrant.objects.filter(pk=review_deny.pk).update(
+            grant_status=PermissionGrant.GrantStatus.SUSPENDED
+        )
+
+        with self.assertRaisesMessage(ValidationError, "non-empty"):
+            ReviewDecision.record_final(
+                submission=submission,
+                decision=ReviewDecision.Decision.APPROVED,
+                rationale="   ",
+                command_id=uuid7(),
+                expected_task_version=self.task.state_version,
+                reviewer_principal=self.owner,
+                acting_role=ActingRole.OWNER,
+                permission_grant=owner_review_grant,
+                recorded_by_principal=self.owner,
+                owner_edit_grant=owner_edit_grant,
             )
 
+        with self.assertRaisesMessage(ValidationError, "exact Product EDIT grant"):
+            ReviewDecision.record_final(
+                submission=submission,
+                decision=ReviewDecision.Decision.APPROVED,
+                rationale="The application path must bind the exact EDIT grant.",
+                command_id=uuid7(),
+                expected_task_version=self.task.state_version,
+                reviewer_principal=self.owner,
+                acting_role=ActingRole.OWNER,
+                permission_grant=owner_review_grant,
+                recorded_by_principal=self.owner,
+            )
+
+        owner_review_command = uuid7()
         review = ReviewDecision.record_final(
             submission=submission,
             decision=ReviewDecision.Decision.APPROVED,
             rationale="Owner explicitly approved their own final content.",
-            command_id=uuid7(),
+            command_id=owner_review_command,
             expected_task_version=self.task.state_version,
             reviewer_principal=self.owner,
             acting_role=ActingRole.OWNER,
             permission_grant=owner_review_grant,
             recorded_by_principal=self.owner,
+            owner_edit_grant=owner_edit_grant,
         )
         self.assertEqual(review.reviewer_principal, self.owner)
         self.assertEqual(review.submission.submitted_by_principal, self.owner)
         self.assertEqual(review.reviewer_grant, owner_review_grant)
+        self.assertEqual(review.owner_edit_grant, owner_edit_grant)
+        self.assertEqual(
+            review.payload_schema_version,
+            ReviewDecision.PayloadSchemaVersion.V3,
+        )
+        self.assertEqual(
+            review.command_payload()["owner_edit_grant_id"],
+            str(owner_edit_grant.pk),
+        )
         self.assertEqual(review.reviewer_acting_role, ActingRole.OWNER)
+
+        alternate_edit_grant = PermissionGrant.objects.create(
+            principal=self.owner,
+            scope_kind=PermissionGrant.ScopeKind.PRODUCT,
+            product=self.product,
+            action=PermissionGrant.Action.EDIT,
+            valid_from=now - timedelta(minutes=1),
+            valid_until=now + timedelta(hours=1),
+            granted_by_principal=self.owner,
+        )
+        with self.assertRaisesMessage(ValidationError, "different review command"):
+            ReviewDecision.record_final(
+                submission=submission,
+                decision=ReviewDecision.Decision.APPROVED,
+                rationale="Owner explicitly approved their own final content.",
+                command_id=owner_review_command,
+                expected_task_version=self.task.state_version,
+                reviewer_principal=self.owner,
+                acting_role=ActingRole.OWNER,
+                permission_grant=owner_review_grant,
+                recorded_by_principal=self.owner,
+                owner_edit_grant=alternate_edit_grant,
+            )
 
         Task.transition(
             task_id=self.task.pk,
@@ -890,6 +1110,23 @@ class ContentOpsInvariantTests(TestCase):
             )
         self.assertFalse(ReviewDecision.objects.filter(submission=submission).exists())
 
+        with self.assertRaisesMessage(
+            ValidationError,
+            "may only be recorded for an Owner approving their own submission",
+        ):
+            ReviewDecision.record_final(
+                submission=submission,
+                decision=ReviewDecision.Decision.APPROVED,
+                rationale="A non-self review must not claim an Owner EDIT audit grant.",
+                command_id=uuid7(),
+                expected_task_version=self.task.state_version,
+                reviewer_principal=self.reviewer,
+                acting_role=ActingRole.OPERATIONS_ADMIN,
+                permission_grant=self.review_grant,
+                recorded_by_principal=self.recorder,
+                owner_edit_grant=self.edit_grant,
+            )
+
         direct = ReviewDecision(
             submission=submission,
             decision=ReviewDecision.Decision.APPROVED,
@@ -921,6 +1158,29 @@ class ContentOpsInvariantTests(TestCase):
         raw.decision_sha256 = raw.payload_hash
         with self.assertRaises(IntegrityError), transaction.atomic():
             models.Model.save_base(raw, raw=True, force_insert=True, using="default")
+
+        raw_non_self = ReviewDecision(
+            submission=submission,
+            decision=ReviewDecision.Decision.APPROVED,
+            rationale="Raw non-self misuse of the Owner EDIT audit field.",
+            command_id=uuid7(),
+            expected_task_version=self.task.state_version,
+            reviewer_principal=self.reviewer,
+            reviewer_acting_role=ActingRole.OPERATIONS_ADMIN,
+            reviewer_grant=self.review_grant,
+            owner_edit_grant=self.edit_grant,
+            recorded_by_principal=self.recorder,
+            decided_at=timezone.now(),
+        )
+        raw_non_self.payload_hash = canonical_sha256(raw_non_self.command_payload())
+        raw_non_self.decision_sha256 = raw_non_self.payload_hash
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            models.Model.save_base(
+                raw_non_self,
+                raw=True,
+                force_insert=True,
+                using="default",
+            )
 
     def test_review_replay_binds_exact_reviewer_role_and_grant(self):
         asset = self._asset()

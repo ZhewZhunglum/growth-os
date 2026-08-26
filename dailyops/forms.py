@@ -226,6 +226,24 @@ class ManualEvidenceForm(CommandForm):
         return cleaned
 
 
+class EvidenceCorrectionForm(ManualEvidenceForm):
+    reason = forms.CharField(
+        label="更正原因",
+        max_length=2_000,
+        widget=forms.Textarea(
+            attrs={"rows": 2, "placeholder": "例如：原链接粘贴错误，改为正确版本"}
+        ),
+    )
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.is_english:
+            self.fields["reason"].label = "Reason for correction"
+            self.fields["reason"].widget.attrs["placeholder"] = (
+                "For example: replace the incorrect link with the correct version"
+            )
+
+
 class CSVTextForm(CommandForm):
     platform = forms.ChoiceField(
         label="平台",

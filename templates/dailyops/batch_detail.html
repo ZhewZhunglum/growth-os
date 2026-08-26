@@ -33,6 +33,15 @@
   </aside>
   {% endif %}
 
+  {% if not can_edit_batch %}
+  <aside class="daily-notice" role="status">
+    <div>
+      <strong>{% ui '当前是只读查看' 'You have view-only access' %}</strong>
+      <p>{% ui '你可以查看线索、建议、计划和执行进度；采集、补录、更正、采用建议和排任务需要本产品的编辑权限。' 'You can review signals, suggestions, plans, and execution progress. Collecting, editing, accepting suggestions, and planning require product edit access.' %}</p>
+    </div>
+  </aside>
+  {% endif %}
+
   <nav class="daily-stepper" aria-label="{% ui '今日工作进度' "Today's workflow progress" %}">
     <a class="daily-step is-complete" href="{% url 'dailyops:home' %}"><span>1</span><small>{% ui '确定问题' 'Question' %}</small></a>
     <button class="daily-step" type="button" data-go-step="2"><span>2</span><small>{% ui '找线索' 'Collect' %}</small></button>
@@ -57,10 +66,10 @@
           <h3>{% ui '七个平台采集' 'Seven-platform collection' %}</h3>
           <p>{% ui '按顺序检查每个平台；没有接口的会明确提示你改用浏览器或手动补录。' 'Each platform is checked in order. If no connection is available, the system clearly asks for browser or manual input.' %}</p>
         </div>
-        <form id="daily-collect-form" method="post" action="{% url 'dailyops:automatic-collect' product.id batch_key %}">
+        {% if can_edit_batch %}<form id="daily-collect-form" method="post" action="{% url 'dailyops:automatic-collect' product.id batch_key %}">
           {% csrf_token %}<input type="hidden" name="command_id" value="{{ command_id }}">
           <button class="button button-primary" id="daily-collect-all" type="button">{% ui '开始检查 7 个平台' 'Check all 7 platforms' %}</button>
-        </form>
+        </form>{% endif %}
       </div>
 
       <div class="daily-progress" id="daily-progress" hidden>
@@ -70,7 +79,7 @@
 
       <div class="daily-platform-list" id="daily-platform-list">
       {% for card in platform_cards %}
-        <article class="daily-platform-row" data-collect-url="{% url 'dailyops:platform-collect' product.id batch_key card.platform.value %}" data-platform-name="{% if card.platform.value == 'SHOPIFY' %}{% ui 'Shopify / 独立站' 'Shopify store' %}{% elif card.platform.value == 'GOOGLE_SEARCH' %}{% ui 'Google 搜索' 'Google Search' %}{% else %}{{ card.name }}{% endif %}">
+        <article class="daily-platform-row"{% if can_edit_batch %} data-collect-url="{% url 'dailyops:platform-collect' product.id batch_key card.platform.value %}"{% endif %} data-platform-name="{% if card.platform.value == 'SHOPIFY' %}{% ui 'Shopify / 独立站' 'Shopify store' %}{% elif card.platform.value == 'GOOGLE_SEARCH' %}{% ui 'Google 搜索' 'Google Search' %}{% else %}{{ card.name }}{% endif %}">
           <span class="daily-platform-position">{{ forloop.counter }}</span>
           <div class="daily-platform-main">
             <strong>{% if card.platform.value == 'SHOPIFY' %}{% ui 'Shopify / 独立站' 'Shopify store' %}{% elif card.platform.value == 'GOOGLE_SEARCH' %}{% ui 'Google 搜索' 'Google Search' %}{% else %}{{ card.name }}{% endif %}</strong>
@@ -94,10 +103,11 @@
             {% for item in card.evidence %}
               <li>
                 <span>{% if item.external_url %}<a class="inline-link" href="{{ item.external_url }}" target="_blank" rel="noopener">{{ item.title|default:item.external_url }}</a>{% else %}{{ item.title|default:item.external_content_id }}{% endif %}</span>
+                {% if can_edit_batch %}{% if item.source.source_kind == 'MANUAL_LINK' %}<a class="daily-text-button" href="{% url 'dailyops:evidence-correct' product.id batch_key item.id %}">{% ui '更正' 'Correct' %}</a>{% endif %}
                 <form method="post" action="{% url 'dailyops:evidence-invalidate' product.id batch_key item.id %}">
                   {% csrf_token %}<input type="hidden" name="command_id" value="{{ item.invalidation_command_id }}"><input type="hidden" name="reason" value="{% ui '录入错误，不再用于后续分析。' 'Entered by mistake; exclude from future analysis.' %}">
                   <button class="daily-text-button" type="submit">{% ui '移除' 'Remove' %}</button>
-                </form>
+                </form>{% endif %}
               </li>
             {% endfor %}
             </ul>
@@ -111,7 +121,7 @@
       {% endfor %}
       </div>
 
-      <div class="daily-fallback-grid">
+      {% if can_edit_batch %}<div class="daily-fallback-grid">
         <details class="daily-fallback-card"{% if not evidence %} open{% endif %}>
           <summary><strong>{% ui 'AI 没找到？手动补一条' 'Nothing found? Add one manually' %}</strong><small>{% ui '粘贴链接，系统自动识别平台' 'Paste a link and the platform is detected' %}</small></summary>
           <form class="config-form" method="post" action="{% url 'dailyops:evidence-manual-unified' product.id batch_key %}">
@@ -134,7 +144,7 @@
             <button class="button button-secondary" type="submit">{% ui '检查并补录' 'Check and add' %}</button>
           </form>
         </details>
-      </div>
+      </div>{% endif %}
     </div>
   </details>
 
@@ -149,15 +159,26 @@
       <div class="daily-locked"><strong>{% ui '先完成上一步' 'Finish the previous step first' %}</strong><p>{% ui '至少先保存一条真实线索，系统才会整理建议。' 'Save at least one real signal before generating a suggestion.' %}</p></div>
       {% elif not proposal %}
       <div class="daily-action-card"><div><h3>{% ui '整理成一个可执行建议' 'Turn signals into one actionable suggestion' %}</h3><p>{% ui '当前是离线测试，不联网、不付费。生成的只是建议，不会自动执行。' 'This is an offline test: no network and no paid call. The result is a suggestion and will not execute automatically.' %}</p></div>
-        <form method="post" action="{% url 'dailyops:analysis-propose' product.id batch_key %}">{% csrf_token %}<input type="hidden" name="command_id" value="{{ command_id }}"><button class="button button-primary" type="submit">{% ui '生成一个建议' 'Generate a suggestion' %}</button></form>
+        {% if can_edit_batch %}<form method="post" action="{% url 'dailyops:analysis-propose' product.id batch_key %}">{% csrf_token %}<input type="hidden" name="command_id" value="{{ command_id }}"><button class="button button-primary" type="submit">{% ui '生成一个建议' 'Generate a suggestion' %}</button></form>{% else %}<p class="read-only-note">{% ui '等待有编辑权限的同事生成建议。' 'Waiting for a teammate with edit access to generate the suggestion.' %}</p>{% endif %}
       </div>
+      {% elif proposal_is_stale %}
+      <article class="daily-proposal-card daily-action-card-stacked">
+        <span class="task-state task-state-blocked">{% ui '需要重新生成' 'Regeneration required' %}</span>
+        <div>
+          <h3>{% ui '线索已经修改，原建议不能再采用' 'Signals changed, so the old suggestion cannot be used' %}</h3>
+          <p>{% ui '旧建议和原始线索会保留在历史中。请让系统只根据当前有效线索生成一份新建议。' 'The old suggestion and original signals remain in history. Generate a new suggestion from the currently valid signals.' %}</p>
+        </div>
+        {% if can_edit_batch %}<form method="post" action="{% url 'dailyops:analysis-propose' product.id batch_key %}">{% csrf_token %}<input type="hidden" name="command_id" value="{{ command_id }}"><button class="button button-primary" type="submit">{% ui '根据最新线索重新生成建议' 'Regenerate from current signals' %}</button></form>{% else %}<p class="read-only-note">{% ui '等待有编辑权限的同事重新生成建议。' 'Waiting for a teammate with edit access to regenerate the suggestion.' %}</p>{% endif %}
+        <details class="daily-advanced-actions"><summary>{% ui '查看已过期的旧建议' 'View expired suggestion' %}</summary><h4>{{ proposal.value.topic_label }}</h4><p>{{ proposal.value.summary }}</p></details>
+      </article>
       {% else %}
       <article class="daily-proposal-card">
         <span class="status-pill">{% ui '待你决定' 'Your decision' %}</span>
         <h3>{{ proposal.value.topic_label }}</h3><p>{{ proposal.value.summary }}</p>
         <div class="daily-proposal-meta"><span>{% ui '系统建议' 'Recommendation' %}: {{ proposal.value.recommendation }}</span><span>{% ui '参考线索' 'Signals used' %}: {{ proposal.value.evidence_ids|length }}</span></div>
-        {% if not initiative or initiative.current_state != 'ACTIVE' %}
+        {% if not initiative or initiative.current_state != 'ACTIVE' %}{% if can_edit_batch %}
         <form method="post" action="{% url 'dailyops:analysis-accept-and-start' product.id batch_key proposal.id %}">{% csrf_token %}<input type="hidden" name="command_id" value="{{ owner_start_command_id }}"><button class="button button-primary" type="submit">{% ui '采用建议并建立执行项目' 'Use suggestion and start execution project' %}</button></form>
+        {% else %}<p class="read-only-note">{% ui '等待有编辑权限的同事采用建议。' 'Waiting for a teammate with edit access to use the suggestion.' %}</p>{% endif %}
         {% else %}<p class="read-only-note">{% ui '建议已采用，执行项目已经启动。' 'Suggestion accepted and execution project started.' %}</p>{% endif %}
       </article>
       {% endif %}
@@ -176,15 +197,17 @@
     {% if opportunity %}
       <article class="daily-action-card daily-action-card-stacked">
         <div><h3>{{ opportunity.title }}</h3><p>{{ opportunity.recommendation }}</p></div>
-        {% if opportunity.current_state == 'PROPOSED' or opportunity.current_state == 'TRIAGED' %}
+        {% if opportunity.current_state == 'PROPOSED' or opportunity.current_state == 'TRIAGED' %}{% if can_edit_batch %}
         <form class="config-form daily-decision-form" method="post" action="{% url 'dailyops:opportunity-transition' opportunity.id %}">
           {% csrf_token %}<input type="hidden" name="command_id" value="{{ command_id }}"><input type="hidden" name="expected_version" value="{{ opportunity.state_version }}">
           <label><span>{% ui '你的决定' 'Your decision' %}</span><select name="to_state">{% if opportunity.current_state == 'PROPOSED' %}<option value="TRIAGED">{% ui '完成初步判断' 'Complete initial review' %}</option>{% else %}<option value="APPROVED">{% ui '确认值得做' 'Confirm it is worth doing' %}</option>{% endif %}<option value="REJECTED">{% ui '不做这个方向' 'Do not pursue' %}</option></select></label>
           <label><span>{% ui '一句话说明原因' 'Reason in one sentence' %}</span><textarea name="reason" rows="2" required></textarea></label>
           <button class="button button-primary" type="submit">{% ui '保存决定' 'Save decision' %}</button>
         </form>
-        {% elif opportunity.current_state == 'APPROVED' and not initiative %}
+        {% else %}<p class="read-only-note">{% ui '等待有编辑权限的同事确认方向。' 'Waiting for a teammate with edit access to confirm the direction.' %}</p>{% endif %}
+        {% elif opportunity.current_state == 'APPROVED' and not initiative %}{% if can_edit_batch %}
         <form method="post" action="{% url 'dailyops:initiative-create' opportunity.id %}">{% csrf_token %}<input type="hidden" name="command_id" value="{{ command_id }}"><button class="button button-primary" type="submit">{% ui '建立执行项目' 'Create execution initiative' %}</button></form>
+        {% else %}<p class="read-only-note">{% ui '等待有编辑权限的同事建立执行项目。' 'Waiting for a teammate with edit access to create the initiative.' %}</p>{% endif %}
         {% else %}<span class="status-pill">{% ui_daily_state opportunity.current_state %}</span>{% endif %}
       </article>
     {% else %}<div class="daily-locked"><strong>{% ui '先采用一个选题' 'Choose an idea first' %}</strong></div>{% endif %}
@@ -204,12 +227,13 @@
     {% if initiative %}
       <article class="daily-action-card daily-action-card-stacked">
         <div><h3>{{ initiative.title }}</h3><p>{{ initiative.objective }}</p></div>
-        {% if initiative.current_state == 'PROPOSED' or initiative.current_state == 'APPROVED' %}
+        {% if initiative.current_state == 'PROPOSED' or initiative.current_state == 'APPROVED' %}{% if can_edit_batch %}
         <form class="config-form daily-decision-form" method="post" action="{% url 'dailyops:initiative-transition' initiative.id %}">
           {% csrf_token %}<input type="hidden" name="command_id" value="{{ command_id }}"><input type="hidden" name="expected_version" value="{{ initiative.state_version }}"><input type="hidden" name="to_state" value="{% if initiative.current_state == 'PROPOSED' %}APPROVED{% else %}ACTIVE{% endif %}">
           <label><span>{% ui '一句话说明原因' 'Reason in one sentence' %}</span><textarea name="reason" rows="2" required></textarea></label>
           <button class="button button-primary" type="submit">{% if initiative.current_state == 'PROPOSED' %}{% ui '批准这个项目' 'Approve initiative' %}{% else %}{% ui '开始安排任务' 'Start planning work' %}{% endif %}</button>
         </form>
+        {% else %}<p class="read-only-note">{% ui '等待有编辑权限的同事批准或启动项目。' 'Waiting for a teammate with edit access to approve or start the initiative.' %}</p>{% endif %}
         {% else %}<span class="status-pill"><span></span>{% ui_daily_state initiative.current_state %}</span>{% endif %}
       </article>
     {% else %}<div class="daily-locked"><strong>{% ui '先完成方向确认' 'Confirm the direction first' %}</strong></div>{% endif %}
@@ -225,7 +249,7 @@
     </summary>
     <div class="daily-stage-body">
     {% if initiative.current_state == 'APPROVED' or initiative.current_state == 'ACTIVE' %}
-      <article class="daily-plan-builder">
+      {% if can_edit_batch %}<article class="daily-plan-builder">
         <h3>{% ui '安排平台任务' 'Plan platform work' %}</h3>
         <form class="config-form" method="post" action="{% url 'dailyops:plan-create' initiative.id %}">
           {% csrf_token %}{{ plan_form.command_id }}{{ plan_form.non_field_errors }}
@@ -239,7 +263,7 @@
           <p class="daily-inline-help">{% ui '运行环境和发布能力由系统根据所选账号自动核对，你不需要填写代码。' 'The system checks the runtime environment and publishing capability for the selected account; no code is required.' %}</p>
           <button class="button button-primary" type="submit">{% ui '安排平台任务' 'Create channel plan' %}</button>
         </form>
-      </article>
+      </article>{% endif %}
 
       <div class="daily-plan-list">
       {% for plan in plans %}
@@ -247,7 +271,7 @@
           <header><div><p class="task-meta">{{ plan.channel_account.display_name }}</p><h3>{{ plan.goal.title }}</h3></div><span class="task-state">{% ui_daily_state plan.current_state %}</span></header>
           {% if plan.compiled_context %}
           <div class="daily-task-ready"><span>{% ui '执行任务已生成' 'Execution task created' %}</span><a class="button button-primary" href="{% url 'dashboard:task-detail' plan.compiled_context.task.id %}">{% ui '查看执行任务' 'View execution task' %}</a></div>
-          {% else %}
+          {% else %}{% if can_edit_batch %}
           <form method="post" action="{% url 'dailyops:plan-confirm-and-compile' plan.id %}">{% csrf_token %}<input type="hidden" name="command_id" value="{{ plan.owner_flow_command_id }}"><input type="hidden" name="task_id" value="{{ plan.owner_flow_task_id }}"><button class="button button-primary" type="submit">{% ui '确认平台安排并生成执行任务' 'Confirm platform plan and create task' %}</button></form>
           <details class="daily-advanced-actions">
             <summary>{% ui '高级：分步确认和生成' 'Advanced: confirm and compile step by step' %}</summary>
@@ -260,6 +284,7 @@
           {% endif %}
           {% if plan.current_state == 'READY' or plan.current_state == 'ACTIVE' %}{% if not plan.compiled_context %}<form method="post" action="{% url 'dailyops:plan-compile' plan.id %}">{% csrf_token %}<input type="hidden" name="command_id" value="{{ command_id }}"><input type="hidden" name="task_id" value="{{ task_id }}"><button class="button button-primary" type="submit">{% ui '生成执行任务' 'Create execution task' %}</button></form>{% endif %}{% endif %}
           </details>
+          {% else %}<p class="read-only-note">{% ui '等待有编辑权限的同事确认计划并生成执行任务。' 'Waiting for a teammate with edit access to confirm the plan and create execution work.' %}</p>{% endif %}
           {% endif %}
         </article>
       {% empty %}<p class="daily-inline-help">{% ui '还没有安排平台任务。' 'No platform work has been planned yet.' %}</p>{% endfor %}

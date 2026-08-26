@@ -489,6 +489,11 @@ class ReviewReleaseUISliceTests(TestCase):
         self.assertEqual(decision.reviewer_principal, self.owner)
         self.assertEqual(decision.reviewer_acting_role, ActingRole.OWNER)
         self.assertEqual(decision.reviewer_grant, owner_review)
+        self.assertEqual(decision.owner_edit_grant, self.owner_edit)
+        self.assertEqual(
+            decision.command_payload()["owner_edit_grant_id"],
+            str(self.owner_edit.pk),
+        )
 
     def test_submitter_cannot_review_own_submission_even_with_both_grants(self):
         self._grant(self.operator, PermissionGrant.Action.REVIEW)

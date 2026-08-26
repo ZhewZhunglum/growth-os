@@ -15,6 +15,7 @@ from dashboard.views import home, task_action, task_create, task_detail
 from dashboard.release_actions import release_rework_action, release_stop_action
 from dashboard.feature_center_views import feature_center
 from dashboard.guide_views import guide
+from dashboard.history_views import my_task_history
 from dashboard.config_views import (
     configuration_home,
     product_configuration,
@@ -57,6 +58,7 @@ urlpatterns = [
     path("team/grants/<uuid:grant_id>/renew/", team_grant_renew, name="team-grant-renew"),
     path("team/grants/<uuid:grant_id>/revoke/", team_grant_revoke, name="team-grant-revoke"),
     path("account/password/", change_my_password, name="change-my-password"),
+    path("account/history/", my_task_history, name="my-task-history"),
     path("configuration/", configuration_home, name="configuration-home"),
     path("configuration/products/<uuid:product_id>/", product_configuration, name="product-configuration"),
     path(

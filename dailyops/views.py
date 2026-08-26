@@ -13,7 +13,7 @@ from django.http import Http404, HttpRequest, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
 from django.utils import timezone
-from django.views.decorators.http import require_POST
+from django.views.decorators.http import require_POST, require_http_methods
 
 from accounts.authorization import require_authorization, resolve_authorization
 from accounts.models import PermissionGrant, Principal
@@ -47,11 +47,12 @@ from dailyops.forms import (
     CommandForm,
     CompileTaskForm,
     DailyBatchForm,
+    EvidenceCorrectionForm,
     ManualEvidenceForm,
     TransitionForm,
 )
 from dailyops.disposition import batch_disposition, dispose_daily_batch, lock_daily_batch_runs
-from dailyops.evidence_services import invalidate_evidence
+from dailyops.evidence_services import ensure_batch_evidence_editable, invalidate_evidence
 from dailyops.models import DailyBatchDispositionEvent
 from dailyops.deployment import build_web_daily_operations_runtime
 from dailyops.services import (
@@ -61,11 +62,13 @@ from dailyops.services import (
     batch_runs,
     compile_channel_plan_task,
     confirm_channel_plan_and_compile_task,
+    correct_manual_evidence,
     create_channel_plan,
     create_initiative_from_opportunity,
     ensure_default_sources,
     ingest_csv_text,
     ingest_manual_link,
+    proposal_matches_evidence,
     propose_daily_analysis,
     run_automatic_collection,
     run_platform_collection,
@@ -428,6 +431,7 @@ def batch_start(request: HttpRequest) -> HttpResponse:
 @login_required
 def batch_detail(request: HttpRequest, product_id, batch_key) -> HttpResponse:
     product = _product_for_user(request.user, product_id)
+    can_edit_batch = _can_product(request.user, product, PermissionGrant.Action.EDIT)
     try:
         runs = batch_runs(batch_key=batch_key, product=product)
     except ValidationError as error:
@@ -438,6 +442,7 @@ def batch_detail(request: HttpRequest, product_id, batch_key) -> HttpResponse:
             collection_run_id__in=run_ids,
             invalidation_event__isnull=True,
         )
+        .filter(Q(expires_at__isnull=True) | Q(expires_at__gt=timezone.now()))
         .select_related("source")
         .order_by("-observed_at", "id")
     )
@@ -472,6 +477,9 @@ def batch_detail(request: HttpRequest, product_id, batch_key) -> HttpResponse:
         )
         .order_by("-version_number")
         .first()
+    )
+    proposal_is_stale = bool(
+        proposal and not proposal_matches_evidence(proposal=proposal, evidence=evidence)
     )
     opportunity = ProductOpportunity.objects.filter(opportunity_key=f"daily-{batch_key.hex}").first()
     initiative = opportunity.initiatives.order_by("created_at").first() if opportunity else None
@@ -516,6 +524,7 @@ def batch_detail(request: HttpRequest, product_id, batch_key) -> HttpResponse:
         "platform_cards": cards,
         "evidence": evidence,
         "proposal": proposal,
+        "proposal_is_stale": proposal_is_stale,
         "opportunity": opportunity,
         "initiative": initiative,
         "plans": plans,
@@ -533,6 +542,7 @@ def batch_detail(request: HttpRequest, product_id, batch_key) -> HttpResponse:
         "current_step": current_step,
         "owner_start_command_id": uuid.uuid4(),
         "batch_disposition": batch_disposition(batch_key=batch_key, product=product),
+        "can_edit_batch": can_edit_batch,
     }
     return render(request, "dailyops/batch_detail.html", context)
 
@@ -593,11 +603,9 @@ def batch_dispose(request: HttpRequest, product_id, batch_key) -> HttpResponse:
 
 @login_required
 @require_POST
-@transaction.atomic
 def automatic_collect(request: HttpRequest, product_id, batch_key) -> HttpResponse:
     product = _product_for_user(request.user, product_id)
     _require_edit(request.user, product)
-    _require_active_batch(batch_key=batch_key, product=product)
     try:
         form = _command_form(request.POST)
         runtime = build_web_daily_operations_runtime(settings)
@@ -652,11 +660,9 @@ def automatic_collect(request: HttpRequest, product_id, batch_key) -> HttpRespon
 
 @login_required
 @require_POST
-@transaction.atomic
 def platform_collect(request: HttpRequest, product_id, batch_key, platform_code) -> JsonResponse:
     product = _product_for_user(request.user, product_id)
     _require_edit(request.user, product)
-    _require_active_batch(batch_key=batch_key, product=product)
     try:
         form = _command_form(request.POST)
         platform = _platform(platform_code)
@@ -781,6 +787,87 @@ def evidence_manual_unified(request: HttpRequest, product_id, batch_key) -> Http
             _copy(request, "补录内容没有保存：", "The entry was not saved: ") + _error_text(error),
         )
     return redirect(_batch_url(product, batch_key))
+
+
+@login_required
+@require_http_methods(["GET", "POST"])
+@transaction.atomic
+def evidence_correct(request: HttpRequest, product_id, batch_key, evidence_id) -> HttpResponse:
+    product = _product_for_user(request.user, product_id)
+    _require_edit(request.user, product)
+    _require_active_batch(batch_key=batch_key, product=product)
+    evidence = get_object_or_404(
+        ExternalEvidenceItem.objects.select_related("source", "collection_run"),
+        pk=evidence_id,
+        invalidation_event__isnull=True,
+    )
+    if (
+        evidence.source.source_kind != SourceRegistry.SourceKind.MANUAL_LINK
+        or str(evidence.collection_run.batch_key) != str(batch_key)
+        or str(evidence.collection_run.query_spec.get("product_id", "")) != str(product.pk)
+    ):
+        raise Http404("Correctable manual evidence not found.")
+    try:
+        ensure_batch_evidence_editable(batch_key=batch_key, product=product)
+    except ValidationError as error:
+        messages.error(request, _error_text(error))
+        return redirect(_batch_url(product, batch_key))
+
+    if request.method == "POST":
+        form = EvidenceCorrectionForm(request.POST, language_code=request.LANGUAGE_CODE)
+        if form.is_valid():
+            try:
+                result = correct_manual_evidence(
+                    evidence_id=evidence.pk,
+                    batch_key=batch_key,
+                    product=product,
+                    command_id=form.cleaned_data["command_id"],
+                    platform=form.cleaned_data["platform"],
+                    external_url=form.cleaned_data["external_url"],
+                    external_content_id=form.cleaned_data["external_content_id"],
+                    title=form.cleaned_data["title"],
+                    content_text=form.cleaned_data["content_text"],
+                    collected_at=form.cleaned_data["collected_at"],
+                    reason=form.cleaned_data["reason"],
+                    principal=request.user,
+                    acting_role=request.user.role,
+                )
+                messages.success(
+                    request,
+                    _copy(
+                        request,
+                        "线索已更正；旧记录仍保留。请根据最新线索重新生成建议。",
+                        "Signal corrected; the old record remains. Regenerate the suggestion from current signals.",
+                    ),
+                )
+                return redirect(_batch_url(product, batch_key))
+            except (ValidationError, IntelligenceError, IngestionValidationError) as error:
+                form.add_error(None, _error_text(error))
+    else:
+        initial_reference = evidence.external_url or evidence.external_content_id
+        form = EvidenceCorrectionForm(
+            initial={
+                "command_id": uuid.uuid4(),
+                "collected_at": timezone.now(),
+                "reference": initial_reference,
+                "platform": evidence.platform_code,
+                "title": evidence.title,
+                "content_text": evidence.excerpt,
+                "reason": "",
+            },
+            language_code=request.LANGUAGE_CODE,
+        )
+
+    return render(
+        request,
+        "dailyops/evidence_correct.html",
+        {
+            "product": product,
+            "batch_key": batch_key,
+            "evidence": evidence,
+            "form": form,
+        },
+    )
 
 
 @login_required

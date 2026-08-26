@@ -16,6 +16,7 @@
     {% url 'dashboard:release-queue' as release_queue_url %}
     {% url 'dashboard:feature-center' as feature_center_url %}
     {% url 'dashboard:change-my-password' as change_password_url %}
+    {% url 'dashboard:my-task-history' as task_history_url %}
     {% url 'dashboard:guide' as guide_url %}
     {% url 'logout' as logout_url %}
     {% if user.is_authenticated %}{% action_center_for user as global_action_center %}{% feature_center_for user global_action_center as global_feature_center %}{% endif %}
@@ -47,6 +48,7 @@
                 </summary>
                 <div class="sidebar-user-popover">
                     <a href="{{ guide_url|default:'#' }}">{% ui '使用说明' 'Guide' %}</a>
+                    <a href="{{ task_history_url|default:'#' }}">{% ui '我的工作记录' 'My work history' %}</a>
                     <a href="{{ change_password_url|default:'#' }}">{% ui '修改密码' 'Change password' %}</a>
                     <form action="{{ logout_url|default:'#' }}" method="post">{% csrf_token %}<button type="submit">{% ui '退出登录' 'Sign out' %}</button></form>
                 </div>
