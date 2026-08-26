@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
-from django.db import IntegrityError
+from django.db import IntegrityError, models as django_models, transaction
 from django.test import TestCase
 from django.urls import reverse
 from django.utils import timezone
@@ -359,6 +359,8 @@ class ControlledTaskUiTests(TestCase):
         self.assertContains(response, "Reliable sources are ready")
         self.assertContains(response, "这项任务要过三道检查")
         self.assertContains(response, "现在轮到")
+        self.assertContains(response, "管理任务")
+        self.assertContains(response, "删除草稿")
         self.assertContains(response, "审核和发布会在各自的队列里完成")
         self.assertNotContains(response, "状态版本")
         self.assertNotContains(response, "任务合同")
@@ -409,23 +411,157 @@ class ControlledTaskUiTests(TestCase):
         self.assertNotIn(self.task.pk, {task.pk for task in today.context["tasks"]})
         self.assertNotContains(today, self.task.title)
 
-    def test_delete_draft_endpoint_rejects_a_task_that_has_already_become_ready(self):
+    def test_unassigned_operator_creator_with_cancel_grant_sees_and_uses_draft_removal(self):
+        creator_task = self._new_task(self.outsider)
+        creator_cancel = self._grant(
+            self.outsider,
+            PermissionGrant.Action.CANCEL_TASK,
+        )
+        self.client.force_login(self.outsider)
+
+        detail = self.client.get(
+            reverse("dashboard:task-detail", args=[creator_task.pk])
+        )
+        self.assertEqual(detail.status_code, 200)
+        self.assertContains(detail, "管理任务")
+        self.assertContains(detail, "删除草稿")
+
+        response = self.client.post(
+            reverse("dashboard:task-action", args=[creator_task.pk, "cancel"]),
+            self._command_data(
+                creator_task,
+                reason="I created the wrong unassigned draft.",
+                confirm="on",
+            ),
+        )
+
+        self.assertRedirects(response, reverse("dashboard:home"))
+        creator_task.refresh_from_db()
+        self.assertEqual(creator_task.current_state, Task.State.CANCELLED)
+        event = creator_task.state_events.get(to_state=Task.State.CANCELLED)
+        self.assertEqual(event.actor_principal_id, self.outsider.pk)
+        self.assertEqual(event.permission_grant_id, creator_cancel.pk)
+
+    def test_owner_can_abandon_a_ready_task_with_an_audited_cancel_grant(self):
         self._pass_dor()
+        detail = self.client.get(reverse("dashboard:task-detail", args=[self.task.pk]))
+        self.assertContains(detail, "管理任务")
+        self.assertContains(detail, "放弃任务")
         response = self.client.post(
             reverse("dashboard:task-action", args=[self.task.pk, "cancel"]),
             self._command_data(
                 self.task,
-                reason="This is no longer a draft.",
+                reason="This ready task is no longer needed.",
                 confirm="on",
             ),
-            follow=True,
         )
 
-        self.assertEqual(response.status_code, 200)
-        self.assertContains(response, "只有尚未开始的草稿可以删除")
+        self.assertRedirects(response, reverse("dashboard:home"))
         self.task.refresh_from_db()
-        self.assertEqual(self.task.current_state, Task.State.READY)
-        self.assertFalse(self.task.state_events.filter(to_state=Task.State.CANCELLED).exists())
+        self.assertEqual(self.task.current_state, Task.State.CANCELLED)
+        event = self.task.state_events.get(to_state=Task.State.CANCELLED)
+        self.assertEqual(event.from_state, Task.State.READY)
+        self.assertEqual(event.permission_grant_id, self.owner_cancel_grant.pk)
+        self.assertEqual(event.reason, "This ready task is no longer needed.")
+
+    def test_operator_can_abandon_own_unreviewed_submission_directly_to_cancelled(self):
+        operator_cancel = self._grant(self.operator, PermissionGrant.Action.CANCEL_TASK)
+        self._assign_and_start()
+        response = self.client.post(
+            reverse("dashboard:task-action", args=[self.task.pk, "deliver"]),
+            self._command_data(
+                self.task,
+                external_url="https://example.com/exact-submission",
+                submission_note="This submission will be abandoned before review.",
+                criterion__plain_language=TaskCheckRun.Result.PASS,
+            ),
+        )
+        self.assertEqual(response.status_code, 302)
+        self.task.refresh_from_db()
+        self.assertEqual(self.task.current_state, Task.State.UNDER_REVIEW)
+        submission = self.task.submissions.get()
+
+        unrelated_task = self._new_task(self.owner)
+        for event_type, to_state in (
+            (
+                TaskStateEvent.EventType.SUBMISSION_WITHDRAWN,
+                Task.State.IN_PROGRESS,
+            ),
+            (
+                TaskStateEvent.EventType.SUBMISSION_ABANDONED,
+                Task.State.CANCELLED,
+            ),
+        ):
+            with self.subTest(cross_task_event_type=event_type):
+                with self.assertRaises(IntegrityError):
+                    with transaction.atomic():
+                        candidate = TaskStateEvent(
+                            task=unrelated_task,
+                            event_type=event_type,
+                            submission=submission,
+                            from_state=Task.State.UNDER_REVIEW,
+                            to_state=to_state,
+                            command_id=uuid.uuid4(),
+                            payload_hash="a" * 64,
+                            expected_state_version=0,
+                            resulting_state_version=1,
+                            event_sequence=1,
+                            reason="Cross-task exits must fail in the database.",
+                            actor_principal=self.operator,
+                            acting_role=ActingRole.OPERATOR,
+                            permission_grant=operator_cancel,
+                            recorded_by_principal=self.operator,
+                            event_at=timezone.now(),
+                        )
+                        django_models.Model.save(candidate, force_insert=True)
+
+        detail = self.client.get(reverse("dashboard:task-detail", args=[self.task.pk]))
+        self.assertContains(detail, "管理任务")
+        self.assertContains(detail, "撤回并放弃")
+        response = self.client.post(
+            reverse("dashboard:task-action", args=[self.task.pk, "cancel"]),
+            self._command_data(
+                self.task,
+                reason="The task should end rather than return for editing.",
+                confirm="on",
+            ),
+        )
+
+        self.assertRedirects(response, reverse("dashboard:home"))
+        self.task.refresh_from_db()
+        self.assertEqual(self.task.current_state, Task.State.CANCELLED)
+        event = self.task.state_events.get(
+            event_type=TaskStateEvent.EventType.SUBMISSION_ABANDONED
+        )
+        self.assertEqual(event.from_state, Task.State.UNDER_REVIEW)
+        self.assertEqual(event.to_state, Task.State.CANCELLED)
+        self.assertEqual(event.submission_id, submission.pk)
+        self.assertEqual(event.permission_grant_id, operator_cancel.pk)
+        self.assertTrue(TaskSubmission.objects.filter(pk=submission.pk).exists())
+        self.assertFalse(ReviewDecision.objects.filter(submission=submission).exists())
+
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                candidate = TaskStateEvent(
+                    task=self.task,
+                    event_type=TaskStateEvent.EventType.SUBMISSION_WITHDRAWN,
+                    submission=submission,
+                    from_state=Task.State.UNDER_REVIEW,
+                    to_state=Task.State.IN_PROGRESS,
+                    command_id=uuid.uuid4(),
+                    payload_hash="b" * 64,
+                    expected_state_version=self.task.state_version,
+                    resulting_state_version=self.task.state_version + 1,
+                    event_sequence=self.task.state_version + 1,
+                    previous_event=event,
+                    reason="Withdrawal and abandonment must be mutually exclusive.",
+                    actor_principal=self.operator,
+                    acting_role=ActingRole.OPERATOR,
+                    permission_grant=operator_cancel,
+                    recorded_by_principal=self.operator,
+                    event_at=timezone.now(),
+                )
+                django_models.Model.save(candidate, force_insert=True)
 
     def test_creator_without_edit_permission_cannot_record_dor(self):
         unauthorized_task = self._new_task(self.outsider)
@@ -802,7 +938,7 @@ class ControlledTaskUiTests(TestCase):
 
         self.client.force_login(self.owner)
         detail = self.client.get(reverse("dashboard:task-detail", args=[self.task.pk]))
-        self.assertContains(detail, "提交人不能审核自己的内容")
+        self.assertContains(detail, "Owner 自己提交时，可在“审核”队列做最终批准")
         self.assertContains(detail, "审核这次提交")
         self.assertNotContains(detail, "分错人了？现在可以改派")
         rejected = self.client.post(

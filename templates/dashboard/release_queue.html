@@ -3,6 +3,7 @@
 {% block title %}{% ui '受控发布队列' 'Publishing queue' %} · PUKO Growth OS{% endblock %}
 {% block page_title %}{% ui '受控发布队列' 'Publishing queue' %}{% endblock %}
 {% block content %}
+<a class="back-link" href="{% url 'dashboard:home' %}">← {% ui '返回首页' 'Back to home' %}</a>
 <section class="hero-panel"><div><p class="eyebrow">{% ui '发布检查 · 最终人工确认' 'Release checks · final human confirmation' %}</p><h2>{% ui '系统负责检查，人负责最后确认。' 'The system checks; a person gives final confirmation.' %}</h2><p>{% ui '这里只显示你拥有匹配发布权限的已审核任务；人工路径可直接登记证明，API/浏览器路径未配置时会安全拒绝。' 'This page shows reviewed tasks that match your publishing access. Manual publishing records proof directly; unconfigured API or browser paths fail safely.' %}</p></div><div class="status-pill"><span></span> {% ui '未确认绝不外发' 'Nothing is published without confirmation' %}</div></section>
 <section class="section-heading"><div><p class="eyebrow">{% ui '审核已通过' 'Review approved' %}</p><h2>{% ui '等待检查或发布证明' 'Waiting for release checks or publishing proof' %}</h2></div><span class="section-note">{{ tasks|length }} {% ui '项' 'items' %}</span></section>
 <section class="task-list">

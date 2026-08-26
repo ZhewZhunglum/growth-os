@@ -13,6 +13,38 @@
     </div>
     <div class="detail-status-stack">
         <span class="task-state task-state-{{ task.current_state|lower }}">{% ui_task_state task.current_state %}</span>
+        <div class="task-management-control">
+            <span class="task-label">{% ui '管理任务' 'Manage task' %}</span>
+            {% if management_kind == 'delete-draft' or management_kind == 'abandon' or management_kind == 'withdraw-abandon' %}
+            <details class="secondary-action-block secondary-action-danger">
+                <summary class="button button-secondary">
+                    {% if management_kind == 'delete-draft' %}{% ui '删除草稿' 'Remove draft' %}
+                    {% elif management_kind == 'withdraw-abandon' %}{% ui '撤回并放弃' 'Withdraw and abandon' %}
+                    {% else %}{% ui '放弃任务' 'Abandon task' %}{% endif %}
+                </summary>
+                <p class="action-explanation">
+                    {% if management_kind == 'delete-draft' %}{% ui '这份草稿会从活跃列表隐藏，但审计历史仍会保留。' 'The draft is hidden from active lists while its audit history remains.' %}
+                    {% elif management_kind == 'withdraw-abandon' %}{% ui '只有审核尚未作出结论时才能操作。系统会直接结束任务，并保留旧提交。' 'This is available only before a final review. The task ends directly and the sealed submission remains.' %}
+                    {% else %}{% ui '任务会从待办列表隐藏，但已有工作与审计历史不会被删除。' 'The task is hidden from active work while its existing work and audit history remain.' %}{% endif %}
+                </p>
+                <form class="task-action-form" action="{% url 'dashboard:task-action' task.id 'cancel' %}" method="post">
+                    {% csrf_token %}{{ cancel_form.command_id }}{{ cancel_form.expected_state_version }}{{ cancel_form.non_field_errors }}
+                    {% for field in cancel_form.visible_fields %}<div class="field-row">{{ field.label_tag }}{{ field }}{{ field.errors }}{% if field.help_text %}<small>{{ field.help_text }}</small>{% endif %}</div>{% endfor %}
+                    <button class="button button-danger" type="submit">
+                        {% if management_kind == 'delete-draft' %}{% ui '确认删除草稿' 'Confirm draft removal' %}
+                        {% elif management_kind == 'withdraw-abandon' %}{% ui '确认撤回并放弃' 'Confirm withdrawal and abandonment' %}
+                        {% else %}{% ui '确认放弃任务' 'Confirm task abandonment' %}{% endif %}
+                    </button>
+                </form>
+            </details>
+            {% elif management_kind == 'stop-publication' %}
+            <a class="button button-secondary" href="{% url 'dashboard:release-detail' task.id %}">{% ui '打开发布页停止这项工作' 'Open publishing page to stop this work' %}</a>
+            {% elif management_kind == 'read-only' %}
+            <small>{% ui '流程已结束，只能查看历史' 'The workflow is complete and read-only' %}</small>
+            {% else %}
+            <small>{% ui '当前账号不能结束这项任务' 'This account cannot end this task' %}</small>
+            {% endif %}
+        </div>
     </div>
 </section>
 
@@ -128,7 +160,7 @@
                 <button class="button button-primary" type="submit">{% ui '封存这份内容并送审' 'Seal this content and send for review' %}</button>
             </form>
         {% elif task.current_state == "UNDER_REVIEW" %}
-            <h3>{% ui '交付已送入人工审核' 'Delivery sent for human review' %}</h3><p class="action-explanation">{% ui '提交人不能审核自己的内容。请切换到 Admin 或另一位拥有审核权限的账号，在“审核”队列处理。' 'The submitter cannot review their own work. Switch to an Admin or another authorized account and use the Review queue.' %}</p>
+            <h3>{% ui '交付已送入人工审核' 'Delivery sent for human review' %}</h3><p class="action-explanation">{% ui 'Owner 自己提交时，可在“审核”队列做最终批准；Admin 或 Operator 提交时，必须由另一位有审核权限的账号处理。右上角铃铛会明确提示现在轮到谁。' 'When the Owner submits, they may give final approval in the Review queue. Admin and Operator submissions must be handled by another authorized reviewer. The top-right bell shows whose action is next.' %}</p>
             {% if submission %}<dl class="submission-summary"><dt>{% ui '提交批次' 'Submission' %}</dt><dd>#{{ submission.submission_number }}</dd><dt>{% ui '封存时间' 'Sealed at' %}</dt><dd>{{ submission.sealed_at }}</dd></dl>{% endif %}
         {% else %}
             <h3>{% ui '当前没有可执行动作' 'No action is available now' %}</h3><p class="action-explanation">{% ui '可能是当前状态暂不需要你操作，或你没有该产品的编辑权限。任务事实仍可在左侧查看。' 'The current state may not need your action, or you may not have edit access for this product. You can still view the task facts on the left.' %}</p>
@@ -158,17 +190,6 @@
         </div>
         {% endif %}
 
-        {% if cancel_form %}
-        <div class="secondary-action-block secondary-action-danger">
-            <h3>{% ui '这份草稿建错了？' 'Created the wrong draft?' %}</h3>
-            <p class="action-explanation">{% ui '取消后它会从“今日任务”隐藏，但系统仍保留历史，避免误删审计记录。' 'Cancelling hides it from Today while preserving its audit history.' %}</p>
-            <form class="task-action-form" action="{% url 'dashboard:task-action' task.id 'cancel' %}" method="post">
-                {% csrf_token %}{{ cancel_form.command_id }}{{ cancel_form.expected_state_version }}{{ cancel_form.non_field_errors }}
-                {% for field in cancel_form.visible_fields %}<div class="field-row">{{ field.label_tag }}{{ field }}{{ field.errors }}{% if field.help_text %}<small>{{ field.help_text }}</small>{% endif %}</div>{% endfor %}
-                <button class="button button-danger" type="submit">{% ui '删除草稿（保留历史）' 'Remove draft (keep history)' %}</button>
-            </form>
-        </div>
-        {% endif %}
     </article>
 </section>
 {% if revision_form %}

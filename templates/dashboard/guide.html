@@ -3,6 +3,7 @@
 {% block title %}{% ui '使用说明' 'Guide' %} · PUKO Growth OS{% endblock %}
 {% block page_title %}{% ui '使用说明' 'Guide' %}{% endblock %}
 {% block content %}
+<a class="back-link" href="{% url 'dashboard:feature-center' %}">← {% ui '返回功能中心' 'Back to feature center' %}</a>
 <section class="detail-panel action-panel">
   <p class="eyebrow">{% ui '先看这一页，再开始操作' 'Read this before you start' %}</p>
   <h2>{% ui '一次 Daily Task 到底怎么跑？' 'How does one Daily Task run?' %}</h2>
@@ -24,7 +25,7 @@
   <article class="detail-panel">
     <h3>{% ui '三种账号分别做什么' 'What each account does' %}</h3>
     <dl class="submission-summary">
-      <dt>Owner</dt><dd>{% ui '决定做什么、安排工作、管理高风险授权。也能执行普通任务，但不能审核自己提交的内容。' 'Decides what to do, plans work, and manages high-risk grants. Can execute ordinary work but cannot review their own submission.' %}</dd>
+      <dt>Owner</dt><dd>{% ui '决定做什么、安排工作、管理高风险授权，也能执行普通任务。Owner 可以最终批准自己提交的内容，系统会单独记录这次自批。' 'Decides what to do, plans work, manages high-risk grants, and may execute ordinary work. An Owner may finally approve their own submission, with that self-approval recorded separately.' %}</dd>
       <dt>Admin</dt><dd>{% ui '审核内容、处理团队待办、管理 Operator 的低风险工作权限。' 'Reviews content, handles team actions, and manages low-risk Operator permissions.' %}</dd>
       <dt>Operator</dt><dd>{% ui '在“我的任务”里完成被分配的工作，提交系统内完整内容或外部链接；没有审核权限。' 'Completes assigned work in My work and submits complete in-system content or an external link; has no review permission.' %}</dd>
     </dl>

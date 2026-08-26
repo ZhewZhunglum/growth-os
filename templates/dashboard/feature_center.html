@@ -3,6 +3,7 @@
 {% block title %}{% ui '功能中心' 'Feature center' %} · PUKO Growth OS{% endblock %}
 {% block page_title %}{% ui '功能中心' 'Feature center' %}{% endblock %}
 {% block content %}
+<a class="back-link" href="{% url 'dashboard:home' %}">← {% ui '返回首页' 'Back to home' %}</a>
 <section class="hero-panel config-hero">
   <div>
     <p class="eyebrow">{% ui '按业务阶段找功能' 'Features grouped by work stage' %}</p>

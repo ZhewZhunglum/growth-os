@@ -10,7 +10,7 @@ from accounts.models import Principal
 from contentops.models import ContentAssetVersion
 from core.ids import uuid7
 from products.models import ProductProfileVersion
-from workflow.models import TaskCheckRun, TaskContractVersion
+from workflow.models import Task, TaskCheckRun, TaskContractVersion
 
 
 CHECK_CHOICES = (
@@ -336,6 +336,31 @@ class CancelTaskForm(CommandForm):
         help_text="任务不会被删除；系统会保留审计记录，并从 Today 主列表隐藏。",
     )
     confirm = forms.BooleanField(label="确认取消这份草稿")
+
+    def __init__(self, *args, state_version: int, task_state: str = Task.State.DRAFT, **kwargs):
+        super().__init__(*args, state_version=state_version, **kwargs)
+        if task_state == Task.State.DRAFT:
+            zh_reason = "删除草稿原因"
+            zh_confirm = "我确认删除这份草稿（历史仍保留）"
+            en_reason = "Reason for removing the draft"
+            en_confirm = "I confirm removing this draft (history remains)"
+        elif task_state == Task.State.UNDER_REVIEW:
+            zh_reason = "撤回并放弃原因"
+            zh_confirm = "我确认撤回送审并放弃这项任务"
+            en_reason = "Reason for withdrawing and abandoning"
+            en_confirm = "I confirm withdrawing the submission and abandoning this task"
+        else:
+            zh_reason = "放弃任务原因"
+            zh_confirm = "我确认放弃这项任务（历史仍保留）"
+            en_reason = "Reason for abandoning the task"
+            en_confirm = "I confirm abandoning this task (history remains)"
+        self.fields["reason"].label = en_reason if _is_english() else zh_reason
+        self.fields["confirm"].label = en_confirm if _is_english() else zh_confirm
+        self.fields["reason"].help_text = (
+            "The task and any sealed submission remain in audit history; they are never physically deleted."
+            if _is_english()
+            else "任务和已封存的提交都会保留在审计历史中，不会被物理删除。"
+        )
 
 
 class WithdrawSubmissionForm(CommandForm):

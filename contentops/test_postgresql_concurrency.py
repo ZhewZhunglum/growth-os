@@ -92,6 +92,11 @@ class PostgreSQLConcurrencyAcceptanceTests(TransactionTestCase):
             action=PermissionGrant.Action.EDIT,
             **grant_window,
         )
+        self.cancel_grant = PermissionGrant.objects.create(
+            principal=self.operator,
+            action=PermissionGrant.Action.CANCEL_TASK,
+            **grant_window,
+        )
         self.assign_grant = PermissionGrant.objects.create(
             principal=self.operator,
             action=PermissionGrant.Action.ASSIGN_TASK,
@@ -533,6 +538,56 @@ class PostgreSQLConcurrencyAcceptanceTests(TransactionTestCase):
             self.assertEqual(self.task.current_state, Task.State.UNDER_REVIEW)
         else:
             self.assertEqual(self.task.current_state, Task.State.IN_PROGRESS)
+
+    def test_abandonment_and_review_are_serialized_to_exactly_one_winner(self):
+        expected_version = self.task.state_version
+
+        def abandon() -> str:
+            actor = Principal.objects.get(pk=self.operator.pk)
+            grant = PermissionGrant.objects.select_related("principal").get(
+                pk=self.cancel_grant.pk
+            )
+            recorder = Principal.objects.get(pk=self.recorder.pk)
+            event = Task.cancel_task(
+                task_id=self.task.pk,
+                submission_id=self.submission.pk,
+                command_id=uuid7(),
+                expected_state_version=expected_version,
+                actor_principal=actor,
+                acting_role=ActingRole.OPERATOR,
+                permission_grant=grant,
+                recorded_by_principal=recorder,
+                reason="PostgreSQL abandon vs review acceptance.",
+            )
+            return str(event.pk)
+
+        results = self._run_two_connection_race(
+            {
+                "abandon": abandon,
+                "review": lambda: self._record_review(
+                    self.reviewer_a.pk,
+                    self.review_grant_a.pk,
+                    rationale="PostgreSQL abandon vs review acceptance.",
+                ),
+            }
+        )
+        winners = [label for label, (succeeded, _value, _pid) in results.items() if succeeded]
+        losers = [value for succeeded, value, _pid in results.values() if not succeeded]
+        self.assertEqual(len(winners), 1, results)
+        self.assertEqual(len(losers), 1, results)
+        self.assertIsInstance(losers[0], ValidationError)
+
+        review_count = ReviewDecision.objects.filter(submission=self.submission).count()
+        abandonment_count = TaskStateEvent.objects.filter(
+            event_type=TaskStateEvent.EventType.SUBMISSION_ABANDONED,
+            submission=self.submission,
+        ).count()
+        self.assertEqual(review_count + abandonment_count, 1)
+        self.task.refresh_from_db()
+        if review_count:
+            self.assertEqual(self.task.current_state, Task.State.UNDER_REVIEW)
+        else:
+            self.assertEqual(self.task.current_state, Task.State.CANCELLED)
 
     def test_reassignment_and_original_assignee_submission_have_exactly_one_winner(self):
         fixture = self._create_assignment_race_fixture("submission")

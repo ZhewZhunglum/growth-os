@@ -78,12 +78,30 @@ class ReviewDecisionForm(CommandVersionForm):
     )
 
     def __init__(self, *args, **kwargs):
+        owner_self_approval = kwargs.pop("owner_self_approval", False)
         super().__init__(*args, **kwargs)
-        if _is_english():
+        if owner_self_approval:
             self.fields["decision"].choices = (
-                (ReviewDecision.Decision.APPROVED, "Approve and continue to release checks"),
-                (ReviewDecision.Decision.CHANGES_REQUESTED, "Request changes and return for revision"),
+                (ReviewDecision.Decision.APPROVED, "Owner 最终批准（已审计）"),
             )
+            self.fields["decision"].help_text = "Owner 可批准自己提交的内容；本次批准会保留独立审计记录。"
+            self.fields["rationale"].label = "批准说明"
+            self.fields["rationale"].help_text = "请简要记录为什么批准进入发布检查。"
+        if _is_english():
+            if owner_self_approval:
+                self.fields["decision"].choices = (
+                    (ReviewDecision.Decision.APPROVED, "Owner final approval (audited)"),
+                )
+                self.fields["decision"].help_text = (
+                    "An Owner may approve their own submission; this approval is recorded separately."
+                )
+                self.fields["rationale"].label = "Approval note"
+                self.fields["rationale"].help_text = "Briefly record why this may continue to release checks."
+            else:
+                self.fields["decision"].choices = (
+                    (ReviewDecision.Decision.APPROVED, "Approve and continue to release checks"),
+                    (ReviewDecision.Decision.CHANGES_REQUESTED, "Request changes and return for revision"),
+                )
 
 
 class ReleaseGateForm(CommandVersionForm):

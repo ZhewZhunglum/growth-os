@@ -855,6 +855,29 @@ class ReviewDecision(AppendOnlyFact):
     class Meta:
         ordering = ["decided_at", "id"]
 
+    @staticmethod
+    def owner_self_approval_allowed(
+        *,
+        submission: TaskSubmission,
+        decision: str,
+        reviewer_principal,
+        acting_role: str,
+    ) -> bool:
+        """Allow one explicit exception to submitter/reviewer separation.
+
+        The product Owner may give the final approval to their own content,
+        but only while acting as Owner and only through an exact REVIEW grant.
+        Admins and Operators remain unable to self-review, and an Owner cannot
+        use this exception to create a self-authored rework/rejection fact.
+        """
+
+        return bool(
+            reviewer_principal.pk == submission.submitted_by_principal_id
+            and reviewer_principal.role == ActingRole.OWNER
+            and acting_role == ActingRole.OWNER
+            and decision == ReviewDecision.Decision.APPROVED
+        )
+
     def command_payload(self, *, schema_version: int | None = None) -> dict[str, Any]:
         """Return the exact payload shape used by the stored hash.
 
@@ -902,8 +925,21 @@ class ReviewDecision(AppendOnlyFact):
             self.submission_id
             and self.reviewer_principal_id
             and self.reviewer_principal_id == self.submission.submitted_by_principal_id
+            and not self.owner_self_approval_allowed(
+                submission=self.submission,
+                decision=self.decision,
+                reviewer_principal=self.reviewer_principal,
+                acting_role=self.reviewer_acting_role,
+            )
         ):
-            raise ValidationError({"reviewer_principal": "A submitter cannot review their own submission."})
+            raise ValidationError(
+                {
+                    "reviewer_principal": (
+                        "A non-Owner submitter cannot review their own submission; "
+                        "only an Owner may approve it."
+                    )
+                }
+            )
         if self.reviewer_grant_id and self.reviewer_principal_id and self.submission_id:
             _validate_grant(
                 grant=self.reviewer_grant,
@@ -950,8 +986,23 @@ class ReviewDecision(AppendOnlyFact):
         )
         provisional.payload_hash = canonical_sha256(provisional.command_payload())
         provisional.decision_sha256 = provisional.payload_hash
-        if reviewer_principal.pk == submission.submitted_by_principal_id:
-            raise ValidationError({"reviewer_principal": "A submitter cannot review their own submission."})
+        if (
+            reviewer_principal.pk == submission.submitted_by_principal_id
+            and not cls.owner_self_approval_allowed(
+                submission=submission,
+                decision=decision,
+                reviewer_principal=reviewer_principal,
+                acting_role=acting_role,
+            )
+        ):
+            raise ValidationError(
+                {
+                    "reviewer_principal": (
+                        "A non-Owner submitter cannot review their own submission; "
+                        "only an Owner may approve it."
+                    )
+                }
+            )
 
         with transaction.atomic():
             from workflow.models import Task, TaskStateEvent
@@ -980,13 +1031,33 @@ class ReviewDecision(AppendOnlyFact):
                 return existing_command
 
             guard_review(locked_task, submission=locked_submission)
-            if locked_submission.submitted_by_principal_id == reviewer_principal.pk:
-                raise ValidationError({"reviewer_principal": "A submitter cannot review their own submission."})
+            if (
+                locked_submission.submitted_by_principal_id == reviewer_principal.pk
+                and not cls.owner_self_approval_allowed(
+                    submission=locked_submission,
+                    decision=decision,
+                    reviewer_principal=reviewer_principal,
+                    acting_role=acting_role,
+                )
+            ):
+                raise ValidationError(
+                    {
+                        "reviewer_principal": (
+                            "A non-Owner submitter cannot review their own submission; "
+                            "only an Owner may approve it."
+                        )
+                    }
+                )
             if TaskStateEvent.objects.filter(
-                event_type=TaskStateEvent.EventType.SUBMISSION_WITHDRAWN,
+                event_type__in={
+                    TaskStateEvent.EventType.SUBMISSION_WITHDRAWN,
+                    TaskStateEvent.EventType.SUBMISSION_ABANDONED,
+                },
                 submission=locked_submission,
             ).exists():
-                raise ValidationError("A withdrawn submission cannot receive a review decision.")
+                raise ValidationError(
+                    "A withdrawn or abandoned submission cannot receive a review decision."
+                )
             if cls.objects.filter(submission=locked_submission).exists():
                 raise ValidationError("This submission already has its one final review decision.")
             provisional._record_final_authorized = True

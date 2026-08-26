@@ -93,6 +93,73 @@ def _can_manage_assignment(user: Principal, task: Task) -> bool:
     )
 
 
+TASK_MANAGEMENT_CANCELLABLE_STATES = {
+    Task.State.DRAFT,
+    Task.State.BLOCKED,
+    Task.State.READY,
+    Task.State.ASSIGNED,
+    Task.State.IN_PROGRESS,
+    Task.State.HUMAN_REWORK,
+    Task.State.UNDER_REVIEW,
+}
+
+
+def _can_cancel_task(user: Principal, task: Task) -> bool:
+    if task.current_state not in TASK_MANAGEMENT_CANCELLABLE_STATES:
+        return False
+    if not _authorization(user, task, PermissionGrant.Action.CANCEL_TASK).allowed:
+        return False
+    is_owner_or_admin = user.role in {
+        Principal.Role.OWNER,
+        Principal.Role.OPERATIONS_ADMIN,
+    }
+    if task.current_state == Task.State.UNDER_REVIEW:
+        submission = task.submissions.order_by("-submission_number").first()
+        if submission is None or ReviewDecision.objects.filter(submission=submission).exists():
+            return False
+        if TaskStateEvent.objects.filter(
+            event_type__in={
+                TaskStateEvent.EventType.SUBMISSION_WITHDRAWN,
+                TaskStateEvent.EventType.SUBMISSION_ABANDONED,
+            },
+            submission=submission,
+        ).exists():
+            return False
+        return bool(
+            submission.submitted_by_principal_id == user.pk or is_owner_or_admin
+        )
+    creator_can_cancel_unassigned = (
+        task.current_assignee_principal_id is None
+        and task.created_by_principal_id == user.pk
+        and task.current_state
+        in {Task.State.DRAFT, Task.State.READY, Task.State.BLOCKED}
+    )
+    return bool(
+        task.current_assignee_principal_id == user.pk
+        or creator_can_cancel_unassigned
+        or is_owner_or_admin
+    )
+
+
+def _task_management_kind(user: Principal, task: Task) -> str:
+    if task.current_state in {Task.State.DONE, Task.State.CANCELLED}:
+        return "read-only"
+    if task.current_state == Task.State.APPROVED:
+        if (
+            user.role in {Principal.Role.OWNER, Principal.Role.OPERATIONS_ADMIN}
+            and _authorization(user, task, PermissionGrant.Action.CANCEL_TASK).allowed
+        ):
+            return "stop-publication"
+        return "read-only"
+    if not _can_cancel_task(user, task):
+        return ""
+    if task.current_state == Task.State.DRAFT:
+        return "delete-draft"
+    if task.current_state == Task.State.UNDER_REVIEW:
+        return "withdraw-abandon"
+    return "abandon"
+
+
 def _task_for_user(user: Principal, task_id) -> Task:
     task = get_object_or_404(
         Task.objects.select_related(
@@ -101,6 +168,8 @@ def _task_for_user(user: Principal, task_id) -> Task:
         pk=task_id,
     )
     if user.pk in {task.created_by_principal_id, task.current_assignee_principal_id}:
+        return task
+    if _can_cancel_task(user, task):
         return task
     if _can_manage_assignment(user, task):
         return task
@@ -252,21 +321,51 @@ def _current_task_turn(task: Task, compilation_context=None) -> dict[str, str]:
             "note_en": "When the assignee finishes, the next step moves to the correct review or publishing queue.",
         }
     if task.current_state in {Task.State.SUBMITTED, Task.State.UNDER_REVIEW}:
-        submission = task.submissions.order_by("-submission_number").first()
-        submitter_id = submission.submitted_by_principal_id if submission else None
-        people = _authorized_product_people(
-            task,
-            PermissionGrant.Action.REVIEW,
-            exclude_principal_id=submitter_id,
+        submission = task.submissions.select_related("submitted_by_principal").order_by(
+            "-submission_number"
+        ).first()
+        owner_self_approval = bool(
+            submission
+            and submission.submitted_by_principal.role == Principal.Role.OWNER
         )
-        who_zh, who_en = _turn_people_label(people, "尚未配置独立审核人", "No independent reviewer configured")
+        if submission is None:
+            people = []
+        else:
+            # Import lazily so the task-detail projection uses the exact same
+            # REVIEW + EDIT and narrow Owner self-approval rule as the review
+            # queue/detail/action endpoints without introducing an import
+            # cycle during app initialization.
+            from dashboard.review_views import _can_review_submission
+
+            people = [
+                person
+                for person in Principal.objects.filter(
+                    principal_type=Principal.PrincipalType.HUMAN_USER,
+                    principal_status=Principal.PrincipalStatus.ACTIVE,
+                    is_active=True,
+                ).order_by("display_name", "username")
+                if _can_review_submission(person, task, submission)
+            ]
+        who_zh, who_en = _turn_people_label(
+            people,
+            "尚未配置可审核账号，请 Owner 处理",
+            "No eligible reviewer is configured; ask the Owner to handle it",
+        )
         return {
             "who_zh": who_zh,
             "who_en": who_en,
             "action_zh": "审核这次提交",
             "action_en": "Review this submission",
-            "note_zh": "提交人不能审核自己的内容；请由 Admin 或另一位拥有审核权限的账号处理。",
-            "note_en": "The submitter cannot review their own work. An Admin or another authorized account must review it.",
+            "note_zh": (
+                "Owner 可对自己提交的内容做最终批准并留下审计；Admin/Operator 提交后仍需由另一位有权限的账号审核。"
+                if owner_self_approval
+                else "Admin/Operator 提交后不能自审；请由另一位拥有审核权限的账号处理。"
+            ),
+            "note_en": (
+                "An Owner may give final approval to their own submission with an audit record; Admin and Operator submissions still require another authorized reviewer."
+                if owner_self_approval
+                else "Admin and Operator submitters cannot self-review; another authorized account must handle the review."
+            ),
         }
     if task.current_state == Task.State.APPROVED:
         account = (
@@ -420,6 +519,7 @@ def _detail_context(
     inline_versions = _inline_content_versions(task)
     latest_inline_version = inline_versions.first()
     latest_assignment = task.assignments.order_by("-assignment_number").first()
+    management_kind = _task_management_kind(user, task)
     may_reassign = bool(
         latest_assignment
         and task.current_state in {Task.State.ASSIGNED, Task.State.IN_PROGRESS}
@@ -496,10 +596,14 @@ def _detail_context(
             if may_edit_content and latest_inline_version is not None
             else None
         ),
+        "management_kind": management_kind,
         "cancel_form": cancel_form if cancel_form is not None else (
-            CancelTaskForm(state_version=task.state_version)
-            if task.current_state == Task.State.DRAFT
-            and _authorization(user, task, PermissionGrant.Action.CANCEL_TASK).allowed
+            CancelTaskForm(
+                state_version=task.state_version,
+                task_state=task.current_state,
+            )
+            if management_kind
+            in {"delete-draft", "abandon", "withdraw-abandon"}
             else None
         ),
         "reassign_form": reassign_form if reassign_form is not None else (
@@ -1111,7 +1215,11 @@ def task_action(request: HttpRequest, task_id, action: str) -> HttpResponse:
                 "交付内容已封存并送入人工审核。" if result == TaskCheckRun.Result.PASS else "交付内容和本次检查已保留，但仍有阻塞项，尚未送审。",
             )
         elif action == "cancel":
-            form = CancelTaskForm(request.POST, state_version=task.state_version)
+            form = CancelTaskForm(
+                request.POST,
+                state_version=task.state_version,
+                task_state=task.current_state,
+            )
             if not form.is_valid():
                 return render(
                     request,
@@ -1119,11 +1227,16 @@ def task_action(request: HttpRequest, task_id, action: str) -> HttpResponse:
                     _detail_context(task, request.user, cancel_form=form),
                     status=400,
                 )
-            if task.current_state != Task.State.DRAFT:
-                raise ValidationError("只有尚未开始的草稿可以删除；进行中的任务请按流程处理。")
-            Task.transition(
+            if not _can_cancel_task(request.user, task):
+                raise PermissionDenied("CURRENT_CANCEL_TASK_AUTHORIZATION_REQUIRED")
+            state_before_cancel = task.current_state
+            submission = (
+                task.submissions.order_by("-submission_number").first()
+                if task.current_state == Task.State.UNDER_REVIEW
+                else None
+            )
+            Task.cancel_task(
                 task_id=task.pk,
-                to_state=Task.State.CANCELLED,
                 command_id=form.cleaned_data["command_id"],
                 expected_state_version=form.cleaned_data["expected_state_version"],
                 actor_principal=request.user,
@@ -1131,8 +1244,15 @@ def task_action(request: HttpRequest, task_id, action: str) -> HttpResponse:
                 permission_grant=grant,
                 recorded_by_principal=request.user,
                 reason=form.cleaned_data["reason"],
+                submission_id=submission.pk if submission else None,
             )
-            messages.success(request, "草稿已取消并从 Today 隐藏；历史记录仍然保留。")
+            if state_before_cancel == Task.State.DRAFT:
+                message = "草稿已从任务列表移除；历史记录仍然保留。"
+            elif state_before_cancel == Task.State.UNDER_REVIEW:
+                message = "送审已撤回，任务已放弃；旧提交和全部历史仍然保留。"
+            else:
+                message = "任务已放弃并从待办列表隐藏；全部历史仍然保留。"
+            messages.success(request, message)
             return redirect("dashboard:home")
         elif action == "withdraw":
             form = WithdrawSubmissionForm(request.POST, state_version=task.state_version)

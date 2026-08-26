@@ -693,8 +693,8 @@ class ContentOpsInvariantTests(TestCase):
             )
         self.assertEqual(TaskSubmission.objects.count(), 2)
 
-    def test_owner_submitter_with_review_grant_is_still_rejected_from_self_review(self):
-        """Owner rank never overrides the exact submitter/reviewer separation."""
+    def test_owner_submitter_with_exact_review_grant_can_approve_own_submission(self):
+        """The explicit Owner path may approve, while preserving exact audit facts."""
 
         now = timezone.now()
         owner_edit_grant = PermissionGrant.objects.create(
@@ -797,19 +797,71 @@ class ContentOpsInvariantTests(TestCase):
             )
             self.task.refresh_from_db()
 
-        with self.assertRaisesMessage(ValidationError, "cannot review their own"):
-            ReviewDecision.record_final(
+        self.assertFalse(
+            ReviewDecision.owner_self_approval_allowed(
                 submission=submission,
-                decision=ReviewDecision.Decision.APPROVED,
-                rationale="Owner authority cannot override self-review separation.",
-                command_id=uuid7(),
-                expected_task_version=self.task.state_version,
+                decision=ReviewDecision.Decision.CHANGES_REQUESTED,
                 reviewer_principal=self.owner,
                 acting_role=ActingRole.OWNER,
-                permission_grant=owner_review_grant,
-                recorded_by_principal=self.recorder,
             )
-        self.assertFalse(ReviewDecision.objects.filter(submission=submission).exists())
+        )
+
+        # The database exception is intentionally as narrow as the service
+        # rule.  Raw SQL/ORM bypasses cannot label an EDIT grant as REVIEW
+        # authority merely because the submitter happens to be an Owner.
+        raw_wrong_grant = ReviewDecision(
+            submission=submission,
+            decision=ReviewDecision.Decision.APPROVED,
+            rationale="Raw Owner approval with the wrong grant must fail.",
+            command_id=uuid7(),
+            expected_task_version=self.task.state_version,
+            reviewer_principal=self.owner,
+            reviewer_acting_role=ActingRole.OWNER,
+            reviewer_grant=owner_edit_grant,
+            recorded_by_principal=self.owner,
+            decided_at=timezone.now(),
+        )
+        raw_wrong_grant.payload_hash = canonical_sha256(
+            raw_wrong_grant.command_payload()
+        )
+        raw_wrong_grant.decision_sha256 = raw_wrong_grant.payload_hash
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            models.Model.save_base(
+                raw_wrong_grant,
+                raw=True,
+                force_insert=True,
+                using="default",
+            )
+
+        review = ReviewDecision.record_final(
+            submission=submission,
+            decision=ReviewDecision.Decision.APPROVED,
+            rationale="Owner explicitly approved their own final content.",
+            command_id=uuid7(),
+            expected_task_version=self.task.state_version,
+            reviewer_principal=self.owner,
+            acting_role=ActingRole.OWNER,
+            permission_grant=owner_review_grant,
+            recorded_by_principal=self.owner,
+        )
+        self.assertEqual(review.reviewer_principal, self.owner)
+        self.assertEqual(review.submission.submitted_by_principal, self.owner)
+        self.assertEqual(review.reviewer_grant, owner_review_grant)
+        self.assertEqual(review.reviewer_acting_role, ActingRole.OWNER)
+
+        Task.transition(
+            task_id=self.task.pk,
+            to_state=Task.State.APPROVED,
+            command_id=uuid7(),
+            expected_state_version=self.task.state_version,
+            actor_principal=self.owner,
+            acting_role=ActingRole.OWNER,
+            permission_grant=owner_edit_grant,
+            recorded_by_principal=self.owner,
+            reason="Owner final approval recorded.",
+        )
+        self.task.refresh_from_db()
+        self.assertEqual(self.task.current_state, Task.State.APPROVED)
 
     def test_self_review_is_rejected_and_record_final_is_the_only_orm_write_path(self):
         asset = self._asset()

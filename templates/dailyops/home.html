@@ -4,6 +4,7 @@
 {% block page_title %}{% ui '机会与计划' 'Opportunities' %}{% endblock %}
 {% block content %}
 <div class="daily-page">
+  <a class="back-link" href="{% url 'dashboard:feature-center' %}">← {% ui '返回功能中心' 'Back to feature center' %}</a>
   <header class="daily-page-heading">
     <div>
       <p class="eyebrow">{% ui '每日运营' 'Daily operations' %}</p>
@@ -114,7 +115,7 @@
         <div class="daily-recent-actions">
           <a class="button button-primary" href="{% url 'dailyops:batch-detail' batch.product.id batch.batch_key %}">{% ui '继续下一步' 'Continue' %}</a>
           {% if batch.can_dispose %}<details class="daily-disposition-control">
-            <summary class="daily-text-button">
+            <summary class="button button-secondary daily-disposition-trigger">
               {% if batch.has_formal_execution %}{% ui '从最近工作隐藏（任务保留）' 'Hide from Recent work (tasks remain)' %}{% else %}{% ui '删除这次草稿' 'Remove this draft' %}{% endif %}
             </summary>
             <form method="post" action="{% url 'dailyops:batch-dispose' batch.product.id batch.batch_key %}" data-disposition-form>

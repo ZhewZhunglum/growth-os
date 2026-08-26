@@ -3,6 +3,7 @@
 {% block title %}{% ui '问题与规则治理' 'Issues and rules' %} · PUKO{% endblock %}
 {% block page_title %}{% ui '问题与规则治理' 'Issues and rules' %}{% endblock %}
 {% block content %}
+<a class="back-link" href="{% url 'dashboard:feature-center' %}">← {% ui '返回功能中心' 'Back to feature center' %}</a>
 <section class="hero-panel governance-hero">
   <div><p class="eyebrow">{% ui 'Daily Operations 的安全出口' 'The safe path for Daily Operations issues' %}</p><h2>{% ui '先把问题说清楚，再决定要不要改规则。' 'Describe the issue first, then decide whether a rule should change.' %}</h2>
   <p>{% ui '员工上报不会自动改规则；学习结论只能提出建议。规则必须经过离线回放、影子验证、人工批准、小范围试运行，最后由有权的人明确启用。' 'Staff reports never change rules automatically, and learnings can only make proposals. A rule must pass historical replay, shadow validation, human approval, and a canary before an authorized person activates it.' %}</p></div>

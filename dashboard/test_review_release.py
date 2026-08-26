@@ -22,6 +22,7 @@ from integrations.publishing import (
     PublicationRuntime,
     PublicationRuntimeConfig,
 )
+from dashboard.action_center import build_action_center
 from dashboard.review_views import (
     release_detail,
     release_done_action,
@@ -34,7 +35,7 @@ from dashboard.review_views import (
     review_queue,
 )
 from dashboard.release_actions import release_rework_action, release_stop_action
-from dashboard.views import home
+from dashboard.views import _current_task_turn, home
 from products.models import Product, ProductProfileVersion
 from releasegate.models import (
     AccountEnvironmentBinding,
@@ -264,7 +265,14 @@ class ReviewReleaseUISliceTests(TestCase):
         inline_content=None,
         mime_type="text/uri-list",
         metadata=None,
+        executor=None,
     ):
+        executor = executor or self.operator
+        executor_edit = {
+            self.owner.pk: self.owner_edit,
+            self.operator.pk: self.operator_edit,
+            self.reviewer.pk: self.reviewer_edit,
+        }[executor.pk]
         object_key = object_key or self.asset_url
         if metadata is None:
             metadata = {"source": "external-url"}
@@ -290,7 +298,7 @@ class ReviewReleaseUISliceTests(TestCase):
         self._transition(task, Task.State.READY)
         TaskAssignment.record(
             task=task,
-            assignee_principal=self.operator,
+            assignee_principal=executor,
             command_id=uuid.uuid4(),
             expected_task_version=task.state_version,
             assigned_by_principal=self.owner,
@@ -303,8 +311,8 @@ class ReviewReleaseUISliceTests(TestCase):
         self._transition(
             task,
             Task.State.IN_PROGRESS,
-            principal=self.operator,
-            grant=self.operator_edit,
+            principal=executor,
+            grant=executor_edit,
         )
         asset = ContentAsset.create_idempotent(
             task=task,
@@ -312,10 +320,10 @@ class ReviewReleaseUISliceTests(TestCase):
             title="UI deliverable",
             asset_kind=ContentAsset.AssetKind.COPY,
             command_id=uuid.uuid4(),
-            actor_principal=self.operator,
-            acting_role=self.operator.role,
-            permission_grant=self.operator_edit,
-            recorded_by_principal=self.operator,
+            actor_principal=executor,
+            acting_role=executor.role,
+            permission_grant=executor_edit,
+            recorded_by_principal=executor,
         )
         if inline_content is None:
             version = ContentAssetVersion.create_next(
@@ -327,10 +335,10 @@ class ReviewReleaseUISliceTests(TestCase):
                 content_sha256=hashlib.sha256(object_key.encode("utf-8")).hexdigest(),
                 metadata=metadata,
                 command_id=uuid.uuid4(),
-                actor_principal=self.operator,
-                acting_role=self.operator.role,
-                permission_grant=self.operator_edit,
-                recorded_by_principal=self.operator,
+                actor_principal=executor,
+                acting_role=executor.role,
+                permission_grant=executor_edit,
+                recorded_by_principal=executor,
             )
         else:
             version = ContentAssetVersion.create_next(
@@ -340,20 +348,20 @@ class ReviewReleaseUISliceTests(TestCase):
                 mime_type="text/plain; charset=utf-8",
                 metadata={"source": "generated-inline-content", "title": "Exact Quora answer"},
                 command_id=uuid.uuid4(),
-                actor_principal=self.operator,
-                acting_role=self.operator.role,
-                permission_grant=self.operator_edit,
-                recorded_by_principal=self.operator,
+                actor_principal=executor,
+                acting_role=executor.role,
+                permission_grant=executor_edit,
+                recorded_by_principal=executor,
             )
         dod = TaskCheckRun.record_completed(
             task=task,
             check_kind=TaskCheckRun.Kind.DOD,
             results=[{"criterion_key": "complete", "result": "PASS", "evidence": {"version": str(version.pk)}}],
             command_id=uuid.uuid4(),
-            evaluator_principal=self.operator,
-            acting_role=self.operator.role,
-            permission_grant=self.operator_edit,
-            recorded_by_principal=self.operator,
+            evaluator_principal=executor,
+            acting_role=executor.role,
+            permission_grant=executor_edit,
+            recorded_by_principal=executor,
         )
         TaskSubmission.seal(
             task=task,
@@ -362,10 +370,10 @@ class ReviewReleaseUISliceTests(TestCase):
             submission_note="Ready for human review.",
             command_id=uuid.uuid4(),
             expected_task_version=task.state_version,
-            actor_principal=self.operator,
-            acting_role=self.operator.role,
-            permission_grant=self.operator_edit,
-            recorded_by_principal=self.operator,
+            actor_principal=executor,
+            acting_role=executor.role,
+            permission_grant=executor_edit,
+            recorded_by_principal=executor,
         )
         self._transition(task, Task.State.SUBMITTED)
         self._transition(task, Task.State.UNDER_REVIEW)
@@ -437,22 +445,130 @@ class ReviewReleaseUISliceTests(TestCase):
         self.client.force_login(self.outsider)
         self.assertNotContains(self.client.get(reverse("dashboard:review-queue")), self.task.title)
 
+    def test_owner_self_submission_is_actionable_and_only_allows_audited_final_approval(self):
+        # Close the default Operator submission first so the Owner inbox has
+        # exactly one review item: the Owner-authored submission below.
+        self._approve()
+        owner_review = self._grant(self.owner, PermissionGrant.Action.REVIEW)
+        owner_task = self._under_review_task(
+            executor=self.owner,
+            inline_content=(
+                "This is the exact, complete content authored by the Owner for "
+                "the audited final-approval path."
+            ),
+        )
+        self.task = owner_task
+        self.client.force_login(self.owner)
+
+        center = build_action_center(self.owner)
+        self.assertEqual(center.pending_review_count, 1)
+        self.assertEqual(center.waiting_count, 0)
+        self.assertEqual(center.items[0].key, "review")
+
+        home_response = self.client.get(reverse("dashboard:home"))
+        self.assertContains(home_response, "等我审核或批准")
+        queue_response = self.client.get(reverse("dashboard:review-queue"))
+        self.assertContains(queue_response, owner_task.title)
+        self.assertContains(queue_response, "Owner 最终批准")
+
+        detail_response = self.client.get(
+            reverse("dashboard:review-detail", args=[owner_task.pk])
+        )
+        self.assertEqual(detail_response.status_code, 200)
+        self.assertContains(detail_response, "Owner 最终批准（已审计）")
+        self.assertContains(detail_response, 'value="APPROVED"')
+        self.assertNotContains(detail_response, 'value="CHANGES_REQUESTED"')
+        self.assertNotContains(detail_response, 'value="REJECTED"')
+
+        approved = self._review_post(decision=ReviewDecision.Decision.APPROVED)
+        self.assertRedirects(approved, reverse("dashboard:review-queue"))
+        owner_task.refresh_from_db()
+        self.assertEqual(owner_task.current_state, Task.State.APPROVED)
+        decision = ReviewDecision.objects.get(submission__task=owner_task)
+        self.assertEqual(decision.decision, ReviewDecision.Decision.APPROVED)
+        self.assertEqual(decision.reviewer_principal, self.owner)
+        self.assertEqual(decision.reviewer_acting_role, ActingRole.OWNER)
+        self.assertEqual(decision.reviewer_grant, owner_review)
+
     def test_submitter_cannot_review_own_submission_even_with_both_grants(self):
         self._grant(self.operator, PermissionGrant.Action.REVIEW)
         self.client.force_login(self.operator)
 
         queue = self.client.get(reverse("dashboard:review-queue"))
-        self.assertNotContains(queue, self.task.title)
-        denied = self._review_post()
-
-        self.assertEqual(denied.status_code, 302)
-        self.assertEqual(
-            denied.headers["Location"],
+        self.assertNotContains(
+            queue,
             reverse("dashboard:review-detail", args=[self.task.pk]),
         )
+        self.assertContains(queue, "我送审的内容正在等待他人")
+        self.assertContains(queue, "请等待有权限的账号处理")
+        self.assertEqual(
+            self.client.get(
+                reverse("dashboard:review-detail", args=[self.task.pk])
+            ).status_code,
+            403,
+        )
+        denied = self._review_post()
+
+        self.assertEqual(denied.status_code, 403)
         self.assertFalse(ReviewDecision.objects.filter(submission__task=self.task).exists())
         self.task.refresh_from_db()
         self.assertEqual(self.task.current_state, Task.State.UNDER_REVIEW)
+
+    def test_operations_admin_submitter_cannot_review_own_submission(self):
+        self._approve()
+        self._grant(self.owner, PermissionGrant.Action.REVIEW)
+        admin_task = self._under_review_task(
+            executor=self.reviewer,
+            inline_content=(
+                "This complete Admin-authored delivery must still be approved "
+                "by a different authorized Principal."
+            ),
+        )
+        self.task = admin_task
+        self.client.force_login(self.reviewer)
+
+        center = build_action_center(self.reviewer)
+        self.assertEqual(center.pending_review_count, 0)
+        self.assertEqual(center.waiting_count, 1)
+        queue = self.client.get(reverse("dashboard:review-queue"))
+        self.assertNotContains(
+            queue,
+            reverse("dashboard:review-detail", args=[admin_task.pk]),
+        )
+        self.assertContains(queue, "我送审的内容正在等待他人")
+        self.assertEqual(
+            self.client.get(
+                reverse("dashboard:review-detail", args=[admin_task.pk])
+            ).status_code,
+            403,
+        )
+        self.assertEqual(self._review_post().status_code, 403)
+        self.assertFalse(
+            ReviewDecision.objects.filter(submission__task=admin_task).exists()
+        )
+        admin_task.refresh_from_db()
+        self.assertEqual(admin_task.current_state, Task.State.UNDER_REVIEW)
+
+    def test_handoff_status_is_separate_from_actionable_review_and_permission_filtered(self):
+        submitter_center = build_action_center(self.operator)
+        self.assertEqual(submitter_center.pending_review_count, 0)
+        self.assertEqual(submitter_center.total_count, 0)
+        self.assertEqual(submitter_center.waiting_count, 1)
+        self.assertEqual(len(submitter_center.waiting_items), 1)
+        self.assertIn(self.task.title, submitter_center.waiting_items[0].label_zh)
+        self.assertIn(self.reviewer.username, submitter_center.waiting_items[0].hint_zh)
+        self.client.force_login(self.operator)
+        submitter_home = self.client.get(reverse("dashboard:home"))
+        self.assertContains(submitter_home, "等待他人")
+        self.assertContains(submitter_home, "notification-badge-passive")
+
+        reviewer_center = build_action_center(self.reviewer)
+        self.assertEqual(reviewer_center.pending_review_count, 1)
+        self.assertEqual(reviewer_center.waiting_count, 0)
+
+        outsider_center = build_action_center(self.outsider)
+        self.assertEqual(outsider_center.pending_review_count, 0)
+        self.assertEqual(outsider_center.waiting_count, 0)
 
     def test_completed_review_history_is_read_only_and_private_to_reviewer(self):
         self.client.force_login(self.reviewer)
@@ -1082,7 +1198,25 @@ class ReviewReleaseUISliceTests(TestCase):
             username="review-only", password="test-only", role=Principal.Role.OPERATIONS_ADMIN
         )
         self._grant(review_only, PermissionGrant.Action.REVIEW)
+
+        center = build_action_center(review_only)
+        self.assertEqual(center.pending_review_count, 0)
+        turn = _current_task_turn(self.task)
+        self.assertNotIn(review_only.username, turn["who_zh"])
+        self.assertIn(self.reviewer.username, turn["who_zh"])
+
         self.client.force_login(review_only)
+        queue = self.client.get(reverse("dashboard:review-queue"))
+        self.assertNotContains(
+            queue,
+            reverse("dashboard:review-detail", args=[self.task.pk]),
+        )
+        self.assertEqual(
+            self.client.get(
+                reverse("dashboard:review-detail", args=[self.task.pk])
+            ).status_code,
+            403,
+        )
         denied = self.client.post(
             reverse("dashboard:review-action", args=[self.task.pk]),
             {
@@ -1103,6 +1237,50 @@ class ReviewReleaseUISliceTests(TestCase):
         self.task.refresh_from_db()
         self.assertEqual(self.task.current_state, Task.State.HUMAN_REWORK)
         self.assertEqual(self.task.submissions.get().final_review.decision, "CHANGES_REQUESTED")
+
+    def test_submitter_sees_explicit_block_when_no_eligible_reviewer_exists(self):
+        now = timezone.now()
+        self.reviewer_review.grant_status = PermissionGrant.GrantStatus.REVOKED
+        self.reviewer_review.revoked_at = now
+        self.reviewer_review.revoked_by_principal = self.owner
+        self.reviewer_review.revocation_reason = "Exercise the no-reviewer handoff state."
+        self.reviewer_review.save(
+            update_fields=[
+                "grant_status",
+                "revoked_at",
+                "revoked_by_principal",
+                "revocation_reason",
+                "updated_at",
+            ]
+        )
+
+        center = build_action_center(self.operator)
+        self.assertEqual(center.pending_review_count, 0)
+        self.assertEqual(center.waiting_count, 1)
+        self.assertEqual(center.waiting_items[0].key, f"review-blocked:{self.task.pk}")
+        self.assertEqual(
+            center.waiting_items[0].hint_zh,
+            "尚未配置可审核账号，请 Owner 处理",
+        )
+
+        turn = _current_task_turn(self.task)
+        self.assertEqual(turn["who_zh"], "尚未配置可审核账号，请 Owner 处理")
+
+        self.client.force_login(self.operator)
+        home_response = self.client.get(reverse("dashboard:home"))
+        self.assertContains(home_response, "审核受阻")
+        self.assertContains(home_response, "尚未配置可审核账号，请 Owner 处理")
+        self.assertContains(home_response, "notification-badge-passive")
+        queue_response = self.client.get(reverse("dashboard:review-queue"))
+        self.assertContains(queue_response, "审核受阻")
+        self.assertContains(queue_response, "尚未配置可审核账号，请 Owner 处理")
+
+        outsider_center = build_action_center(self.outsider)
+        self.assertEqual(outsider_center.waiting_count, 0)
+        self.client.force_login(self.outsider)
+        outsider_queue = self.client.get(reverse("dashboard:review-queue"))
+        self.assertNotContains(outsider_queue, self.task.title)
+        self.assertNotContains(outsider_queue, "尚未配置可审核账号，请 Owner 处理")
 
     def test_release_gate_proof_and_owner_completion_are_manual_and_idempotent(self):
         self._approve()

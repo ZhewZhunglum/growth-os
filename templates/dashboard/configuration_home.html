@@ -3,6 +3,7 @@
 {% block title %}{% ui '产品与运行配置' 'Product & runtime setup' %} · PUKO{% endblock %}
 {% block page_title %}{% ui '产品与运行配置' 'Product & runtime setup' %}{% endblock %}
 {% block content %}
+<a class="back-link" href="{% url 'dashboard:feature-center' %}">← {% ui '返回功能中心' 'Back to feature center' %}</a>
 <section class="hero-panel config-hero">
   <div><p class="eyebrow">{% ui 'Daily Operations 基础资料' 'Daily Operations foundation' %}</p><h2>{% ui '把真实产品、规则和账号准备好' 'Prepare real products, rules, and accounts' %}</h2>
   <p>{% ui '这里只保存封存版本、平台账号编号和外部链接，不接收图片、视频、密码或 API 密钥。' 'This area stores sealed versions, platform account identifiers, and external links—not images, videos, passwords, or API keys.' %}</p></div>

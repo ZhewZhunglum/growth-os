@@ -469,6 +469,17 @@ class Task(TimeStampedModel):
                     raise PermissionDenied("ONLY_OWNER_OR_ADMIN_CAN_STOP_PUBLICATION")
                 if not reason.strip():
                     raise ValidationError("Stopping publication requires a reason.")
+            elif to_state == cls.State.CANCELLED:
+                if (
+                    task.current_assignee_principal_id != actor_principal.pk
+                    and acting_role
+                    not in {ActingRole.OWNER, ActingRole.OPERATIONS_ADMIN}
+                ):
+                    raise PermissionDenied(
+                        "ONLY_ASSIGNEE_OR_OWNER_ADMIN_CAN_CANCEL_TASK"
+                    )
+                if not reason.strip():
+                    raise ValidationError("Cancelling a task requires a reason.")
             # Projecting a newly-created assignment from READY is the
             # privileged assignment action.  Returning a BLOCKED task to its
             # recorded ASSIGNED state is only an unblock operation and must
@@ -799,6 +810,177 @@ class Task(TimeStampedModel):
             )
             return event
 
+    @classmethod
+    def cancel_task(
+        cls,
+        *,
+        task_id,
+        command_id: uuid.UUID,
+        expected_state_version: int,
+        actor_principal,
+        acting_role: str,
+        permission_grant,
+        recorded_by_principal,
+        reason: str,
+        submission_id=None,
+    ) -> TaskStateEvent:
+        """Cancel active work through one audited, serialized command.
+
+        Ordinary pre-review work appends a normal state transition.  Cancelling
+        an item already under review appends a submission-bound abandonment
+        event.  ReviewDecision.record_final() locks rows in the same Task then
+        Submission order, so review and abandonment have a single winner.
+        """
+
+        from contentops.models import ReviewDecision, TaskSubmission
+
+        normalized_reason = reason.strip()
+        if not normalized_reason:
+            raise ValidationError("Cancelling a task requires a reason.")
+
+        with transaction.atomic():
+            task = cls.objects.select_for_update().get(pk=task_id)
+            payload = {
+                "task_id": str(task.pk),
+                "submission_id": str(submission_id) if submission_id else None,
+                "to_state": cls.State.CANCELLED,
+                "expected_state_version": expected_state_version,
+                "actor_principal_id": str(actor_principal.pk),
+                "acting_role": acting_role,
+                "permission_grant_id": str(permission_grant.pk),
+                "reason": normalized_reason,
+            }
+            digest = payload_sha256(payload)
+            existing = TaskStateEvent.objects.filter(command_id=command_id).first()
+            if existing:
+                if existing.payload_hash != digest:
+                    raise CommandReplayConflict(
+                        "command_id was already used with a different cancellation payload."
+                    )
+                return existing
+
+            if task.state_version != expected_state_version:
+                raise OptimisticConcurrencyConflict(
+                    "Task version is stale; reread before cancelling."
+                )
+            cancellable_states = {
+                cls.State.DRAFT,
+                cls.State.BLOCKED,
+                cls.State.READY,
+                cls.State.ASSIGNED,
+                cls.State.IN_PROGRESS,
+                cls.State.HUMAN_REWORK,
+                cls.State.UNDER_REVIEW,
+            }
+            if task.current_state not in cancellable_states:
+                raise IllegalTaskTransition(
+                    f"{task.current_state} cannot be abandoned through task management."
+                )
+            validate_current_grant(
+                permission_grant,
+                principal=actor_principal,
+                acting_role=acting_role,
+                action="CANCEL_TASK",
+                product_id=task.product_id,
+            )
+
+            submission = None
+            event_type = TaskStateEvent.EventType.STATE_TRANSITION
+            if task.current_state == cls.State.UNDER_REVIEW:
+                if submission_id is None:
+                    raise ValidationError(
+                        "Cancelling an UNDER_REVIEW task requires the exact submission."
+                    )
+                submission = TaskSubmission.objects.select_for_update().get(pk=submission_id)
+                if submission.task_id != task.pk:
+                    raise CheckGateRejected("The submission belongs to another task.")
+                latest = TaskSubmission.objects.filter(task=task).order_by(
+                    "-submission_number"
+                ).first()
+                if latest is None or latest.pk != submission.pk:
+                    raise CheckGateRejected(
+                        "Only the current exact submission may be abandoned."
+                    )
+                if ReviewDecision.objects.filter(submission=submission).exists():
+                    raise CheckGateRejected(
+                        "A submission with a final review decision cannot be abandoned."
+                    )
+                if TaskStateEvent.objects.filter(
+                    event_type__in={
+                        TaskStateEvent.EventType.SUBMISSION_WITHDRAWN,
+                        TaskStateEvent.EventType.SUBMISSION_ABANDONED,
+                    },
+                    submission=submission,
+                ).exists():
+                    raise CheckGateRejected(
+                        "This submission is no longer active."
+                    )
+                if (
+                    submission.submitted_by_principal_id != actor_principal.pk
+                    and acting_role
+                    not in {ActingRole.OWNER, ActingRole.OPERATIONS_ADMIN}
+                ):
+                    raise PermissionDenied(
+                        "ONLY_SUBMITTER_OR_OWNER_ADMIN_CAN_ABANDON_REVIEW"
+                    )
+                event_type = TaskStateEvent.EventType.SUBMISSION_ABANDONED
+            else:
+                creator_can_cancel_unassigned = (
+                    task.current_assignee_principal_id is None
+                    and task.created_by_principal_id == actor_principal.pk
+                    and task.current_state
+                    in {cls.State.DRAFT, cls.State.READY, cls.State.BLOCKED}
+                )
+                if (
+                    task.current_assignee_principal_id != actor_principal.pk
+                    and not creator_can_cancel_unassigned
+                    and acting_role
+                    not in {ActingRole.OWNER, ActingRole.OPERATIONS_ADMIN}
+                ):
+                    raise PermissionDenied(
+                        "ONLY_ASSIGNEE_OR_OWNER_ADMIN_CAN_CANCEL_TASK"
+                    )
+                if submission_id is not None:
+                    raise ValidationError(
+                        "A pre-review cancellation must not reference a submission."
+                    )
+
+            previous = task.state_events.order_by("-event_sequence").first()
+            next_version = task.state_version + 1
+            event = TaskStateEvent.objects.create(
+                task=task,
+                event_type=event_type,
+                submission=submission,
+                from_state=task.current_state,
+                to_state=cls.State.CANCELLED,
+                command_id=command_id,
+                payload_hash=digest,
+                expected_state_version=expected_state_version,
+                resulting_state_version=next_version,
+                event_sequence=next_version,
+                previous_event=previous,
+                reason=normalized_reason,
+                actor_principal=actor_principal,
+                acting_role=acting_role,
+                permission_grant=permission_grant,
+                recorded_by_principal=recorded_by_principal,
+                event_at=timezone.now(),
+            )
+            task.current_state = cls.State.CANCELLED
+            task.state_version = next_version
+            task.blocked_from_state = ""
+            task.updated_by_principal = recorded_by_principal
+            task.save(
+                update_fields=[
+                    "current_state",
+                    "state_version",
+                    "blocked_from_state",
+                    "updated_by_principal",
+                    "updated_at",
+                ]
+            )
+            return event
+
 
 class TaskAssignment(AppendOnlyFact):
     task = models.ForeignKey(Task, on_delete=models.PROTECT, related_name="assignments")
@@ -1015,6 +1197,10 @@ class TaskStateEvent(AppendOnlyFact):
     class EventType(models.TextChoices):
         STATE_TRANSITION = "STATE_TRANSITION", "State transition"
         SUBMISSION_WITHDRAWN = "SUBMISSION_WITHDRAWN", "Submission withdrawn"
+        SUBMISSION_ABANDONED = (
+            "SUBMISSION_ABANDONED",
+            "Submission abandoned with task cancellation",
+        )
         APPROVED_REWORK_REQUESTED = (
             "APPROVED_REWORK_REQUESTED",
             "Approved submission returned for rework",
@@ -1074,6 +1260,12 @@ class TaskStateEvent(AppendOnlyFact):
                         to_state=Task.State.IN_PROGRESS,
                     )
                     | Q(
+                        event_type="SUBMISSION_ABANDONED",
+                        submission__isnull=False,
+                        from_state=Task.State.UNDER_REVIEW,
+                        to_state=Task.State.CANCELLED,
+                    )
+                    | Q(
                         event_type="APPROVED_REWORK_REQUESTED",
                         submission__isnull=False,
                         from_state=Task.State.APPROVED,
@@ -1084,8 +1276,13 @@ class TaskStateEvent(AppendOnlyFact):
             ),
             models.UniqueConstraint(
                 fields=["submission"],
-                condition=Q(event_type="SUBMISSION_WITHDRAWN"),
-                name="workflow_one_withdrawal_per_submission",
+                condition=Q(
+                    event_type__in=(
+                        "SUBMISSION_WITHDRAWN",
+                        "SUBMISSION_ABANDONED",
+                    )
+                ),
+                name="workflow_one_review_exit_per_submission",
             ),
             models.UniqueConstraint(
                 fields=["submission"],
@@ -1109,6 +1306,22 @@ class TaskStateEvent(AppendOnlyFact):
                 raise ValidationError("A withdrawal event must move UNDER_REVIEW to IN_PROGRESS.")
             if self.task_id and self.submission.task_id != self.task_id:
                 raise ValidationError("The withdrawn submission belongs to another task.")
+        elif self.event_type == self.EventType.SUBMISSION_ABANDONED:
+            if self.submission_id is None:
+                raise ValidationError(
+                    "An abandonment event must reference the exact submission."
+                )
+            if (
+                self.from_state != Task.State.UNDER_REVIEW
+                or self.to_state != Task.State.CANCELLED
+            ):
+                raise ValidationError(
+                    "An abandonment event must move UNDER_REVIEW directly to CANCELLED."
+                )
+            if self.task_id and self.submission.task_id != self.task_id:
+                raise ValidationError(
+                    "The abandoned submission belongs to another task."
+                )
         elif self.event_type == self.EventType.APPROVED_REWORK_REQUESTED:
             if self.submission_id is None:
                 raise ValidationError(

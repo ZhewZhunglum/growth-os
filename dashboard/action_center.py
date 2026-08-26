@@ -28,7 +28,9 @@ class ActionCenterItem:
 class ActionCenter:
     tasks: tuple[Task, ...]
     items: tuple[ActionCenterItem, ...]
+    waiting_items: tuple[ActionCenterItem, ...]
     total_count: int
+    waiting_count: int
     pending_review_count: int
     pending_publish_count: int
     pending_complete_count: int
@@ -152,7 +154,9 @@ def build_action_center(user: Principal) -> ActionCenter:
         return ActionCenter(
             tasks=(),
             items=(),
+            waiting_items=(),
             total_count=0,
+            waiting_count=0,
             pending_review_count=0,
             pending_publish_count=0,
             pending_complete_count=0,
@@ -164,7 +168,8 @@ def build_action_center(user: Principal) -> ActionCenter:
 
     # Imported lazily to avoid coupling app initialization to the review and
     # release slice. These helpers perform the same fail-closed checks as the
-    # destination queues, including submitter != reviewer.
+    # destination queues, including the narrow audited Owner self-approval
+    # exception and the self-review prohibition for every other account.
     from dashboard.review_views import (
         _allowed_accounts,
         _can_complete,
@@ -221,10 +226,10 @@ def build_action_center(user: Principal) -> ActionCenter:
             ActionCenterItem(
                 key="review",
                 count=pending_review_count,
-                label_zh="等我审核",
-                label_en="Needs my review",
-                hint_zh="只显示我有权审核且不是我提交的内容",
-                hint_en="Only authorized work submitted by someone else",
+                label_zh="等我审核或批准",
+                label_en="Needs my review or approval",
+                hint_zh="Owner 可最终批准自己提交的内容；其他账号仍禁止自审",
+                hint_en="Owners may finally approve their own submissions; other accounts cannot self-review",
                 url=reverse("dashboard:review-queue"),
             )
         )
@@ -253,7 +258,61 @@ def build_action_center(user: Principal) -> ActionCenter:
             )
         )
 
+    waiting_items: list[ActionCenterItem] = []
+    waiting_review_candidates = (
+        Task.objects.filter(current_state=Task.State.UNDER_REVIEW)
+        .filter(Q(created_by_principal=user) | Q(submissions__submitted_by_principal=user))
+        .select_related("product")
+        .prefetch_related("submissions")
+        .distinct()
+        .order_by("updated_at", "title")
+    )
+    for task in waiting_review_candidates:
+        submission = task.submissions.order_by("-submission_number").first()
+        if submission is None or _can_review_submission(user, task, submission):
+            continue
+        if not (
+            _product_allowed(user, task, PermissionGrant.Action.VIEW)
+            or _product_allowed(user, task, PermissionGrant.Action.EDIT)
+        ):
+            continue
+        reviewers = []
+        for principal in Principal.objects.filter(
+            principal_type=Principal.PrincipalType.HUMAN_USER,
+            principal_status=Principal.PrincipalStatus.ACTIVE,
+            is_active=True,
+        ).order_by("role", "display_name", "username"):
+            if not _can_review_submission(principal, task, submission):
+                continue
+            reviewers.append(principal.display_name or principal.username)
+        if not reviewers:
+            waiting_items.append(
+                ActionCenterItem(
+                    key=f"review-blocked:{task.pk}",
+                    count=1,
+                    label_zh=f"审核受阻：{task.title}",
+                    label_en=f"Review blocked: {task.title}",
+                    hint_zh="尚未配置可审核账号，请 Owner 处理",
+                    hint_en="No eligible reviewer is configured; ask the Owner to handle it",
+                    url=reverse("dashboard:task-detail", args=[task.pk]),
+                )
+            )
+            continue
+        reviewer_names = "、".join(reviewers)
+        waiting_items.append(
+            ActionCenterItem(
+                key=f"waiting-review:{task.pk}",
+                count=1,
+                label_zh=f"等待审核：{task.title}",
+                label_en=f"Waiting for review: {task.title}",
+                hint_zh=f"已交给 {reviewer_names}；你现在不用操作",
+                hint_en=f"Handed to {reviewer_names}; no action is needed from you now",
+                url=reverse("dashboard:task-detail", args=[task.pk]),
+            )
+        )
+
     total_count = sum(item.count for item in items)
+    waiting_count = sum(item.count for item in waiting_items)
     can_open_review = bool(
         pending_review_count
         or _can_use_any_product(user, PermissionGrant.Action.REVIEW)
@@ -266,7 +325,9 @@ def build_action_center(user: Principal) -> ActionCenter:
     return ActionCenter(
         tasks=tasks,
         items=tuple(items),
+        waiting_items=tuple(waiting_items),
         total_count=total_count,
+        waiting_count=waiting_count,
         pending_review_count=pending_review_count,
         pending_publish_count=pending_publish_count,
         pending_complete_count=pending_complete_count,

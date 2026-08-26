@@ -181,9 +181,17 @@ def _latest_submission(task: Task) -> TaskSubmission:
 def _can_review_submission(user: Principal, task: Task, submission: TaskSubmission) -> bool:
     """Return whether the user may independently review this exact submission."""
 
+    is_owner_self_approval = bool(
+        submission.submitted_by_principal_id == user.pk
+        and user.role == Principal.Role.OWNER
+    )
     return bool(
-        submission.submitted_by_principal_id != user.pk
+        (
+            submission.submitted_by_principal_id != user.pk
+            or is_owner_self_approval
+        )
         and _product_decision(user, task, PermissionGrant.Action.REVIEW).allowed
+        and _product_decision(user, task, PermissionGrant.Action.EDIT).allowed
     )
 
 
@@ -268,16 +276,25 @@ def _can_view_publication_proof_event(
     return may_complete or may_publish
 
 
-def _review_context(task: Task, *, form=None):
+def _review_context(task: Task, user: Principal, *, form=None):
     submission = _latest_submission(task)
     asset_version = submission.primary_asset_version
+    owner_self_approval = bool(
+        submission.submitted_by_principal_id == user.pk
+        and user.role == Principal.Role.OWNER
+    )
     return {
         "task": task,
         "submission": submission,
         "asset_version": asset_version,
         "is_link_delivery": _is_link_delivery(asset_version),
         "is_inline_delivery": _is_inline_delivery(asset_version),
-        "review_form": form or ReviewDecisionForm(state_version=task.state_version),
+        "review_form": form
+        or ReviewDecisionForm(
+            state_version=task.state_version,
+            owner_self_approval=owner_self_approval,
+        ),
+        "owner_self_approval": owner_self_approval,
     }
 
 
@@ -399,6 +416,10 @@ def review_queue(request: HttpRequest) -> HttpResponse:
     ):
         submission = task.submissions.order_by("-submission_number").first()
         if submission is not None and _can_review_submission(request.user, task, submission):
+            task.owner_self_approval = bool(
+                submission.submitted_by_principal_id == request.user.pk
+                and request.user.role == Principal.Role.OWNER
+            )
             tasks.append(task)
     completed_reviews = (
         ReviewDecision.objects.filter(reviewer_principal=request.user)
@@ -408,10 +429,20 @@ def review_queue(request: HttpRequest) -> HttpResponse:
         )
         .order_by("-decided_at", "-id")
     )
+    # The review queue stays strictly actionable. An Owner may give the final
+    # audited approval to their own submission; other submitters see a separate
+    # read-only handoff summary so their submission never appears to disappear.
+    from dashboard.action_center import build_action_center
+
+    waiting_reviews = build_action_center(request.user).waiting_items
     return render(
         request,
         "dashboard/review_queue.html",
-        {"tasks": tasks, "completed_reviews": completed_reviews},
+        {
+            "tasks": tasks,
+            "completed_reviews": completed_reviews,
+            "waiting_reviews": waiting_reviews,
+        },
     )
 
 
@@ -422,11 +453,23 @@ def review_detail(request: HttpRequest, task_id) -> HttpResponse:
         pk=task_id,
         current_state=Task.State.UNDER_REVIEW,
     )
-    _require_product_grant(request.user, task, PermissionGrant.Action.REVIEW)
     submission = _latest_submission(task)
-    if submission.submitted_by_principal_id == request.user.pk:
-        raise PermissionDenied("SUBMITTER_CANNOT_REVIEW_OWN_SUBMISSION")
-    return render(request, "dashboard/review_detail.html", _review_context(task))
+    # Keep the GET route aligned with the queue and POST route: a reviewer
+    # needs both REVIEW (to decide) and EDIT (to project the task state). The
+    # only self-approval exception is the narrow, audited Owner path encoded
+    # in the shared helper.
+    if not _can_review_submission(request.user, task, submission):
+        if (
+            submission.submitted_by_principal_id == request.user.pk
+            and request.user.role != Principal.Role.OWNER
+        ):
+            raise PermissionDenied("SUBMITTER_CANNOT_REVIEW_OWN_SUBMISSION")
+        raise PermissionDenied("CURRENT_REVIEW_AUTHORIZATION_REQUIRED")
+    return render(
+        request,
+        "dashboard/review_detail.html",
+        _review_context(task, request.user),
+    )
 
 
 @login_required
@@ -472,16 +515,31 @@ def review_action(request: HttpRequest, task_id) -> HttpResponse:
     # REVIEW and EDIT are deliberately independent grants.  The review fact
     # must not be written when the reviewer cannot project the Task state.
     edit_grant = _require_product_grant(request.user, task, PermissionGrant.Action.EDIT)
-    form = ReviewDecisionForm(request.POST, state_version=task.state_version)
+    submission = _latest_submission(task)
+    owner_self_approval = bool(
+        submission.submitted_by_principal_id == request.user.pk
+        and request.user.role == Principal.Role.OWNER
+    )
+    if (
+        submission.submitted_by_principal_id == request.user.pk
+        and not owner_self_approval
+    ):
+        raise PermissionDenied("SUBMITTER_CANNOT_REVIEW_OWN_SUBMISSION")
+    form = ReviewDecisionForm(
+        request.POST,
+        state_version=task.state_version,
+        owner_self_approval=owner_self_approval,
+    )
     if not form.is_valid():
         return render(
             request,
             "dashboard/review_detail.html",
-            _review_context(task, form=form),
+            _review_context(task, request.user, form=form),
             status=400,
         )
-    submission = _latest_submission(task)
     decision = form.cleaned_data["decision"]
+    if owner_self_approval and decision != ReviewDecision.Decision.APPROVED:
+        raise PermissionDenied("OWNER_SELF_APPROVAL_CAN_ONLY_APPROVE")
     target = (
         Task.State.APPROVED
         if decision == ReviewDecision.Decision.APPROVED

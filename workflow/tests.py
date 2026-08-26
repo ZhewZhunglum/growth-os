@@ -229,6 +229,142 @@ class WorkflowFoundationTests(TestCase):
                 permission_grant=self.grants[PermissionGrant.Action.ASSIGN_TASK], recorded_by_principal=self.owner,
             )
 
+    def test_cancel_task_is_append_only_idempotent_and_requires_exact_cancel_grant(self):
+        command_id = uuid.uuid4()
+        event = Task.cancel_task(
+            task_id=self.task.pk,
+            command_id=command_id,
+            expected_state_version=0,
+            actor_principal=self.owner,
+            acting_role=ActingRole.OWNER,
+            permission_grant=self.grants[PermissionGrant.Action.CANCEL_TASK],
+            recorded_by_principal=self.owner,
+            reason="This draft is not needed.",
+        )
+        replay = Task.cancel_task(
+            task_id=self.task.pk,
+            command_id=command_id,
+            expected_state_version=0,
+            actor_principal=self.owner,
+            acting_role=ActingRole.OWNER,
+            permission_grant=self.grants[PermissionGrant.Action.CANCEL_TASK],
+            recorded_by_principal=self.owner,
+            reason="This draft is not needed.",
+        )
+
+        self.assertEqual(replay.pk, event.pk)
+        self.task.refresh_from_db()
+        self.assertEqual(self.task.current_state, Task.State.CANCELLED)
+        self.assertEqual(self.task.state_events.count(), 1)
+        self.assertEqual(event.permission_grant_id, self.grants[PermissionGrant.Action.CANCEL_TASK].pk)
+
+        with self.assertRaises(CommandReplayConflict):
+            Task.cancel_task(
+                task_id=self.task.pk,
+                command_id=command_id,
+                expected_state_version=0,
+                actor_principal=self.owner,
+                acting_role=ActingRole.OWNER,
+                permission_grant=self.grants[PermissionGrant.Action.CANCEL_TASK],
+                recorded_by_principal=self.owner,
+                reason="A different reason must not replay.",
+            )
+
+    def test_non_assignee_operator_cannot_cancel_another_principals_task(self):
+        operator_cancel = PermissionGrant.objects.create(
+            principal=self.operator,
+            scope_kind=PermissionGrant.ScopeKind.PRODUCT,
+            product=self.product,
+            action=PermissionGrant.Action.CANCEL_TASK,
+            valid_from=timezone.now() - timedelta(minutes=1),
+            valid_until=timezone.now() + timedelta(hours=1),
+            granted_by_principal=self.owner,
+        )
+
+        with self.assertRaises(PermissionDenied):
+            Task.cancel_task(
+                task_id=self.task.pk,
+                command_id=uuid.uuid4(),
+                expected_state_version=0,
+                actor_principal=self.operator,
+                acting_role=ActingRole.OPERATOR,
+                permission_grant=operator_cancel,
+                recorded_by_principal=self.operator,
+                reason="This task does not belong to this operator.",
+            )
+        self.task.refresh_from_db()
+        self.assertEqual(self.task.current_state, Task.State.DRAFT)
+        self.assertFalse(self.task.state_events.exists())
+
+    def test_unassigned_creator_can_cancel_draft_ready_and_blocked_with_exact_grant(self):
+        operator_cancel = PermissionGrant.objects.create(
+            principal=self.operator,
+            scope_kind=PermissionGrant.ScopeKind.PRODUCT,
+            product=self.product,
+            action=PermissionGrant.Action.CANCEL_TASK,
+            valid_from=timezone.now() - timedelta(minutes=1),
+            valid_until=timezone.now() + timedelta(hours=1),
+            granted_by_principal=self.owner,
+        )
+
+        for target_state in (Task.State.DRAFT, Task.State.READY, Task.State.BLOCKED):
+            with self.subTest(target_state=target_state):
+                task = Task.objects.create(
+                    product=self.product,
+                    product_profile_version=self.profile,
+                    contract_version=self.contract,
+                    title=f"Unassigned creator task in {target_state}",
+                    created_by_principal=self.operator,
+                    updated_by_principal=self.operator,
+                )
+                if target_state != Task.State.DRAFT:
+                    check_result = (
+                        TaskCheckRun.Result.PASS
+                        if target_state == Task.State.READY
+                        else TaskCheckRun.Result.BLOCKED
+                    )
+                    TaskCheckRun.record_completed(
+                        task=task,
+                        check_kind=TaskCheckRun.Kind.DOR,
+                        results=[{
+                            "criterion_key": "source_ready",
+                            "result": check_result,
+                            "evidence": {"source": "creator-cancellation-test"},
+                        }],
+                        command_id=uuid.uuid4(),
+                        evaluator_principal=self.operator,
+                        acting_role=ActingRole.OPERATOR,
+                        permission_grant=self.operator_edit_grant,
+                        recorded_by_principal=self.operator,
+                    )
+                    Task.transition(
+                        task_id=task.pk,
+                        to_state=target_state,
+                        command_id=uuid.uuid4(),
+                        expected_state_version=0,
+                        actor_principal=self.operator,
+                        acting_role=ActingRole.OPERATOR,
+                        permission_grant=self.operator_edit_grant,
+                        recorded_by_principal=self.operator,
+                    )
+                    task.refresh_from_db()
+
+                event = Task.cancel_task(
+                    task_id=task.pk,
+                    command_id=uuid.uuid4(),
+                    expected_state_version=task.state_version,
+                    actor_principal=self.operator,
+                    acting_role=ActingRole.OPERATOR,
+                    permission_grant=operator_cancel,
+                    recorded_by_principal=self.operator,
+                    reason="The creator no longer needs this unassigned work.",
+                )
+
+                task.refresh_from_db()
+                self.assertEqual(task.current_state, Task.State.CANCELLED)
+                self.assertEqual(event.from_state, target_state)
+                self.assertEqual(event.permission_grant_id, operator_cancel.pk)
+
     def test_completed_check_facts_are_immutable(self):
         run = self.record_dor()
         run.aggregate_result = TaskCheckRun.Result.FAIL
