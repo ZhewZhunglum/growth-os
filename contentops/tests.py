@@ -71,6 +71,15 @@ class ContentOpsInvariantTests(TestCase):
             valid_until=now + timedelta(hours=1),
             granted_by_principal=self.owner,
         )
+        self.owner_assign_grant = PermissionGrant.objects.create(
+            principal=self.owner,
+            scope_kind=PermissionGrant.ScopeKind.PRODUCT,
+            product=self.product,
+            action=PermissionGrant.Action.ASSIGN_TASK,
+            valid_from=now - timedelta(minutes=1),
+            valid_until=now + timedelta(hours=1),
+            granted_by_principal=self.owner,
+        )
         self.review_grant = PermissionGrant.objects.create(
             principal=self.reviewer,
             scope_kind=PermissionGrant.ScopeKind.PRODUCT,
@@ -136,8 +145,8 @@ class ContentOpsInvariantTests(TestCase):
             self.task.refresh_from_db()
             TaskAssignment.record(
                 task=self.task, assignee_principal=self.operator, command_id=uuid7(),
-                expected_task_version=1, assigned_by_principal=self.operator, acting_role="OPERATOR",
-                permission_grant=self.assign_grant, recorded_by_principal=self.recorder,
+                expected_task_version=1, assigned_by_principal=self.owner, acting_role="OWNER",
+                permission_grant=self.owner_assign_grant, recorded_by_principal=self.recorder,
             )
             Task.transition(
                 task_id=self.task.pk, to_state=Task.State.ASSIGNED, command_id=uuid7(),
@@ -210,7 +219,7 @@ class ContentOpsInvariantTests(TestCase):
         content = f"immutable content v{number}".encode()
         return ContentAssetVersion.create_next(
             content_asset=asset,
-            object_key=f"puko/tasks/{self.task.pk}/primary-v{number}.mp4",
+            object_key=f"https://drafts.example.com/tasks/{self.task.pk}/primary-v{number}.mp4",
             mime_type="video/mp4",
             byte_size=len(content),
             content_sha256=hashlib.sha256(content).hexdigest(),
@@ -283,7 +292,7 @@ class ContentOpsInvariantTests(TestCase):
         content = b"v1"
         kwargs = {
             "content_asset": asset,
-            "object_key": "puko/v1.mp4",
+            "object_key": "https://drafts.example.com/puko/v1.mp4",
             "mime_type": "video/mp4",
             "byte_size": len(content),
             "content_sha256": hashlib.sha256(content).hexdigest(),
@@ -299,14 +308,176 @@ class ContentOpsInvariantTests(TestCase):
         self.assertEqual(version.id.version, 7)
         self.assertEqual(ContentAssetVersion.objects.count(), 1)
         with self.assertRaises(ValidationError):
-            ContentAssetVersion.create_next(**{**kwargs, "object_key": "puko/different.mp4"})
-        version.object_key = "mutated.mp4"
+            ContentAssetVersion.create_next(
+                **{**kwargs, "object_key": "https://drafts.example.com/puko/different.mp4"}
+            )
+        version.object_key = "https://drafts.example.com/puko/mutated.mp4"
         with self.assertRaises(ValidationError):
             version.save()
         with self.assertRaises(ValidationError):
-            ContentAssetVersion.objects.filter(pk=version.pk).update(object_key="mutated.mp4")
+            ContentAssetVersion.objects.filter(pk=version.pk).update(
+                object_key="https://drafts.example.com/puko/mutated.mp4"
+            )
         with self.assertRaises(ValidationError):
             ContentAssetVersion.objects.filter(pk=version.pk).delete()
+
+    def test_inline_text_version_hashes_body_and_metadata_and_is_idempotent(self):
+        asset = self._asset()
+        command_id = uuid7()
+        body = "Hook: Keep your afternoon focused.\nCTA: Learn more."
+        metadata = {
+            "template_key": "tiktok-script",
+            "template_version": 1,
+            "evidence_manifest_sha256": "a" * 64,
+        }
+        kwargs = {
+            "content_asset": asset,
+            "representation_kind": ContentAssetVersion.RepresentationKind.INLINE_TEXT,
+            "inline_content": body,
+            "mime_type": "text/plain; charset=utf-8",
+            "metadata": metadata,
+            "command_id": command_id,
+            "actor_principal": self.operator,
+            "acting_role": ActingRole.OPERATOR,
+            "permission_grant": self.edit_grant,
+            "recorded_by_principal": self.recorder,
+        }
+
+        version = ContentAssetVersion.create_next(**kwargs)
+        replay = ContentAssetVersion.create_next(**kwargs)
+
+        body_bytes = body.encode("utf-8")
+        expected_payload = {
+            "content_asset_id": str(asset.pk),
+            "payload_schema_version": ContentAssetVersion.PayloadSchemaVersion.V2,
+            "representation_kind": ContentAssetVersion.RepresentationKind.INLINE_TEXT,
+            "object_key": "",
+            "inline_content": body,
+            "mime_type": "text/plain; charset=utf-8",
+            "byte_size": len(body_bytes),
+            "content_sha256": hashlib.sha256(body_bytes).hexdigest(),
+            "metadata": metadata,
+        }
+        self.assertEqual(replay.pk, version.pk)
+        self.assertEqual(version.object_key, "")
+        self.assertEqual(version.byte_size, len(body_bytes))
+        self.assertEqual(version.content_sha256, hashlib.sha256(body_bytes).hexdigest())
+        self.assertEqual(version.creation_payload_hash, canonical_sha256(expected_payload))
+        self.assertEqual(
+            version.manifest_sha256,
+            canonical_sha256({**expected_payload, "version_number": version.version_number}),
+        )
+
+    def test_legacy_v1_object_key_keeps_its_original_payload_and_manifest_hashes(self):
+        asset = self._asset()
+        command_id = uuid7()
+        legacy_object_key = f"legacy/tasks/{self.task.pk}/primary-v1.txt"
+        legacy_bytes = b"legacy immutable content"
+        metadata = {"source": "pre-inline-text-migration"}
+        legacy_payload = {
+            "content_asset_id": str(asset.pk),
+            "object_key": legacy_object_key,
+            "mime_type": "text/plain",
+            "byte_size": len(legacy_bytes),
+            "content_sha256": hashlib.sha256(legacy_bytes).hexdigest(),
+            "metadata": metadata,
+        }
+        original_payload_hash = canonical_sha256(legacy_payload)
+        original_manifest_hash = canonical_sha256({**legacy_payload, "version_number": 1})
+        legacy = ContentAssetVersion.objects.create(
+            content_asset=asset,
+            version_number=1,
+            payload_schema_version=ContentAssetVersion.PayloadSchemaVersion.V1,
+            representation_kind=ContentAssetVersion.RepresentationKind.EXTERNAL_URL,
+            object_key=legacy_object_key,
+            inline_content="",
+            mime_type="text/plain",
+            byte_size=len(legacy_bytes),
+            content_sha256=hashlib.sha256(legacy_bytes).hexdigest(),
+            metadata=metadata,
+            manifest_sha256=original_manifest_hash,
+            creation_command_id=command_id,
+            creation_payload_hash=original_payload_hash,
+            created_by_principal=self.operator,
+            created_by_acting_role=ActingRole.OPERATOR,
+            created_under_grant=self.edit_grant,
+            recorded_by_principal=self.recorder,
+        )
+
+        replay = ContentAssetVersion.create_next(
+            content_asset=asset,
+            object_key=legacy_object_key,
+            mime_type="text/plain",
+            byte_size=len(legacy_bytes),
+            content_sha256=hashlib.sha256(legacy_bytes).hexdigest(),
+            metadata=metadata,
+            command_id=command_id,
+            actor_principal=self.operator,
+            acting_role=ActingRole.OPERATOR,
+            permission_grant=self.edit_grant,
+            recorded_by_principal=self.recorder,
+        )
+
+        self.assertEqual(replay.pk, legacy.pk)
+        self.assertEqual(legacy.command_payload(), legacy_payload)
+        self.assertNotIn("representation_kind", legacy.command_payload())
+        self.assertNotIn("inline_content", legacy.command_payload())
+        self.assertEqual(legacy.creation_payload_hash, original_payload_hash)
+        self.assertEqual(legacy.manifest_sha256, original_manifest_hash)
+
+    def test_content_representation_rejects_invalid_url_and_mixed_or_blank_inline_text(self):
+        asset = self._asset()
+        common = {
+            "content_asset": asset,
+            "mime_type": "text/plain",
+            "command_id": uuid7(),
+            "actor_principal": self.operator,
+            "acting_role": ActingRole.OPERATOR,
+            "permission_grant": self.edit_grant,
+            "recorded_by_principal": self.recorder,
+        }
+        payload = b"draft"
+
+        with self.assertRaisesMessage(ValidationError, "HTTP(S)"):
+            ContentAssetVersion.create_next(
+                **common,
+                object_key="legacy/draft.txt",
+                byte_size=len(payload),
+                content_sha256=hashlib.sha256(payload).hexdigest(),
+            )
+        for credential_url in (
+            "https://embedded-user@example.com/draft",
+            "https://embedded-user:embedded-password@example.com/draft",
+        ):
+            with self.subTest(credential_url=credential_url):
+                with self.assertRaisesMessage(ValidationError, "must not embed credentials"):
+                    ContentAssetVersion.create_next(
+                        **{**common, "command_id": uuid7()},
+                        object_key=credential_url,
+                        byte_size=len(payload),
+                        content_sha256=hashlib.sha256(payload).hexdigest(),
+                    )
+        with self.assertRaisesMessage(ValidationError, "cannot be blank"):
+            ContentAssetVersion.create_next(
+                **{**common, "command_id": uuid7()},
+                representation_kind=ContentAssetVersion.RepresentationKind.INLINE_TEXT,
+                inline_content="   ",
+            )
+        with self.assertRaisesMessage(ValidationError, "cannot also contain"):
+            ContentAssetVersion.create_next(
+                **{**common, "command_id": uuid7()},
+                representation_kind=ContentAssetVersion.RepresentationKind.INLINE_TEXT,
+                object_key="https://drafts.example.com/mixed",
+                inline_content="draft",
+            )
+        with self.assertRaisesMessage(ValidationError, "hash does not match"):
+            ContentAssetVersion.create_next(
+                **{**common, "command_id": uuid7()},
+                representation_kind=ContentAssetVersion.RepresentationKind.INLINE_TEXT,
+                inline_content="draft",
+                content_sha256="0" * 64,
+            )
+        self.assertFalse(ContentAssetVersion.objects.filter(content_asset=asset).exists())
 
     def test_submission_has_one_exact_primary_and_rejects_incomplete_dod(self):
         asset = self._asset()
@@ -350,7 +521,7 @@ class ContentOpsInvariantTests(TestCase):
             self._submission(version=version, dod=dod)
         self.assertFalse(TaskSubmission.objects.exists())
 
-    def test_review_payload_v1_replays_without_rehashing_and_new_reviews_use_v2(self):
+    def test_review_payload_v1_v2_remain_stable_and_new_reviews_use_v3(self):
         asset = self._asset()
         submission = self._submission(version=self._version(asset, 1), dod=self._dod(1))
         self._move_to_review()
@@ -395,11 +566,47 @@ class ContentOpsInvariantTests(TestCase):
         self.assertEqual(legacy.payload_hash, original_hash)
         self.assertEqual(legacy.decision_sha256, original_hash)
 
-        # A fresh command is always reviewer-bound V2.
+        legacy_v2 = ReviewDecision(
+            submission=submission,
+            decision=ReviewDecision.Decision.APPROVED,
+            rationale="Legacy V2 approved review.",
+            criteria_results={"primary-deliverable": "PASS"},
+            command_id=uuid7(),
+            payload_schema_version=ReviewDecision.PayloadSchemaVersion.V2,
+            expected_task_version=self.task.state_version,
+            reviewer_principal=self.reviewer,
+            reviewer_acting_role=ActingRole.OPERATIONS_ADMIN,
+            reviewer_grant=self.review_grant,
+            recorded_by_principal=self.recorder,
+            decided_at=timezone.now(),
+        )
+        v2_payload = legacy_v2.command_payload()
+        self.assertEqual(
+            v2_payload,
+            {
+                "submission_id": str(submission.pk),
+                "decision": ReviewDecision.Decision.APPROVED,
+                "rationale": "Legacy V2 approved review.",
+                "criteria_results": {"primary-deliverable": "PASS"},
+                "expected_task_version": self.task.state_version,
+                "payload_schema_version": 2,
+                "reviewer_principal_id": str(self.reviewer.pk),
+                "reviewer_acting_role": ActingRole.OPERATIONS_ADMIN,
+                "reviewer_grant_id": str(self.review_grant.pk),
+            },
+        )
+        self.assertNotIn("owner_edit_grant_id", v2_payload)
+        v2_hash = canonical_sha256(v2_payload)
+        legacy_v2.owner_edit_grant_id = self.edit_grant.pk
+        self.assertEqual(canonical_sha256(legacy_v2.command_payload()), v2_hash)
+
+        # A fresh command is reviewer-bound V3, so the exact optional Owner
+        # EDIT grant participates in the immutable command hash.
         fresh = ReviewDecision()
-        self.assertEqual(fresh.payload_schema_version, ReviewDecision.PayloadSchemaVersion.V2)
+        self.assertEqual(fresh.payload_schema_version, ReviewDecision.PayloadSchemaVersion.V3)
         self.assertIn("payload_schema_version", fresh.command_payload())
         self.assertIn("reviewer_principal_id", fresh.command_payload())
+        self.assertIn("owner_edit_grant_id", fresh.command_payload())
 
     def test_legacy_integrity_audit_detects_self_review_and_invalid_chain(self):
         migration = importlib.import_module(
@@ -522,6 +729,360 @@ class ContentOpsInvariantTests(TestCase):
             )
         self.assertEqual(TaskSubmission.objects.count(), 2)
 
+    def test_owner_submitter_with_exact_review_grant_can_approve_own_submission(self):
+        """The explicit Owner path may approve, while preserving exact audit facts."""
+
+        now = timezone.now()
+        owner_edit_grant = PermissionGrant.objects.create(
+            principal=self.owner,
+            scope_kind=PermissionGrant.ScopeKind.PRODUCT,
+            product=self.product,
+            action=PermissionGrant.Action.EDIT,
+            valid_from=now - timedelta(minutes=1),
+            valid_until=now + timedelta(hours=1),
+            granted_by_principal=self.owner,
+        )
+        owner_review_grant = PermissionGrant.objects.create(
+            principal=self.owner,
+            scope_kind=PermissionGrant.ScopeKind.PRODUCT,
+            product=self.product,
+            action=PermissionGrant.Action.REVIEW,
+            valid_from=now - timedelta(minutes=1),
+            valid_until=now + timedelta(hours=1),
+            granted_by_principal=self.owner,
+        )
+
+        # Fixture-only projection adjustment: the test is about self-review,
+        # so make Owner the exact current assignee before creating any facts.
+        type(self.task).objects.filter(pk=self.task.pk).update(
+            current_assignee_principal=self.owner,
+            updated_by_principal=self.owner,
+        )
+        self.task.refresh_from_db()
+
+        asset = ContentAsset.create_idempotent(
+            task=self.task,
+            asset_key="owner-authored-copy",
+            title="Owner-authored primary copy",
+            asset_kind=ContentAsset.AssetKind.COPY,
+            command_id=uuid7(),
+            actor_principal=self.owner,
+            acting_role=ActingRole.OWNER,
+            permission_grant=owner_edit_grant,
+            recorded_by_principal=self.recorder,
+        )
+        content = b"immutable owner-authored content"
+        version = ContentAssetVersion.create_next(
+            content_asset=asset,
+            object_key=f"https://drafts.example.com/tasks/{self.task.pk}/owner-v1",
+            mime_type="text/plain",
+            byte_size=len(content),
+            content_sha256=hashlib.sha256(content).hexdigest(),
+            metadata={"source": "owner-self-review-negative"},
+            command_id=uuid7(),
+            actor_principal=self.owner,
+            acting_role=ActingRole.OWNER,
+            permission_grant=owner_edit_grant,
+            recorded_by_principal=self.recorder,
+        )
+        TaskCheckRun = apps.get_model("workflow", "TaskCheckRun")
+        dod = TaskCheckRun.record_completed(
+            task=self.task,
+            check_kind=TaskCheckRun.Kind.DOD,
+            results=[
+                {
+                    "criterion_key": "primary-deliverable",
+                    "result": "PASS",
+                    "evidence": {"exact": True},
+                },
+                {
+                    "criterion_key": "claims-check",
+                    "result": "PASS",
+                    "evidence": {"checked": True},
+                },
+            ],
+            command_id=uuid7(),
+            evaluator_principal=self.owner,
+            acting_role=ActingRole.OWNER,
+            permission_grant=owner_edit_grant,
+            recorded_by_principal=self.recorder,
+        )
+        submission = TaskSubmission.seal(
+            task=self.task,
+            dod_check_run=dod,
+            primary_asset_version=version,
+            command_id=uuid7(),
+            expected_task_version=self.task.state_version,
+            actor_principal=self.owner,
+            acting_role=ActingRole.OWNER,
+            permission_grant=owner_edit_grant,
+            recorded_by_principal=self.recorder,
+        )
+
+        Task = apps.get_model("workflow", "Task")
+        for next_state in (Task.State.SUBMITTED, Task.State.UNDER_REVIEW):
+            Task.transition(
+                task_id=self.task.pk,
+                to_state=next_state,
+                command_id=uuid7(),
+                expected_state_version=self.task.state_version,
+                actor_principal=self.owner,
+                acting_role=ActingRole.OWNER,
+                permission_grant=owner_edit_grant,
+                recorded_by_principal=self.recorder,
+            )
+            self.task.refresh_from_db()
+
+        self.assertFalse(
+            ReviewDecision.owner_self_approval_allowed(
+                submission=submission,
+                decision=ReviewDecision.Decision.CHANGES_REQUESTED,
+                reviewer_principal=self.owner,
+                acting_role=ActingRole.OWNER,
+            )
+        )
+
+        def assert_raw_owner_approval_rejected(
+            grant,
+            *,
+            exact_edit_grant=None,
+            decision=ReviewDecision.Decision.APPROVED,
+            rationale="Raw Owner approval bypass must fail.",
+        ):
+            raw_review = ReviewDecision(
+                submission=submission,
+                decision=decision,
+                rationale=rationale,
+                command_id=uuid7(),
+                expected_task_version=self.task.state_version,
+                reviewer_principal=self.owner,
+                reviewer_acting_role=ActingRole.OWNER,
+                reviewer_grant=grant,
+                owner_edit_grant=exact_edit_grant,
+                recorded_by_principal=self.owner,
+                decided_at=timezone.now(),
+            )
+            raw_review.payload_hash = canonical_sha256(raw_review.command_payload())
+            raw_review.decision_sha256 = raw_review.payload_hash
+            with self.assertRaises(IntegrityError), transaction.atomic():
+                models.Model.save_base(
+                    raw_review,
+                    raw=True,
+                    force_insert=True,
+                    using="default",
+                )
+
+        # The database exception is intentionally as narrow as the service
+        # rule. Raw SQL/ORM bypasses must satisfy the exact current Product
+        # REVIEW grant, a separate current Product EDIT allow, and DENY wins.
+        assert_raw_owner_approval_rejected(owner_review_grant)
+        assert_raw_owner_approval_rejected(
+            owner_edit_grant,
+            exact_edit_grant=owner_edit_grant,
+        )
+
+        other_product = Product.objects.create(
+            product_code="PUKO_CONTENTOPS_OTHER",
+            name="Other ContentOps Fixture",
+            market_code="US",
+            language_code="en",
+            created_by_principal=self.owner,
+            updated_by_principal=self.owner,
+        )
+        wrong_product_review = PermissionGrant.objects.create(
+            principal=self.owner,
+            scope_kind=PermissionGrant.ScopeKind.PRODUCT,
+            product=other_product,
+            action=PermissionGrant.Action.REVIEW,
+            valid_from=now - timedelta(minutes=1),
+            valid_until=now + timedelta(hours=1),
+            granted_by_principal=self.owner,
+        )
+        assert_raw_owner_approval_rejected(
+            wrong_product_review,
+            exact_edit_grant=owner_edit_grant,
+        )
+
+        expired_review = PermissionGrant.objects.create(
+            principal=self.owner,
+            scope_kind=PermissionGrant.ScopeKind.PRODUCT,
+            product=self.product,
+            action=PermissionGrant.Action.REVIEW,
+            valid_from=now - timedelta(hours=2),
+            valid_until=now - timedelta(hours=1),
+            granted_by_principal=self.owner,
+        )
+        assert_raw_owner_approval_rejected(
+            expired_review,
+            exact_edit_grant=owner_edit_grant,
+        )
+
+        approve_not_review = PermissionGrant.objects.create(
+            principal=self.owner,
+            scope_kind=PermissionGrant.ScopeKind.PRODUCT,
+            product=self.product,
+            action=PermissionGrant.Action.APPROVE,
+            valid_from=now - timedelta(minutes=1),
+            valid_until=now + timedelta(hours=1),
+            granted_by_principal=self.owner,
+        )
+        assert_raw_owner_approval_rejected(
+            approve_not_review,
+            exact_edit_grant=owner_edit_grant,
+        )
+        assert_raw_owner_approval_rejected(
+            owner_review_grant,
+            exact_edit_grant=owner_edit_grant,
+            rationale="   ",
+        )
+        assert_raw_owner_approval_rejected(
+            owner_review_grant,
+            exact_edit_grant=owner_edit_grant,
+            decision=ReviewDecision.Decision.CHANGES_REQUESTED,
+        )
+        assert_raw_owner_approval_rejected(
+            owner_review_grant,
+            exact_edit_grant=owner_edit_grant,
+            decision=ReviewDecision.Decision.REJECTED,
+        )
+
+        PermissionGrant.objects.filter(pk=owner_edit_grant.pk).update(
+            grant_status=PermissionGrant.GrantStatus.SUSPENDED
+        )
+        assert_raw_owner_approval_rejected(
+            owner_review_grant,
+            exact_edit_grant=owner_edit_grant,
+        )
+        PermissionGrant.objects.filter(pk=owner_edit_grant.pk).update(
+            grant_status=PermissionGrant.GrantStatus.ACTIVE
+        )
+
+        edit_deny = PermissionGrant.objects.create(
+            principal=self.owner,
+            scope_kind=PermissionGrant.ScopeKind.PRODUCT,
+            product=self.product,
+            action=PermissionGrant.Action.EDIT,
+            effect=PermissionGrant.Effect.DENY,
+            valid_from=now - timedelta(minutes=1),
+            valid_until=now + timedelta(hours=1),
+            granted_by_principal=self.owner,
+        )
+        assert_raw_owner_approval_rejected(
+            owner_review_grant,
+            exact_edit_grant=owner_edit_grant,
+        )
+        PermissionGrant.objects.filter(pk=edit_deny.pk).update(
+            grant_status=PermissionGrant.GrantStatus.SUSPENDED
+        )
+
+        review_deny = PermissionGrant.objects.create(
+            principal=self.owner,
+            scope_kind=PermissionGrant.ScopeKind.GLOBAL,
+            action=PermissionGrant.Action.REVIEW,
+            effect=PermissionGrant.Effect.DENY,
+            valid_from=now - timedelta(minutes=1),
+            valid_until=now + timedelta(hours=1),
+            granted_by_principal=self.owner,
+        )
+        assert_raw_owner_approval_rejected(
+            owner_review_grant,
+            exact_edit_grant=owner_edit_grant,
+        )
+        PermissionGrant.objects.filter(pk=review_deny.pk).update(
+            grant_status=PermissionGrant.GrantStatus.SUSPENDED
+        )
+
+        with self.assertRaisesMessage(ValidationError, "non-empty"):
+            ReviewDecision.record_final(
+                submission=submission,
+                decision=ReviewDecision.Decision.APPROVED,
+                rationale="   ",
+                command_id=uuid7(),
+                expected_task_version=self.task.state_version,
+                reviewer_principal=self.owner,
+                acting_role=ActingRole.OWNER,
+                permission_grant=owner_review_grant,
+                recorded_by_principal=self.owner,
+                owner_edit_grant=owner_edit_grant,
+            )
+
+        with self.assertRaisesMessage(ValidationError, "exact Product EDIT grant"):
+            ReviewDecision.record_final(
+                submission=submission,
+                decision=ReviewDecision.Decision.APPROVED,
+                rationale="The application path must bind the exact EDIT grant.",
+                command_id=uuid7(),
+                expected_task_version=self.task.state_version,
+                reviewer_principal=self.owner,
+                acting_role=ActingRole.OWNER,
+                permission_grant=owner_review_grant,
+                recorded_by_principal=self.owner,
+            )
+
+        owner_review_command = uuid7()
+        review = ReviewDecision.record_final(
+            submission=submission,
+            decision=ReviewDecision.Decision.APPROVED,
+            rationale="Owner explicitly approved their own final content.",
+            command_id=owner_review_command,
+            expected_task_version=self.task.state_version,
+            reviewer_principal=self.owner,
+            acting_role=ActingRole.OWNER,
+            permission_grant=owner_review_grant,
+            recorded_by_principal=self.owner,
+            owner_edit_grant=owner_edit_grant,
+        )
+        self.assertEqual(review.reviewer_principal, self.owner)
+        self.assertEqual(review.submission.submitted_by_principal, self.owner)
+        self.assertEqual(review.reviewer_grant, owner_review_grant)
+        self.assertEqual(review.owner_edit_grant, owner_edit_grant)
+        self.assertEqual(
+            review.payload_schema_version,
+            ReviewDecision.PayloadSchemaVersion.V3,
+        )
+        self.assertEqual(
+            review.command_payload()["owner_edit_grant_id"],
+            str(owner_edit_grant.pk),
+        )
+        self.assertEqual(review.reviewer_acting_role, ActingRole.OWNER)
+
+        alternate_edit_grant = PermissionGrant.objects.create(
+            principal=self.owner,
+            scope_kind=PermissionGrant.ScopeKind.PRODUCT,
+            product=self.product,
+            action=PermissionGrant.Action.EDIT,
+            valid_from=now - timedelta(minutes=1),
+            valid_until=now + timedelta(hours=1),
+            granted_by_principal=self.owner,
+        )
+        with self.assertRaisesMessage(ValidationError, "different review command"):
+            ReviewDecision.record_final(
+                submission=submission,
+                decision=ReviewDecision.Decision.APPROVED,
+                rationale="Owner explicitly approved their own final content.",
+                command_id=owner_review_command,
+                expected_task_version=self.task.state_version,
+                reviewer_principal=self.owner,
+                acting_role=ActingRole.OWNER,
+                permission_grant=owner_review_grant,
+                recorded_by_principal=self.owner,
+                owner_edit_grant=alternate_edit_grant,
+            )
+
+        Task.transition(
+            task_id=self.task.pk,
+            to_state=Task.State.APPROVED,
+            command_id=uuid7(),
+            expected_state_version=self.task.state_version,
+            actor_principal=self.owner,
+            acting_role=ActingRole.OWNER,
+            permission_grant=owner_edit_grant,
+            recorded_by_principal=self.owner,
+            reason="Owner final approval recorded.",
+        )
+        self.task.refresh_from_db()
+        self.assertEqual(self.task.current_state, Task.State.APPROVED)
+
     def test_self_review_is_rejected_and_record_final_is_the_only_orm_write_path(self):
         asset = self._asset()
         submission = self._submission(version=self._version(asset, 1), dod=self._dod(1))
@@ -548,6 +1109,23 @@ class ContentOpsInvariantTests(TestCase):
                 recorded_by_principal=self.recorder,
             )
         self.assertFalse(ReviewDecision.objects.filter(submission=submission).exists())
+
+        with self.assertRaisesMessage(
+            ValidationError,
+            "may only be recorded for an Owner approving their own submission",
+        ):
+            ReviewDecision.record_final(
+                submission=submission,
+                decision=ReviewDecision.Decision.APPROVED,
+                rationale="A non-self review must not claim an Owner EDIT audit grant.",
+                command_id=uuid7(),
+                expected_task_version=self.task.state_version,
+                reviewer_principal=self.reviewer,
+                acting_role=ActingRole.OPERATIONS_ADMIN,
+                permission_grant=self.review_grant,
+                recorded_by_principal=self.recorder,
+                owner_edit_grant=self.edit_grant,
+            )
 
         direct = ReviewDecision(
             submission=submission,
@@ -580,6 +1158,29 @@ class ContentOpsInvariantTests(TestCase):
         raw.decision_sha256 = raw.payload_hash
         with self.assertRaises(IntegrityError), transaction.atomic():
             models.Model.save_base(raw, raw=True, force_insert=True, using="default")
+
+        raw_non_self = ReviewDecision(
+            submission=submission,
+            decision=ReviewDecision.Decision.APPROVED,
+            rationale="Raw non-self misuse of the Owner EDIT audit field.",
+            command_id=uuid7(),
+            expected_task_version=self.task.state_version,
+            reviewer_principal=self.reviewer,
+            reviewer_acting_role=ActingRole.OPERATIONS_ADMIN,
+            reviewer_grant=self.review_grant,
+            owner_edit_grant=self.edit_grant,
+            recorded_by_principal=self.recorder,
+            decided_at=timezone.now(),
+        )
+        raw_non_self.payload_hash = canonical_sha256(raw_non_self.command_payload())
+        raw_non_self.decision_sha256 = raw_non_self.payload_hash
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            models.Model.save_base(
+                raw_non_self,
+                raw=True,
+                force_insert=True,
+                using="default",
+            )
 
     def test_review_replay_binds_exact_reviewer_role_and_grant(self):
         asset = self._asset()

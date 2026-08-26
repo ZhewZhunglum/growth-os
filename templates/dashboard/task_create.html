@@ -1,26 +1,27 @@
 {% extends "base.html" %}
-{% block title %}新建任务 · PUKO Growth OS{% endblock %}
-{% block page_title %}新建任务{% endblock %}
+{% load ui_i18n %}
+{% block title %}{% ui '新建任务' 'Create task' %} · PUKO Growth OS{% endblock %}
+{% block page_title %}{% ui '新建任务' 'Create task' %}{% endblock %}
 {% block content %}
-<a class="back-link" href="{% url 'dashboard:home' %}">← 返回今日任务</a>
+<a class="back-link" href="{% url 'dashboard:home' %}">← {% ui '返回今日任务' 'Back to Today' %}</a>
 <section class="task-detail-hero">
-    <div><p class="eyebrow">负责人 / 运营主管</p><h2>从已封存规则创建一项草稿任务</h2><p>这里只定义任务名称和为什么做。开工条件、交付标准与发布门禁来自你选择的精确合同版本，创建后不会自动分配、审核或发布。</p></div>
-    <div class="status-pill"><span></span> 受控编辑授权</div>
+    <div><p class="eyebrow">{% ui '负责人 / 运营主管' 'Owner / operations admin' %}</p><h2>{% ui '从已封存规则创建一项草稿任务' 'Create a draft task from sealed rules' %}</h2><p>{% ui '这里只定义任务名称和为什么做。开工条件、交付标准与发布门禁来自你选择的精确合同版本，创建后不会自动分配、审核或发布。' 'Define the task name and purpose here. Readiness checks, delivery criteria, and release rules come from the exact contract version you select. Creating a draft does not assign, review, or publish it.' %}</p></div>
+    <div class="status-pill"><span></span> {% ui '受控编辑授权' 'Controlled edit access' %}</div>
 </section>
 <section class="detail-columns create-task-layout">
     <article class="detail-panel">
-        <p class="eyebrow">安全边界</p><h3>系统会替你检查什么</h3>
-        <ul class="plain-list"><li>产品配置必须是当前已经封存的版本。</li><li>任务合同必须是该配置的最新精确版本。</li><li>每次提交都会重新检查“创建任务”权限。</li><li>新任务固定从“草稿”、未分配、状态版本 0 开始。</li><li>重复提交同一命令不会创建第二项任务。</li></ul>
+        <p class="eyebrow">{% ui '安全边界' 'Safety checks' %}</p><h3>{% ui '系统会替你检查什么' 'What the system checks' %}</h3>
+        <ul class="plain-list"><li>{% ui '产品配置必须是当前已经封存的版本。' 'The product profile must be the current sealed version.' %}</li><li>{% ui '任务合同必须是该配置的最新精确版本。' 'The task contract must be the latest exact version for that profile.' %}</li><li>{% ui '每次提交都会重新检查“创建任务”权限。' 'Every submission rechecks Create Task access.' %}</li><li>{% ui '新任务固定从“草稿”、未分配、状态版本 0 开始。' 'Every new task starts unassigned as Draft at state version 0.' %}</li><li>{% ui '重复提交同一命令不会创建第二项任务。' 'Repeating the same command will not create a duplicate task.' %}</li></ul>
     </article>
     <article class="detail-panel action-panel">
-        <p class="eyebrow">任务说明</p><h3>填写任务背景</h3>
+        <p class="eyebrow">{% ui '任务说明' 'Task brief' %}</p><h3>{% ui '填写任务背景' 'Describe the task' %}</h3>
         <form class="task-action-form" method="post">
             {% csrf_token %}{{ form.task_id }}{{ form.command_id }}{{ form.task_token }}{{ form.non_field_errors }}
             {% for field in form.visible_fields %}<div class="field-row">{{ field.label_tag }}{{ field }}{{ field.errors }}{% if field.help_text %}<small>{{ field.help_text }}</small>{% endif %}</div>{% endfor %}
             {% if form.task_id.errors %}<div class="field-row">{{ form.task_id.errors }}</div>{% endif %}
             {% if form.command_id.errors %}<div class="field-row">{{ form.command_id.errors }}</div>{% endif %}
             {% if form.task_token.errors %}<div class="field-row">{{ form.task_token.errors }}</div>{% endif %}
-            <button class="button button-primary" type="submit">创建草稿任务</button>
+            <button class="button button-primary" type="submit">{% ui '创建草稿任务' 'Create draft task' %}</button>
         </form>
     </article>
 </section>

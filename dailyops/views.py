@@ -7,11 +7,13 @@ from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth.decorators import login_required
 from django.core.exceptions import ImproperlyConfigured, PermissionDenied, ValidationError
+from django.db import transaction
+from django.db.models import Count, F, Q
 from django.http import Http404, HttpRequest, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
 from django.utils import timezone
-from django.views.decorators.http import require_POST
+from django.views.decorators.http import require_POST, require_http_methods
 
 from accounts.authorization import require_authorization, resolve_authorization
 from accounts.models import PermissionGrant, Principal
@@ -22,6 +24,8 @@ from intelligence.models import (
     AvailabilityState,
     ChannelPlan,
     CollectionRun,
+    DataDomain,
+    DecisionState,
     ExternalEvidenceItem,
     Initiative,
     ProductOpportunity,
@@ -37,15 +41,19 @@ from products.models import Product
 from releasegate.models import ChannelAccount
 
 from dailyops.forms import (
+    BatchDispositionForm,
     CSVTextForm,
     ChannelPlanForm,
     CommandForm,
     CompileTaskForm,
     DailyBatchForm,
+    EvidenceCorrectionForm,
     ManualEvidenceForm,
     TransitionForm,
 )
-from dailyops.evidence_services import invalidate_evidence
+from dailyops.disposition import batch_disposition, dispose_daily_batch, lock_daily_batch_runs
+from dailyops.evidence_services import ensure_batch_evidence_editable, invalidate_evidence
+from dailyops.models import DailyBatchDispositionEvent
 from dailyops.deployment import build_web_daily_operations_runtime
 from dailyops.services import (
     PLATFORMS,
@@ -54,11 +62,13 @@ from dailyops.services import (
     batch_runs,
     compile_channel_plan_task,
     confirm_channel_plan_and_compile_task,
+    correct_manual_evidence,
     create_channel_plan,
     create_initiative_from_opportunity,
     ensure_default_sources,
     ingest_csv_text,
     ingest_manual_link,
+    proposal_matches_evidence,
     propose_daily_analysis,
     run_automatic_collection,
     run_platform_collection,
@@ -101,6 +111,17 @@ def _visible_products(user: Principal):
         for product in Product.objects.filter(product_status=Product.ProductStatus.ACTIVE).order_by("name")
         if _can_product(user, product, PermissionGrant.Action.VIEW)
         or _can_product(user, product, PermissionGrant.Action.EDIT)
+    ]
+    return Product.objects.filter(pk__in=ids).order_by("name")
+
+
+def _editable_products(user: Principal):
+    if not getattr(user, "can_authenticate", False):
+        return Product.objects.none()
+    ids = [
+        product.pk
+        for product in Product.objects.filter(product_status=Product.ProductStatus.ACTIVE).order_by("name")
+        if _can_product(user, product, PermissionGrant.Action.EDIT)
     ]
     return Product.objects.filter(pk__in=ids).order_by("name")
 
@@ -207,15 +228,111 @@ def _command_form(data) -> CommandForm:
     return form
 
 
+def _require_active_batch(*, batch_key, product: Product) -> None:
+    lock_daily_batch_runs(batch_key=batch_key, product=product)
+    if batch_disposition(batch_key=batch_key, product=product) is not None:
+        raise PermissionDenied("这次工作已经删除草稿或归档，只能查看历史，不能继续修改。")
+
+
+def _can_dispose_batch(user: Principal, product: Product) -> bool:
+    if user.role not in {Principal.Role.OWNER, Principal.Role.OPERATIONS_ADMIN}:
+        return False
+    decision = resolve_authorization(
+        principal=user,
+        acting_role=user.role,
+        action=PermissionGrant.Action.CANCEL_TASK,
+        scope_kind=PermissionGrant.ScopeKind.PRODUCT,
+        product=product,
+    )
+    return bool(
+        decision.allowed
+        and decision.grant
+        and decision.grant.scope_kind == PermissionGrant.ScopeKind.PRODUCT
+        and decision.grant.product_id == product.pk
+    )
+
+
+def _data_recommendations(*, products) -> tuple[dict, ...]:
+    """Return only current, externally-sourced opportunities in visible Products."""
+
+    product_ids = tuple(products.values_list("pk", flat=True))
+    if not product_ids:
+        return ()
+    allowed_states = (
+        ProductOpportunity.State.PROPOSED,
+        ProductOpportunity.State.TRIAGED,
+        ProductOpportunity.State.APPROVED,
+    )
+    opportunities = (
+        ProductOpportunity.objects.filter(
+            product_id__in=product_ids,
+            current_state__in=allowed_states,
+            topic__decision_state=DecisionState.APPROVED,
+            topic__superseded_by__isnull=True,
+            demand_assessment__data_domain=DataDomain.EXTERNAL_DEMAND,
+            demand_assessment__decision_state=DecisionState.APPROVED,
+            demand_assessment__availability_state=AvailabilityState.PRESENT,
+            demand_assessment__superseded_by__isnull=True,
+            product_topic_fit_assessment__decision_state=DecisionState.APPROVED,
+            product_topic_fit_assessment__superseded_by__isnull=True,
+        )
+        .annotate(
+            evidence_count=Count("demand_assessment__evidence_links", distinct=True),
+            valid_evidence_count=Count(
+                "demand_assessment__evidence_links",
+                filter=Q(
+                    demand_assessment__evidence_links__evidence_item__data_domain=DataDomain.EXTERNAL_DEMAND,
+                    demand_assessment__evidence_links__evidence_item__invalidation_event__isnull=True,
+                ),
+                distinct=True,
+            ),
+        )
+        .filter(evidence_count__gt=0, valid_evidence_count=F("evidence_count"))
+        .select_related("product", "topic", "demand_assessment")
+        .order_by("-priority_score", "-demand_assessment__demand_score", "-created_at")[:12]
+    )
+    disposed_keys = set(
+        DailyBatchDispositionEvent.objects.filter(product_id__in=product_ids).values_list(
+            "batch_key", flat=True
+        )
+    )
+    recommendations = []
+    for opportunity in opportunities:
+        batch_key = None
+        try:
+            batch_key = _opportunity_batch_key(opportunity)
+        except (ValidationError, ValueError):
+            pass
+        if batch_key in disposed_keys:
+            continue
+        recommendations.append(
+            {
+                "opportunity": opportunity,
+                "product": opportunity.product,
+                "query": opportunity.topic.label or opportunity.title,
+                "batch_key": batch_key,
+            }
+        )
+        if len(recommendations) >= 3:
+            break
+    return tuple(recommendations)
+
+
 @login_required
 def home(request: HttpRequest) -> HttpResponse:
     products = _visible_products(request.user)
-    form = DailyBatchForm(products=products, language_code=request.LANGUAGE_CODE)
+    editable_products = _editable_products(request.user)
+    form = DailyBatchForm(products=editable_products, language_code=request.LANGUAGE_CODE)
     visible_ids = {str(pk) for pk in products.values_list("pk", flat=True)}
+    disposed_keys = set(
+        DailyBatchDispositionEvent.objects.filter(product_id__in=visible_ids).values_list(
+            "batch_key", flat=True
+        )
+    )
     recent: OrderedDict[uuid.UUID, dict] = OrderedDict()
     for run in CollectionRun.objects.select_related("source").order_by("-created_at")[:300]:
         product_id = str(run.query_spec.get("product_id", ""))
-        if product_id not in visible_ids or run.batch_key in recent:
+        if product_id not in visible_ids or run.batch_key in recent or run.batch_key in disposed_keys:
             continue
         product = next((item for item in products if str(item.pk) == product_id), None)
         if product:
@@ -224,6 +341,12 @@ def home(request: HttpRequest) -> HttpResponse:
                 "product": product,
                 "query": run.query_spec.get("query", ""),
                 "created_at": run.created_at,
+                "has_formal_execution": Initiative.objects.filter(
+                    opportunity__opportunity_key=f"daily-{run.batch_key.hex}",
+                    opportunity__product=product,
+                ).exists(),
+                "can_dispose": _can_dispose_batch(request.user, product),
+                "disposition_command_id": uuid.uuid4(),
             }
         if len(recent) >= 20:
             break
@@ -239,6 +362,8 @@ def home(request: HttpRequest) -> HttpResponse:
         {
             "form": form,
             "recent_batches": recent.values(),
+            "data_recommendations": _data_recommendations(products=editable_products),
+            "can_start_batch": editable_products.exists(),
             "configured_source_count": SourceRegistry.objects.filter(
                 status=SourceRegistry.Status.ACTIVE,
                 source_key__startswith="daily-",
@@ -306,6 +431,7 @@ def batch_start(request: HttpRequest) -> HttpResponse:
 @login_required
 def batch_detail(request: HttpRequest, product_id, batch_key) -> HttpResponse:
     product = _product_for_user(request.user, product_id)
+    can_edit_batch = _can_product(request.user, product, PermissionGrant.Action.EDIT)
     try:
         runs = batch_runs(batch_key=batch_key, product=product)
     except ValidationError as error:
@@ -316,6 +442,7 @@ def batch_detail(request: HttpRequest, product_id, batch_key) -> HttpResponse:
             collection_run_id__in=run_ids,
             invalidation_event__isnull=True,
         )
+        .filter(Q(expires_at__isnull=True) | Q(expires_at__gt=timezone.now()))
         .select_related("source")
         .order_by("-observed_at", "id")
     )
@@ -350,6 +477,9 @@ def batch_detail(request: HttpRequest, product_id, batch_key) -> HttpResponse:
         )
         .order_by("-version_number")
         .first()
+    )
+    proposal_is_stale = bool(
+        proposal and not proposal_matches_evidence(proposal=proposal, evidence=evidence)
     )
     opportunity = ProductOpportunity.objects.filter(opportunity_key=f"daily-{batch_key.hex}").first()
     initiative = opportunity.initiatives.order_by("created_at").first() if opportunity else None
@@ -394,6 +524,7 @@ def batch_detail(request: HttpRequest, product_id, batch_key) -> HttpResponse:
         "platform_cards": cards,
         "evidence": evidence,
         "proposal": proposal,
+        "proposal_is_stale": proposal_is_stale,
         "opportunity": opportunity,
         "initiative": initiative,
         "plans": plans,
@@ -410,8 +541,64 @@ def batch_detail(request: HttpRequest, product_id, batch_key) -> HttpResponse:
         "task_id": uuid.uuid4(),
         "current_step": current_step,
         "owner_start_command_id": uuid.uuid4(),
+        "batch_disposition": batch_disposition(batch_key=batch_key, product=product),
+        "can_edit_batch": can_edit_batch,
     }
     return render(request, "dailyops/batch_detail.html", context)
+
+
+@login_required
+@require_POST
+def batch_dispose(request: HttpRequest, product_id, batch_key) -> HttpResponse:
+    product = _product_for_user(request.user, product_id)
+    form = BatchDispositionForm(request.POST)
+    if not form.is_valid():
+        messages.error(
+            request,
+            _copy(request, "没有隐藏这次工作：", "This run was not hidden: ")
+            + "；".join(_form_error_messages(form)),
+        )
+        return redirect("dailyops:home")
+    try:
+        result = dispose_daily_batch(
+            batch_key=batch_key,
+            product=product,
+            command_id=form.cleaned_data["command_id"],
+            reason=form.cleaned_data["reason"],
+            principal=request.user,
+            acting_role=request.user.role,
+        )
+        if result.event.disposition == DailyBatchDispositionEvent.Disposition.ABANDONED:
+            chinese = (
+                "这次草稿已从最近工作隐藏；采集和审计历史仍保留。"
+                if result.created
+                else "这次草稿此前已经隐藏。"
+            )
+            english = (
+                "The draft is hidden from Recent work; collection and audit history remain."
+                if result.created
+                else "This draft was already hidden."
+            )
+        else:
+            chinese = (
+                "这次工作已从最近工作隐藏；已有项目、计划和任务均保留。"
+                if result.created
+                else "这次工作此前已经从最近工作隐藏。"
+            )
+            english = (
+                "This run is hidden from Recent work; its project, plans, and tasks remain."
+                if result.created
+                else "This run was already hidden from Recent work."
+            )
+        messages.success(request, _copy(request, chinese, english))
+    except (ValidationError, IntelligenceError, PermissionDenied) as error:
+        if isinstance(error, PermissionDenied):
+            raise
+        messages.error(
+            request,
+            _copy(request, "不能隐藏这次工作：", "This run cannot be hidden: ") + _error_text(error),
+        )
+    return redirect("dailyops:home")
 
 
 @login_required
@@ -511,9 +698,11 @@ def platform_collect(request: HttpRequest, product_id, batch_key, platform_code)
 
 @login_required
 @require_POST
+@transaction.atomic
 def evidence_manual(request: HttpRequest, product_id, batch_key, platform_code) -> HttpResponse:
     product = _product_for_user(request.user, product_id)
     _require_edit(request.user, product)
+    _require_active_batch(batch_key=batch_key, product=product)
     expected_platform = _platform(platform_code)
     form = ManualEvidenceForm(
         request.POST,
@@ -558,9 +747,11 @@ def evidence_manual(request: HttpRequest, product_id, batch_key, platform_code) 
 
 @login_required
 @require_POST
+@transaction.atomic
 def evidence_manual_unified(request: HttpRequest, product_id, batch_key) -> HttpResponse:
     product = _product_for_user(request.user, product_id)
     _require_edit(request.user, product)
+    _require_active_batch(batch_key=batch_key, product=product)
     form = ManualEvidenceForm(request.POST, language_code=request.LANGUAGE_CODE)
     if not form.is_valid():
         messages.error(
@@ -599,10 +790,93 @@ def evidence_manual_unified(request: HttpRequest, product_id, batch_key) -> Http
 
 
 @login_required
+@require_http_methods(["GET", "POST"])
+@transaction.atomic
+def evidence_correct(request: HttpRequest, product_id, batch_key, evidence_id) -> HttpResponse:
+    product = _product_for_user(request.user, product_id)
+    _require_edit(request.user, product)
+    _require_active_batch(batch_key=batch_key, product=product)
+    evidence = get_object_or_404(
+        ExternalEvidenceItem.objects.select_related("source", "collection_run"),
+        pk=evidence_id,
+        invalidation_event__isnull=True,
+    )
+    if (
+        evidence.source.source_kind != SourceRegistry.SourceKind.MANUAL_LINK
+        or str(evidence.collection_run.batch_key) != str(batch_key)
+        or str(evidence.collection_run.query_spec.get("product_id", "")) != str(product.pk)
+    ):
+        raise Http404("Correctable manual evidence not found.")
+    try:
+        ensure_batch_evidence_editable(batch_key=batch_key, product=product)
+    except ValidationError as error:
+        messages.error(request, _error_text(error))
+        return redirect(_batch_url(product, batch_key))
+
+    if request.method == "POST":
+        form = EvidenceCorrectionForm(request.POST, language_code=request.LANGUAGE_CODE)
+        if form.is_valid():
+            try:
+                result = correct_manual_evidence(
+                    evidence_id=evidence.pk,
+                    batch_key=batch_key,
+                    product=product,
+                    command_id=form.cleaned_data["command_id"],
+                    platform=form.cleaned_data["platform"],
+                    external_url=form.cleaned_data["external_url"],
+                    external_content_id=form.cleaned_data["external_content_id"],
+                    title=form.cleaned_data["title"],
+                    content_text=form.cleaned_data["content_text"],
+                    collected_at=form.cleaned_data["collected_at"],
+                    reason=form.cleaned_data["reason"],
+                    principal=request.user,
+                    acting_role=request.user.role,
+                )
+                messages.success(
+                    request,
+                    _copy(
+                        request,
+                        "线索已更正；旧记录仍保留。请根据最新线索重新生成建议。",
+                        "Signal corrected; the old record remains. Regenerate the suggestion from current signals.",
+                    ),
+                )
+                return redirect(_batch_url(product, batch_key))
+            except (ValidationError, IntelligenceError, IngestionValidationError) as error:
+                form.add_error(None, _error_text(error))
+    else:
+        initial_reference = evidence.external_url or evidence.external_content_id
+        form = EvidenceCorrectionForm(
+            initial={
+                "command_id": uuid.uuid4(),
+                "collected_at": timezone.now(),
+                "reference": initial_reference,
+                "platform": evidence.platform_code,
+                "title": evidence.title,
+                "content_text": evidence.excerpt,
+                "reason": "",
+            },
+            language_code=request.LANGUAGE_CODE,
+        )
+
+    return render(
+        request,
+        "dailyops/evidence_correct.html",
+        {
+            "product": product,
+            "batch_key": batch_key,
+            "evidence": evidence,
+            "form": form,
+        },
+    )
+
+
+@login_required
 @require_POST
+@transaction.atomic
 def evidence_csv(request: HttpRequest, product_id, batch_key, platform_code) -> HttpResponse:
     product = _product_for_user(request.user, product_id)
     _require_edit(request.user, product)
+    _require_active_batch(batch_key=batch_key, product=product)
     expected_platform = _platform(platform_code)
     form = CSVTextForm(
         request.POST,
@@ -643,9 +917,11 @@ def evidence_csv(request: HttpRequest, product_id, batch_key, platform_code) -> 
 
 @login_required
 @require_POST
+@transaction.atomic
 def evidence_csv_unified(request: HttpRequest, product_id, batch_key) -> HttpResponse:
     product = _product_for_user(request.user, product_id)
     _require_edit(request.user, product)
+    _require_active_batch(batch_key=batch_key, product=product)
     form = CSVTextForm(request.POST, language_code=request.LANGUAGE_CODE)
     if not form.is_valid():
         messages.error(
@@ -681,9 +957,11 @@ def evidence_csv_unified(request: HttpRequest, product_id, batch_key) -> HttpRes
 
 @login_required
 @require_POST
+@transaction.atomic
 def evidence_invalidate(request: HttpRequest, product_id, batch_key, evidence_id) -> HttpResponse:
     product = _product_for_user(request.user, product_id)
     _require_edit(request.user, product)
+    _require_active_batch(batch_key=batch_key, product=product)
     try:
         command = _command_form(request.POST)
         result = invalidate_evidence(
@@ -715,9 +993,11 @@ def evidence_invalidate(request: HttpRequest, product_id, batch_key, evidence_id
 
 @login_required
 @require_POST
+@transaction.atomic
 def analysis_propose(request: HttpRequest, product_id, batch_key) -> HttpResponse:
     product = _product_for_user(request.user, product_id)
     _require_edit(request.user, product)
+    _require_active_batch(batch_key=batch_key, product=product)
     try:
         _command_form(request.POST)
         proposal = propose_daily_analysis(
@@ -745,9 +1025,11 @@ def analysis_propose(request: HttpRequest, product_id, batch_key) -> HttpRespons
 
 @login_required
 @require_POST
+@transaction.atomic
 def analysis_accept(request: HttpRequest, product_id, batch_key, proposal_id) -> HttpResponse:
     product = _product_for_user(request.user, product_id)
     _require_edit(request.user, product)
+    _require_active_batch(batch_key=batch_key, product=product)
     proposal = get_object_or_404(SignalAssessment, pk=proposal_id)
     try:
         _command_form(request.POST)
@@ -775,11 +1057,13 @@ def analysis_accept(request: HttpRequest, product_id, batch_key, proposal_id) ->
 
 @login_required
 @require_POST
+@transaction.atomic
 def analysis_accept_and_start(request: HttpRequest, product_id, batch_key, proposal_id) -> HttpResponse:
     """Owner shortcut: one click, separate immutable planning facts."""
 
     product = _product_for_user(request.user, product_id)
     _require_edit(request.user, product)
+    _require_active_batch(batch_key=batch_key, product=product)
     proposal = get_object_or_404(SignalAssessment, pk=proposal_id)
     try:
         form = _command_form(request.POST)
@@ -813,10 +1097,12 @@ def analysis_accept_and_start(request: HttpRequest, product_id, batch_key, propo
 
 @login_required
 @require_POST
+@transaction.atomic
 def opportunity_transition(request: HttpRequest, opportunity_id) -> HttpResponse:
     opportunity = get_object_or_404(ProductOpportunity.objects.select_related("product"), pk=opportunity_id)
     product = _product_for_user(request.user, opportunity.product_id)
     _require_edit(request.user, product)
+    _require_active_batch(batch_key=_opportunity_batch_key(opportunity), product=product)
     form = TransitionForm(request.POST)
     try:
         if not form.is_valid():
@@ -848,10 +1134,12 @@ def opportunity_transition(request: HttpRequest, opportunity_id) -> HttpResponse
 
 @login_required
 @require_POST
+@transaction.atomic
 def initiative_create(request: HttpRequest, opportunity_id) -> HttpResponse:
     opportunity = get_object_or_404(ProductOpportunity.objects.select_related("product"), pk=opportunity_id)
     product = _product_for_user(request.user, opportunity.product_id)
     _require_edit(request.user, product)
+    _require_active_batch(batch_key=_opportunity_batch_key(opportunity), product=product)
     try:
         form = _command_form(request.POST)
         initiative = create_initiative_from_opportunity(
@@ -879,10 +1167,12 @@ def initiative_create(request: HttpRequest, opportunity_id) -> HttpResponse:
 
 @login_required
 @require_POST
+@transaction.atomic
 def initiative_transition(request: HttpRequest, initiative_id) -> HttpResponse:
     initiative = get_object_or_404(Initiative.objects.select_related("product", "opportunity"), pk=initiative_id)
     product = _product_for_user(request.user, initiative.product_id)
     _require_edit(request.user, product)
+    _require_active_batch(batch_key=_opportunity_batch_key(initiative.opportunity), product=product)
     form = TransitionForm(request.POST)
     try:
         if not form.is_valid():
@@ -914,10 +1204,12 @@ def initiative_transition(request: HttpRequest, initiative_id) -> HttpResponse:
 
 @login_required
 @require_POST
+@transaction.atomic
 def plan_create(request: HttpRequest, initiative_id) -> HttpResponse:
     initiative = get_object_or_404(Initiative.objects.select_related("product", "opportunity"), pk=initiative_id)
     product = _product_for_user(request.user, initiative.product_id)
     _require_edit(request.user, product)
+    _require_active_batch(batch_key=_opportunity_batch_key(initiative.opportunity), product=product)
     accounts = _collectible_accounts(request.user, product)
     form = ChannelPlanForm(
         request.POST,
@@ -960,12 +1252,14 @@ def plan_create(request: HttpRequest, initiative_id) -> HttpResponse:
 
 @login_required
 @require_POST
+@transaction.atomic
 def plan_transition(request: HttpRequest, plan_id) -> HttpResponse:
     plan = get_object_or_404(
         ChannelPlan.objects.select_related("initiative__product", "initiative__opportunity"), pk=plan_id
     )
     product = _product_for_user(request.user, plan.initiative.product_id)
     _require_edit(request.user, product)
+    _require_active_batch(batch_key=_opportunity_batch_key(plan.initiative.opportunity), product=product)
     form = TransitionForm(request.POST)
     try:
         if not form.is_valid():
@@ -997,12 +1291,14 @@ def plan_transition(request: HttpRequest, plan_id) -> HttpResponse:
 
 @login_required
 @require_POST
+@transaction.atomic
 def plan_compile(request: HttpRequest, plan_id) -> HttpResponse:
     plan = get_object_or_404(
         ChannelPlan.objects.select_related("initiative__product", "initiative__opportunity"), pk=plan_id
     )
     product = _product_for_user(request.user, plan.initiative.product_id)
     _require_edit(request.user, product)
+    _require_active_batch(batch_key=_opportunity_batch_key(plan.initiative.opportunity), product=product)
     form = CompileTaskForm(request.POST)
     try:
         if not form.is_valid():
@@ -1037,6 +1333,7 @@ def plan_compile(request: HttpRequest, plan_id) -> HttpResponse:
 
 @login_required
 @require_POST
+@transaction.atomic
 def plan_confirm_and_compile(request: HttpRequest, plan_id) -> HttpResponse:
     """Owner shortcut: confirm plan facts, activate, then compile one Task."""
 
@@ -1046,6 +1343,7 @@ def plan_confirm_and_compile(request: HttpRequest, plan_id) -> HttpResponse:
     )
     product = _product_for_user(request.user, plan.initiative.product_id)
     _require_edit(request.user, product)
+    _require_active_batch(batch_key=_opportunity_batch_key(plan.initiative.opportunity), product=product)
     form = CompileTaskForm(request.POST)
     try:
         if not form.is_valid():

@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% load ui_i18n %}
+{% block title %}{% ui '更正线索' 'Correct signal' %} · {{ product.name }}{% endblock %}
+{% block page_title %}{% ui '更正线索' 'Correct signal' %}{% endblock %}
+{% block content %}
+<section class="section-stack section-stack-narrow">
+  <a class="back-link" href="{% url 'dailyops:batch-detail' product.id batch_key %}">← {% ui '返回这次工作' 'Back to this run' %}</a>
+  <header class="page-intro-card">
+    <p class="eyebrow">{% ui '人工补录 · 追加式更正' 'Manual entry · append-only correction' %}</p>
+    <h2>{% ui '修改这条补录内容' 'Correct this manual entry' %}</h2>
+    <p>{% ui '保存后，旧记录不会被改写或删除；系统会保留旧记录、追加作废原因，并创建一条新的正确线索。已有旧建议会变为过期，需要重新生成。' 'Saving does not overwrite or delete the old record. The system retains it, appends the invalidation reason, and creates a corrected signal. Any old suggestion becomes stale and must be regenerated.' %}</p>
+  </header>
+
+  <article class="config-card">
+    <form class="config-form" method="post">
+      {% csrf_token %}
+      {{ form.command_id }}{{ form.collected_at }}{{ form.external_url }}{{ form.external_content_id }}
+      {{ form.non_field_errors }}
+      <label><span>{% ui '链接或内容名称 / ID' 'Link, content name, or ID' %}</span>{{ form.reference }}{{ form.reference.errors }}</label>
+      <label><span>{% ui '平台' 'Platform' %}</span>{{ form.platform }}{{ form.platform.errors }}</label>
+      <label><span>{% ui '标题（可不填）' 'Title (optional)' %}</span>{{ form.title }}{{ form.title.errors }}</label>
+      <label><span>{% ui '补充说明（可不填）' 'Notes (optional)' %}</span>{{ form.content_text }}{{ form.content_text.errors }}</label>
+      <label><span>{% ui '为什么要更正' 'Why this correction is needed' %}</span>{{ form.reason }}{{ form.reason.errors }}</label>
+      <div class="form-actions">
+        <a class="button button-secondary" href="{% url 'dailyops:batch-detail' product.id batch_key %}">{% ui '不修改，返回' 'Cancel and return' %}</a>
+        <button class="button button-primary" type="submit">{% ui '保留旧记录并保存更正' 'Retain old record and save correction' %}</button>
+      </div>
+    </form>
+  </article>
+</section>
+{% endblock %}

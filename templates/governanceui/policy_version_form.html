@@ -1,18 +1,19 @@
 {% extends "base.html" %}
-{% block title %}追加候选规则版本 · PUKO{% endblock %}
-{% block page_title %}追加候选规则版本{% endblock %}
+{% load ui_i18n %}
+{% block title %}{% ui '追加候选规则版本' 'Add candidate rule version' %} · PUKO{% endblock %}
+{% block page_title %}{% ui '追加候选规则版本' 'Add candidate rule version' %}{% endblock %}
 {% block content %}
-<a class="back-link" href="{% url 'governanceui:home' %}">← 返回问题与规则治理</a>
+<a class="back-link" href="{% url 'governanceui:home' %}">← {% ui '返回问题与规则治理' 'Back to issues and rules' %}</a>
 <section class="detail-columns">
   <article class="detail-panel action-panel">
-    <p class="eyebrow">只追加，不覆盖</p>
-    <h3>封存一个确切候选版本</h3>
-    <form class="config-form" method="post">{% csrf_token %}{{ form.as_p }}<button class="button button-primary" type="submit">封存候选版本</button></form>
+    <p class="eyebrow">{% ui '只追加，不覆盖' 'Append only; never overwrite' %}</p>
+    <h3>{% ui '封存一个确切候选版本' 'Seal an exact candidate version' %}</h3>
+    <form class="config-form" method="post">{% csrf_token %}{{ form.as_p }}<button class="button button-primary" type="submit">{% ui '封存候选版本' 'Seal candidate version' %}</button></form>
   </article>
   <article class="detail-panel">
-    <p class="eyebrow">JSON 大白话</p>
-    <h3>required 表示是不是硬门槛</h3>
-    <p class="muted"><code>required: true</code> 表示不通过就不能发布；<code>false</code> 表示记录结果但不单独阻断。保存后版本号和校验哈希由系统生成，旧版本不能修改。</p>
+    <p class="eyebrow">{% ui 'JSON 大白话' 'JSON in plain language' %}</p>
+    <h3>{% ui 'required 表示是不是硬门槛' 'required controls whether the rule blocks publishing' %}</h3>
+    <p class="muted"><code>required: true</code> {% ui '表示不通过就不能发布；' 'means publishing is blocked when the check fails; ' %}<code>false</code> {% ui '表示记录结果但不单独阻断。保存后版本号和校验哈希由系统生成，旧版本不能修改。' 'records the result without blocking on its own. The system generates the version number and verification hash; old versions cannot be edited.' %}</p>
   </article>
 </section>
 {% endblock %}

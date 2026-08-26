@@ -204,3 +204,12 @@ def action_center_for(context, user):
     from dashboard.action_center import build_action_center
 
     return build_action_center(user)
+
+
+@register.simple_tag
+def feature_center_for(user, action_center=None):
+    """Build the permission-filtered feature map used by global navigation."""
+
+    from dashboard.feature_center import build_feature_center
+
+    return build_feature_center(user, action_center=action_center)

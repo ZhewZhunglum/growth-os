@@ -50,7 +50,21 @@ def _is_withdrawn(submission) -> bool:
     manager = getattr(submission, "withdrawal_events", None)
     if manager is None:
         return False
-    return manager.filter(event_type="SUBMISSION_WITHDRAWN").exists()
+    return manager.filter(
+        event_type__in={"SUBMISSION_WITHDRAWN", "SUBMISSION_ABANDONED"}
+    ).exists()
+
+
+def _is_owner_self_approval(review, submission) -> bool:
+    """Return whether a self-authored approval uses the explicit Owner path."""
+
+    return bool(
+        review is not None
+        and review.reviewer_principal_id == submission.submitted_by_principal_id
+        and review.decision == "APPROVED"
+        and review.reviewer_acting_role == "OWNER"
+        and getattr(review.reviewer_principal, "role", None) == "OWNER"
+    )
 
 
 def guard_submission(task, *, submission=None, dod_check_run=None) -> None:
@@ -91,7 +105,9 @@ def guard_review(task, *, submission) -> None:
     if latest is None or latest.pk != submission.pk or submission.task_id != task.pk:
         raise CheckGateRejected("Review requires the task's latest exact sealed submission.")
     if _is_withdrawn(submission):
-        raise CheckGateRejected("A withdrawn submission cannot receive a review decision.")
+        raise CheckGateRejected(
+            "A withdrawn or abandoned submission cannot receive a review decision."
+        )
 
 
 def guard_release_gate(task, *, submission, review_decision) -> None:
@@ -107,8 +123,13 @@ def guard_release_gate(task, *, submission, review_decision) -> None:
         or review_decision.decision != "APPROVED"
     ):
         raise CheckGateRejected("Release gate requires the exact final APPROVED human review.")
-    if review_decision.reviewer_principal_id == submission.submitted_by_principal_id:
-        raise CheckGateRejected("A self-reviewed submission can never pass the release gate.")
+    if (
+        review_decision.reviewer_principal_id == submission.submitted_by_principal_id
+        and not _is_owner_self_approval(review_decision, submission)
+    ):
+        raise CheckGateRejected(
+            "Only an explicit Owner self-approval may pass the release gate."
+        )
 
 
 def guard_manual_publication(task, *, publication) -> None:
@@ -154,7 +175,10 @@ def guard_transition_prerequisites(task, to_state: str) -> None:
             or review.submission_id != submission.pk
             or review.decision != required_decision
             or review.expected_task_version != task.state_version
-            or review.reviewer_principal_id == submission.submitted_by_principal_id
+            or (
+                review.reviewer_principal_id == submission.submitted_by_principal_id
+                and not _is_owner_self_approval(review, submission)
+            )
         ):
             raise CheckGateRejected(
                 f"{to_state} requires the latest submission's exact {required_decision} human review."

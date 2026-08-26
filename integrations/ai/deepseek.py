@@ -100,10 +100,26 @@ class DeepSeekV4Provider:
         usage_payload = response.payload.get("usage", {})
         input_tokens = _nonnegative_int(usage_payload.get("prompt_tokens", 0), "prompt_tokens")
         output_tokens = _nonnegative_int(usage_payload.get("completion_tokens", 0), "completion_tokens")
+        cached_input_tokens = _nonnegative_int(
+            usage_payload.get("prompt_cache_hit_tokens", 0), "prompt_cache_hit_tokens"
+        )
+        cache_miss_value = usage_payload.get("prompt_cache_miss_tokens")
+        if cache_miss_value is not None:
+            cache_miss_tokens = _nonnegative_int(cache_miss_value, "prompt_cache_miss_tokens")
+            if cached_input_tokens + cache_miss_tokens != input_tokens:
+                raise ProviderResponseError(
+                    "DeepSeek cache hit and miss tokens must equal prompt_tokens"
+                )
+        if cached_input_tokens > input_tokens:
+            raise ProviderResponseError(
+                "DeepSeek usage.prompt_cache_hit_tokens cannot exceed prompt_tokens"
+            )
         total_tokens = _nonnegative_int(
             usage_payload.get("total_tokens", input_tokens + output_tokens), "total_tokens"
         )
-        actual_cost = self.config.pricing.estimate(input_tokens, output_tokens)
+        actual_cost = self.config.pricing.estimate(
+            input_tokens, output_tokens, cached_input_tokens=cached_input_tokens
+        )
         return AIResult(
             status=AIExecutionStatus.SUCCEEDED,
             provider=self.provider_name,
@@ -116,37 +132,59 @@ class DeepSeekV4Provider:
                 output_tokens=output_tokens,
                 total_tokens=total_tokens,
                 estimated_cost_usd=float(actual_cost),
+                cached_input_tokens=cached_input_tokens,
             ),
             provider_request_id=response.request_id or _optional_string(response.payload.get("id")),
         )
 
 
 def _openai_payload(model: str, request: AIRequest) -> dict[str, Any]:
+    messages = [{"role": item.role, "content": item.content} for item in request.messages]
+    messages.insert(0, {"role": "system", "content": _json_output_instruction(request)})
     return {
         "model": model,
-        "messages": [{"role": item.role, "content": item.content} for item in request.messages],
+        "messages": messages,
+        # V4 enables thinking by default. Structured JSON generation uses the
+        # non-thinking mode so temperature is effective and no hidden reasoning
+        # tokens consume the bounded output allowance.
+        "thinking": {"type": "disabled"},
         "temperature": request.temperature,
         "max_tokens": request.max_output_tokens,
-        "response_format": {
-            "type": "json_schema",
-            "json_schema": {
-                "name": request.output.name,
-                "strict": request.output.strict,
-                "schema": dict(request.output.schema),
-            },
-        },
+        # DeepSeek Chat Completions supports JSON Object mode, not OpenAI's
+        # response_format.json_schema envelope. The returned object is checked
+        # against the exact schema locally before it can enter the application.
+        "response_format": {"type": "json_object"},
         "stream": False,
-        "user": request.operation_key,
+        # DeepSeek's user_id accepts only a restricted character set and must
+        # not contain private user data. A fingerprint is stable, opaque and
+        # supports provider-side cache/scheduling isolation.
+        "user_id": f"growth-os-{request.fingerprint[:40]}",
     }
 
 
 def _parse_structured_output(payload: Mapping[str, Any], request: AIRequest) -> dict[str, Any]:
     try:
-        content = payload["choices"][0]["message"]["content"]
+        choice = payload["choices"][0]
+        finish_reason = choice["finish_reason"]
+        content = choice["message"]["content"]
     except (KeyError, IndexError, TypeError) as exc:
-        raise ProviderResponseError("DeepSeek response is missing choices[0].message.content") from exc
+        raise ProviderResponseError(
+            "DeepSeek response is missing choices[0] completion fields"
+        ) from exc
+    if finish_reason != "stop":
+        reasons = {
+            "length": "DeepSeek JSON output was truncated by the token limit",
+            "content_filter": "DeepSeek JSON output was blocked by content filtering",
+            "tool_calls": "DeepSeek unexpectedly returned a tool call for a JSON-only request",
+            "insufficient_system_resource": "DeepSeek interrupted generation due to insufficient resources",
+        }
+        raise ProviderResponseError(
+            reasons.get(str(finish_reason), f"DeepSeek returned unsupported finish_reason {finish_reason!r}")
+        )
     if not isinstance(content, str):
         raise ProviderResponseError("DeepSeek message content must be a JSON string")
+    if not content.strip():
+        raise StructuredOutputError("DeepSeek returned empty JSON content")
     try:
         value = json.loads(content)
     except json.JSONDecodeError as exc:
@@ -155,6 +193,59 @@ def _parse_structured_output(payload: Mapping[str, Any], request: AIRequest) -> 
         raise StructuredOutputError("DeepSeek structured output root must be an object")
     validate_json_schema(value, request.output.schema)
     return value
+
+
+def _json_output_instruction(request: AIRequest) -> str:
+    schema = dict(request.output.schema)
+    example = _example_for_schema(schema)
+    return (
+        "Return exactly one valid JSON object and no markdown or commentary. "
+        f"The JSON object must conform to this JSON Schema named {request.output.name!r}: "
+        f"{json.dumps(schema, ensure_ascii=False, separators=(',', ':'))}. "
+        "Example JSON output shape (replace illustrative values with the requested result): "
+        f"{json.dumps(example, ensure_ascii=False, separators=(',', ':'))}"
+    )
+
+
+def _example_for_schema(schema: Mapping[str, Any]) -> Any:
+    if "const" in schema:
+        return schema["const"]
+    enum = schema.get("enum")
+    if isinstance(enum, list) and enum:
+        return enum[0]
+    expected = schema.get("type")
+    if isinstance(expected, list):
+        expected = next((item for item in expected if item != "null"), "null")
+    if expected == "object":
+        properties = schema.get("properties", {})
+        if not isinstance(properties, Mapping):
+            return {}
+        required = schema.get("required", [])
+        return {
+            key: _example_for_schema(child)
+            for key, child in properties.items()
+            if key in required and isinstance(child, Mapping)
+        }
+    if expected == "array":
+        minimum = schema.get("minItems", 0)
+        count = minimum if isinstance(minimum, int) and minimum > 0 else 1
+        maximum = schema.get("maxItems")
+        if isinstance(maximum, int):
+            count = min(count, maximum)
+        item_schema = schema.get("items", {})
+        return [_example_for_schema(item_schema) for _ in range(count)] if isinstance(item_schema, Mapping) else []
+    if expected == "string":
+        minimum = schema.get("minLength", 0)
+        return "x" * max(1, minimum if isinstance(minimum, int) else 0)
+    if expected == "integer":
+        minimum = schema.get("minimum", 0)
+        return math.ceil(minimum) if isinstance(minimum, (int, float)) else 0
+    if expected == "number":
+        minimum = schema.get("minimum", 0)
+        return minimum if isinstance(minimum, (int, float)) else 0
+    if expected == "boolean":
+        return False
+    return None
 
 
 def _estimate_input_tokens(request: AIRequest) -> int:

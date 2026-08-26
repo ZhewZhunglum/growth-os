@@ -3,6 +3,7 @@
 {% block title %}{% ui '员工与权限' 'Team & access' %} · PUKO Growth OS{% endblock %}
 {% block page_title %}{% ui '员工与权限' 'Team & access' %}{% endblock %}
 {% block content %}
+<a class="back-link" href="{% url 'dashboard:feature-center' %}">← {% ui '返回功能中心' 'Back to feature center' %}</a>
 <section class="hero-panel team-hero">
     <div>
         <p class="eyebrow">{% ui '谁能做什么' 'Who can do what' %}</p>
@@ -12,7 +13,7 @@
     <span class="status-pill"><span></span>{{ staff_rows|length }} {% ui '个可管理员工' 'manageable staff' %}</span>
 </section>
 
-<section class="team-list" aria-label="员工列表">
+<section class="team-list" aria-label="{% ui '员工列表' 'Staff list' %}">
     {% for member, active_count in staff_rows %}
     <article class="team-card">
         <span class="avatar team-avatar">{{ member.username|slice:":1"|upper }}</span>

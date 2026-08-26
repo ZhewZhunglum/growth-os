@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import tempfile
 import unittest
 from decimal import Decimal
@@ -26,6 +27,7 @@ from integrations.errors import (
     BudgetExceeded,
     IntegrationConfigurationError,
     NetworkAccessDisabled,
+    ProviderResponseError,
     StructuredOutputError,
 )
 
@@ -39,9 +41,17 @@ SCHEMA = {
 
 
 class RecordingTransport:
-    def __init__(self, output: Mapping[str, Any] | None = None):
+    def __init__(
+        self,
+        output: Mapping[str, Any] | None = None,
+        *,
+        finish_reason: str = "stop",
+        content: str | None = None,
+    ):
         self.calls: list[dict[str, Any]] = []
         self.output = output or {"answer": "ok", "score": 1}
+        self.finish_reason = finish_reason
+        self.content = content
 
     def post_json(
         self,
@@ -58,8 +68,19 @@ class RecordingTransport:
             status_code=200,
             payload={
                 "id": "request-1",
-                "choices": [{"message": {"content": json.dumps(self.output)}}],
-                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+                "choices": [{
+                    "finish_reason": self.finish_reason,
+                    "message": {
+                        "content": self.content if self.content is not None else json.dumps(self.output)
+                    },
+                }],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "prompt_cache_hit_tokens": 4,
+                    "prompt_cache_miss_tokens": 6,
+                    "completion_tokens": 5,
+                    "total_tokens": 15,
+                },
             },
         )
 
@@ -99,7 +120,9 @@ class DeepSeekAdapterTests(unittest.TestCase):
                 DeepSeekV4Config(
                     secret=SecretFileReference(secret_path),
                     model="deepseek-v4-pro",
-                    pricing=ModelPricing(Decimal("0.10"), Decimal("0.20")),
+                    pricing=ModelPricing(
+                        Decimal("0.10"), Decimal("0.20"), Decimal("0.01")
+                    ),
                 ),
                 budget=BudgetGuard(BudgetLimits(max_requests=2, max_cost_usd=Decimal("1"))),
                 transport=transport,
@@ -107,11 +130,42 @@ class DeepSeekAdapterTests(unittest.TestCase):
             result = provider.generate(request())
             self.assertEqual(result.status, AIExecutionStatus.SUCCEEDED)
             self.assertEqual(result.output["answer"], "ok")
+            self.assertEqual(result.usage.cached_input_tokens, 4)
+            self.assertAlmostEqual(result.usage.estimated_cost_usd, 0.00000164)
             self.assertEqual(transport.calls[0]["headers"]["Authorization"], "Bearer test-key")
             payload = transport.calls[0]["payload"]
             self.assertEqual(payload["model"], "deepseek-v4-pro")
-            self.assertEqual(payload["response_format"]["type"], "json_schema")
+            self.assertEqual(payload["response_format"], {"type": "json_object"})
+            self.assertEqual(payload["thinking"], {"type": "disabled"})
+            self.assertNotIn("user", payload)
+            self.assertRegex(payload["user_id"], r"^growth-os-[a-f0-9]{40}$")
+            self.assertTrue(re.fullmatch(r"[A-Za-z0-9_-]+", payload["user_id"]))
+            json_instruction = payload["messages"][0]
+            self.assertEqual(json_instruction["role"], "system")
+            self.assertIn("JSON", json_instruction["content"])
+            self.assertIn('"answer":"x"', json_instruction["content"])
+            self.assertIn('"score":0', json_instruction["content"])
             self.assertFalse(payload["stream"])
+
+    def test_non_stop_and_empty_json_responses_fail_with_protocol_specific_errors(self):
+        with tempfile.TemporaryDirectory() as directory:
+            secret_path = Path(directory) / "key"
+            secret_path.write_text("test-key", encoding="utf-8")
+
+            def provider(transport):
+                return DeepSeekV4Provider(
+                    DeepSeekV4Config(
+                        secret=SecretFileReference(secret_path),
+                        pricing=ModelPricing(Decimal("0"), Decimal("0")),
+                    ),
+                    budget=BudgetGuard(BudgetLimits(max_requests=1, max_cost_usd=Decimal("0"))),
+                    transport=transport,
+                )
+
+            with self.assertRaisesRegex(ProviderResponseError, "truncated"):
+                provider(RecordingTransport(finish_reason="length")).generate(request())
+            with self.assertRaisesRegex(StructuredOutputError, "empty JSON"):
+                provider(RecordingTransport(content="   ")).generate(request())
 
     def test_live_adapter_requires_explicit_pricing_and_budget(self):
         config = DeepSeekV4Config(secret=SecretFileReference(Path("missing")))

@@ -60,8 +60,8 @@ class AIRequest:
             raise ValueError("At least one AI message is required")
         if not self.operation_key or len(self.operation_key) > 200:
             raise ValueError("operation_key must contain 1-200 characters")
-        if not 1 <= self.max_output_tokens <= 32_768:
-            raise ValueError("max_output_tokens must be between 1 and 32768")
+        if not 1 <= self.max_output_tokens <= 384_000:
+            raise ValueError("max_output_tokens must be between 1 and 384000")
         if not 0.0 <= self.temperature <= 2.0:
             raise ValueError("temperature must be between 0 and 2")
         object.__setattr__(self, "metadata", MappingProxyType(dict(self.metadata)))
@@ -86,10 +86,13 @@ class AIUsage:
     output_tokens: int
     total_tokens: int
     estimated_cost_usd: float | None = None
+    cached_input_tokens: int = 0
 
     def __post_init__(self) -> None:
         if min(self.input_tokens, self.output_tokens, self.total_tokens) < 0:
             raise ValueError("Token counts cannot be negative")
+        if not 0 <= self.cached_input_tokens <= self.input_tokens:
+            raise ValueError("Cached input tokens must be within total input tokens")
         if self.total_tokens < self.input_tokens + self.output_tokens:
             raise ValueError("total_tokens cannot be smaller than input + output tokens")
 

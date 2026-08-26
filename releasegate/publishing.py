@@ -12,13 +12,14 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 from django.core.exceptions import ValidationError
-from django.db import transaction
+from django.db import connection, transaction
 from django.utils import timezone
 
 from accounts.models import PermissionGrant, Principal
 from contentops.models import ContentAsset, ContentAssetVersion, TaskSubmission
 from integrations.connectors.types import Platform
 from integrations.publishing import (
+    PublicationAssetRepresentation,
     PublicationDispatchRequest,
     PublicationDispatchStatus,
     PublicationMode,
@@ -33,6 +34,7 @@ from .models import (
     CapabilityState,
     ChannelAccount,
     PolicyDefinition,
+    PolicyVersion,
     Publication,
     PublicationEvent,
     ReleaseGateRecord,
@@ -170,8 +172,30 @@ def _lock_exact_release_context(publication_id: uuid.UUID) -> Publication:
     RuntimeEnvironment.objects.select_for_update().get(pk=gate.runtime_environment_id)
     AccountEnvironmentBinding.objects.select_for_update().get(pk=gate.account_environment_binding_id)
     CapabilityState.objects.select_for_update().get(pk=gate.capability_state_id)
+    _lock_policy_catalog_for_final_dispatch()
     list(PolicyDefinition.objects.select_for_update().values_list("pk", flat=True))
     return publication
+
+
+def _lock_policy_catalog_for_final_dispatch() -> None:
+    """Prevent a mandatory-policy phantom during the external side effect.
+
+    Existing Definition row locks stop ordinary updates, but they cannot stop a
+    concurrent transaction from inserting a brand-new mandatory Definition.
+    PostgreSQL SHARE table locks block policy Definition/Version writes until
+    this transaction has completed its fresh policy-set check, dispatch and
+    immutable proof event. SQLite is used only for local tests and has no
+    equivalent lock; Production validation remains PostgreSQL-only.
+    """
+
+    if connection.vendor != "postgresql":
+        return
+    table_names = (
+        connection.ops.quote_name(PolicyDefinition._meta.db_table),
+        connection.ops.quote_name(PolicyVersion._meta.db_table),
+    )
+    with connection.cursor() as cursor:
+        cursor.execute(f"LOCK TABLE {', '.join(table_names)} IN SHARE MODE")
 
 
 def _pre_dispatch_blockers(publication: Publication, gate: ReleaseGateRecord) -> list[str]:
@@ -227,12 +251,22 @@ def dispatch_confirmed_publication(
         "publication", "actor_principal"
     ).first()
     if existing is not None:
+        manual_inputs_match = (
+            confirmation.mode is not PublicationMode.MANUAL
+            or (
+                existing.external_url == manual_external_url
+                and existing.external_publication_id == manual_external_publication_id
+            )
+        )
         if (
             existing.publication_id != publication.pk
             or existing.actor_principal_id != publisher_principal.pk
             or existing.event_type != PublicationEvent.EventType.MANUAL_PUBLISHED_RECORDED
+            or not manual_inputs_match
         ):
-            raise ValidationError("The command_id was already used by another publication action.")
+            raise ValidationError(
+                "The command_id was already used by another publication action or different proof inputs."
+            )
         return ConfirmedPublicationResult(
             status=PublicationDispatchStatus.SUCCEEDED,
             mode=confirmation.mode,
@@ -258,14 +292,38 @@ def dispatch_confirmed_publication(
     except ValueError as exc:
         raise ValidationError("ChannelAccount platform is outside the seven-platform V1 scope.") from exc
 
-    asset_reference = gate.primary_asset_version.object_key
+    asset_version = gate.primary_asset_version
+    try:
+        asset_representation = PublicationAssetRepresentation(asset_version.representation_kind)
+    except (TypeError, ValueError) as exc:
+        raise ValidationError("The approved asset representation is not publishable.") from exc
+    if asset_representation is PublicationAssetRepresentation.INLINE_TEXT:
+        # Import locally to keep the release domain independent at module-load
+        # time while still enforcing the content-generation provenance at the
+        # final side-effect boundary.
+        from dailyops.content_generation import validate_inline_content_evidence_manifest
+
+        validate_inline_content_evidence_manifest(
+            asset_version=asset_version,
+            lock=True,
+        )
     request = PublicationDispatchRequest(
         platform=platform,
         mode=confirmation.mode,
         operation_key=str(command_id),
         account_ref=gate.channel_account.account_code,
         asset_version_id=str(gate.primary_asset_version_id),
-        asset_external_url=asset_reference,
+        asset_representation_kind=asset_representation,
+        asset_external_url=(
+            asset_version.object_key
+            if asset_representation is PublicationAssetRepresentation.EXTERNAL_URL
+            else ""
+        ),
+        asset_inline_content=(
+            asset_version.inline_content
+            if asset_representation is PublicationAssetRepresentation.INLINE_TEXT
+            else ""
+        ),
         gate_id=str(gate.pk),
         gate_context_sha256=gate.context_sha256,
         human_confirmation_id=str(confirmation.confirmation_id),
@@ -274,6 +332,9 @@ def dispatch_confirmed_publication(
             "publication_id": str(publication.pk),
             "submission_id": str(gate.task_submission_id),
             "runtime_environment_id": str(gate.runtime_environment_id),
+            "asset_representation_kind": asset_representation.value,
+            "asset_content_sha256": asset_version.content_sha256,
+            "asset_manifest_sha256": asset_version.manifest_sha256,
         },
     )
 

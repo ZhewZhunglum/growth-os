@@ -12,7 +12,10 @@ from dashboard.review_views import (
     review_queue,
 )
 from dashboard.views import home, task_action, task_create, task_detail
+from dashboard.release_actions import release_rework_action, release_stop_action
+from dashboard.feature_center_views import feature_center
 from dashboard.guide_views import guide
+from dashboard.history_views import my_task_history
 from dashboard.config_views import (
     configuration_home,
     product_configuration,
@@ -33,6 +36,7 @@ from dashboard.team_views import (
 app_name = "dashboard"
 urlpatterns = [
     path("", home, name="home"),
+    path("features/", feature_center, name="feature-center"),
     path("guide/", guide, name="guide"),
     path("tasks/new/", task_create, name="task-create"),
     path("tasks/<uuid:task_id>/", task_detail, name="task-detail"),
@@ -46,12 +50,15 @@ urlpatterns = [
     path("release/<uuid:task_id>/gate/", release_gate_action, name="release-gate-action"),
     path("release/<uuid:task_id>/proof/", release_proof_action, name="release-proof-action"),
     path("release/<uuid:task_id>/done/", release_done_action, name="release-done-action"),
+    path("release/<uuid:task_id>/stop/", release_stop_action, name="release-stop-action"),
+    path("release/<uuid:task_id>/rework/", release_rework_action, name="release-rework-action"),
     path("team/", team_members, name="team-members"),
     path("team/<uuid:member_id>/", team_member_detail, name="team-member-detail"),
     path("team/<uuid:member_id>/grants/new/", team_grant_issue, name="team-grant-issue"),
     path("team/grants/<uuid:grant_id>/renew/", team_grant_renew, name="team-grant-renew"),
     path("team/grants/<uuid:grant_id>/revoke/", team_grant_revoke, name="team-grant-revoke"),
     path("account/password/", change_my_password, name="change-my-password"),
+    path("account/history/", my_task_history, name="my-task-history"),
     path("configuration/", configuration_home, name="configuration-home"),
     path("configuration/products/<uuid:product_id>/", product_configuration, name="product-configuration"),
     path(

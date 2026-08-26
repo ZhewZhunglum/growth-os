@@ -23,6 +23,7 @@ from .forms import (
     PerformanceManualForm,
 )
 from .services import (
+    LOCAL_TEST_GEO_PANEL_KEY,
     add_geo_panel_item,
     create_geo_panel_version,
     evidence_choices,
@@ -56,6 +57,7 @@ _SERVICE_ERRORS_EN = {
     "同一个提交编号不能用于不同内容。": "The same submission ID cannot be reused for different content.",
     "证据编号无效。": "The selected supporting result is invalid.",
     "GEO 证据不属于所选产品。": "The AI search result does not belong to the selected product.",
+    "本地 GEO 测试结果不能进入正式学习或需求。": "Local GEO test results cannot enter formal learning or demand.",
     "平台表现证据没有与该产品的 Channel Plan 建立关系。": "The performance result is not linked to this product's channel plan.",
     "不支持的证据类型。": "This supporting result type is not supported.",
 }
@@ -65,6 +67,7 @@ _SERVICE_ERRORS_ZH = {
     "Question cannot be blank.": "问题不能为空。",
     "This GEO panel version already exists with different immutable input.": "这个问题组版本已经存在，但保存的内容不同。",
     "This question number already exists with different immutable input.": "这个问题序号已经存在，但问题内容不同。",
+    "本地 GEO 测试结果不能进入正式学习或需求。": "本地 GEO 测试结果不能进入正式学习或需求。",
 }
 
 
@@ -128,6 +131,9 @@ def _forms_for(
         "recent_panels": panel_item_form.fields["panel"].queryset.prefetch_related("items")[:12],
         "geo_form": geo_form,
         "can_record_geo": geo_form.fields["panel_item"].queryset.exists(),
+        "has_local_test_geo": geo_form.fields["panel_item"].queryset.filter(
+            panel__panel_key=LOCAL_TEST_GEO_PANEL_KEY
+        ).exists(),
         "learning_form": learning or LearningProposalForm(
             actor=request.user,
             evidence_choices=choices,

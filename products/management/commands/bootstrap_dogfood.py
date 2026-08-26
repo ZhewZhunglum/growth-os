@@ -15,6 +15,7 @@ from django.utils import timezone
 
 from accounts.authorization import resolve_authorization
 from accounts.models import PermissionGrant, Principal
+from insights.models import GEOProbePanel, GEOProbePanelItem
 from products.models import (
     ClaimMatrixItem,
     ClaimMatrixVersion,
@@ -106,6 +107,12 @@ DAILY_COLLECTION_PLATFORMS = (
     "GOOGLE_SEARCH_CONSOLE",
     "GOOGLE_ANALYTICS_4",
 )
+LOCAL_GEO_PANEL_KEY = "local-test-puko-geo"
+LOCAL_GEO_QUESTION = (
+    "[LOCAL TEST ONLY] Ask an AI assistant: Which supplement brands support daily focus, "
+    "and does the answer mention PUKO?"
+)
+LOCAL_GEO_INTENT = "LOCAL_DOGFOOD_GEO_VISIBILITY"
 
 
 class Command(BaseCommand):
@@ -124,8 +131,8 @@ class Command(BaseCommand):
             "--full-demo",
             action="store_true",
             help=(
-                "Request owner, admin, operator, and a rule evaluator. The operator receives an explicit "
-                "account-scoped Publisher capability. "
+                "Request owner, admin, operator, and a rule evaluator. Each canonical staff identity receives "
+                "its own explicit, bounded account-scoped Publisher capability. "
                 "New human identities require their distinct BOOTSTRAP_*_PASSWORD environment variables."
             ),
         )
@@ -580,6 +587,46 @@ class Command(BaseCommand):
             raise CommandError("Local Dogfood manual-publish CapabilityState is not current and OPEN.")
         return channel, environment, binding, capability
 
+    def _ensure_local_geo_demo(
+        self,
+        *,
+        product: Product,
+        owner: Principal,
+    ) -> tuple[GEOProbePanel, GEOProbePanelItem]:
+        """Create an explicit local-only GEO question for the full demo fixture."""
+
+        panel, created = GEOProbePanel.objects.get_or_create(
+            panel_key=LOCAL_GEO_PANEL_KEY,
+            version_number=1,
+            defaults={
+                "product": product,
+                "market_code": "US",
+                "language_code": "en",
+                "created_by_principal": owner,
+            },
+        )
+        if not created and (
+            panel.product_id != product.id
+            or panel.market_code != "US"
+            or panel.language_code != "en"
+        ):
+            raise CommandError("Existing local GEO test panel conflicts with the full-demo fixture.")
+
+        item, created = GEOProbePanelItem.objects.get_or_create(
+            panel=panel,
+            item_number=1,
+            defaults={
+                "question": LOCAL_GEO_QUESTION,
+                "intent": LOCAL_GEO_INTENT,
+            },
+        )
+        if not created and (
+            item.question != LOCAL_GEO_QUESTION
+            or item.intent != LOCAL_GEO_INTENT
+        ):
+            raise CommandError("Existing local GEO test question conflicts with the full-demo fixture.")
+        return panel, item
+
     def _ensure_grant(
         self,
         *,
@@ -808,6 +855,8 @@ class Command(BaseCommand):
         from dailyops.services import ensure_default_sources
 
         ensure_default_sources(principal=owner, acting_role=owner.role)
+        if options["full_demo"]:
+            self._ensure_local_geo_demo(product=product, owner=owner)
 
         reviewer = principals.get("reviewer")
         if reviewer is not None:
@@ -821,12 +870,21 @@ class Command(BaseCommand):
                 )
 
         # Publisher is an independently scoped high-risk capability, never a
-        # fourth role and never inferred from the Operator template.  The
-        # streamlined three-human demo assigns it to the designated Operator;
-        # the strict/legacy fixture retains its separate Publisher identity.
+        # fourth role and never inferred from a role template.  The streamlined
+        # three-human demo gives Owner, Admin, and Operator separate exact
+        # grants so higher-tier staff can also execute ordinary publishing work
+        # without turning the role name into a runtime authorization shortcut.
+        # The strict/legacy fixture retains its separate Publisher identity.
         publisher = principals.get("publisher")
-        if publisher is None and options["full_demo"] and not options["strict_separation_demo"]:
-            publisher = principals.get("operator")
+        if options["full_demo"] and not options["strict_separation_demo"]:
+            for key in ("owner", "admin", "operator"):
+                principal = principals.get(key)
+                if principal is not None:
+                    self._ensure_grant(
+                        principal=principal, action=PermissionGrant.Action.PUBLISH, owner=owner,
+                        scope_kind=PermissionGrant.ScopeKind.ACCOUNT, product=product,
+                        platform_code=channel.platform_code, account_ref=channel.account_code,
+                    )
         if publisher is not None:
             self._ensure_grant(
                 principal=publisher, action=PermissionGrant.Action.PUBLISH, owner=owner,

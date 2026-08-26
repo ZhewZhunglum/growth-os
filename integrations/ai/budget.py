@@ -21,15 +21,30 @@ class BudgetLimits:
 class ModelPricing:
     input_usd_per_million_tokens: Decimal
     output_usd_per_million_tokens: Decimal
+    cached_input_usd_per_million_tokens: Decimal | None = None
 
     def __post_init__(self) -> None:
-        if self.input_usd_per_million_tokens < 0 or self.output_usd_per_million_tokens < 0:
+        rates = (
+            self.input_usd_per_million_tokens,
+            self.output_usd_per_million_tokens,
+            self.cached_input_usd_per_million_tokens,
+        )
+        if any(rate is not None and rate < 0 for rate in rates):
             raise ValueError("Model pricing cannot be negative")
 
-    def estimate(self, input_tokens: int, output_tokens: int) -> Decimal:
+    def estimate(self, input_tokens: int, output_tokens: int, *, cached_input_tokens: int = 0) -> Decimal:
+        if not 0 <= cached_input_tokens <= input_tokens:
+            raise ValueError("Cached input tokens must be within total input tokens")
         million = Decimal(1_000_000)
+        cached_rate = (
+            self.cached_input_usd_per_million_tokens
+            if self.cached_input_usd_per_million_tokens is not None
+            else self.input_usd_per_million_tokens
+        )
+        uncached_input_tokens = input_tokens - cached_input_tokens
         return (
-            Decimal(input_tokens) * self.input_usd_per_million_tokens / million
+            Decimal(uncached_input_tokens) * self.input_usd_per_million_tokens / million
+            + Decimal(cached_input_tokens) * cached_rate / million
             + Decimal(output_tokens) * self.output_usd_per_million_tokens / million
         )
 

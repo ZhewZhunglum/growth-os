@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% load ui_i18n %}
-{% block title %}{{ product.name }}配置 · PUKO{% endblock %}
+{% block title %}{{ product.name }} · {% ui '配置' 'Setup' %} · PUKO{% endblock %}
 {% block page_title %}{{ product.name }} {% ui '配置' 'setup' %}{% endblock %}
 {% block content %}
 <a class="back-link" href="{% url 'dashboard:configuration-home' %}">← {% ui '返回产品列表' 'Back to products' %}</a>
@@ -15,5 +15,5 @@
   <section class="detail-panel action-panel"><p class="eyebrow">{% ui '最后一步' 'Final step' %}</p><h3>{% ui '封存并设为当前版本' 'Seal and set as current' %}</h3><p class="muted">{% ui '启用后旧版本仍保留，已经生成的旧任务继续引用旧版。' 'Old versions remain after activation, and existing tasks keep their original version.' %}</p><form method="post" action="{% url 'dashboard:product-configuration-action' product.id 'seal' %}" class="config-form">{% csrf_token %}{{ forms.seal.as_p }}<button class="button button-primary">{% ui '确认封存并启用' 'Seal and activate' %}</button></form></section>
 </div>
 
-<section class="detail-panel config-history"><p class="eyebrow">版本历史</p><h3>产品档案</h3><div class="grant-list">{% for profile in profiles %}<article class="grant-card {% if product.current_profile_version_id == profile.id %}grant-current{% endif %}"><div class="grant-heading"><div><strong>档案 v{{ profile.version_number }}</strong><small>目标 {{ profile.objective_profile_version.version_number|default:"-" }} · 声明 {{ profile.claim_matrix_version.version_number|default:"-" }} · 证据 {{ profile.evidence_library_version.version_number|default:"-" }}</small></div><span class="task-state">{% if profile.is_sealed %}已封存{% else %}草稿{% endif %}</span></div></article>{% empty %}<p class="muted">还没有产品档案。</p>{% endfor %}</div></section>
+<section class="detail-panel config-history"><p class="eyebrow">{% ui '版本历史' 'Version history' %}</p><h3>{% ui '产品档案' 'Product profiles' %}</h3><div class="grant-list">{% for profile in profiles %}<article class="grant-card {% if product.current_profile_version_id == profile.id %}grant-current{% endif %}"><div class="grant-heading"><div><strong>{% ui '档案' 'Profile' %} v{{ profile.version_number }}</strong><small>{% ui '目标' 'Objective' %} {{ profile.objective_profile_version.version_number|default:"-" }} · {% ui '声明' 'Claims' %} {{ profile.claim_matrix_version.version_number|default:"-" }} · {% ui '证据' 'Evidence' %} {{ profile.evidence_library_version.version_number|default:"-" }}</small></div><span class="task-state">{% if profile.is_sealed %}{% ui '已封存' 'Sealed' %}{% else %}{% ui '草稿' 'Draft' %}{% endif %}</span></div></article>{% empty %}<p class="muted">{% ui '还没有产品档案。' 'No product profiles yet.' %}</p>{% endfor %}</div></section>
 {% endblock %}

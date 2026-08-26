@@ -54,10 +54,8 @@ class PresentationLanguageTests(TestCase):
             {"language": "en", "next": reverse("dashboard:home")},
         )
         response = self.client.get(reverse("dashboard:home"))
-        self.assertContains(response, "Opportunities")
         self.assertContains(response, "My work")
-        self.assertContains(response, "Team")
-        self.assertContains(response, "Settings")
+        self.assertContains(response, "Feature center")
         self.assertContains(response, "Sign out")
         self.assertContains(response, "Language Owner")
         self.assertContains(response, "Owner")

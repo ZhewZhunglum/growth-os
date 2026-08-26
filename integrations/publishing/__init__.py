@@ -7,6 +7,7 @@ from .runtime import (
     PublicationRuntimeConfig,
 )
 from .types import (
+    PublicationAssetRepresentation,
     PublicationConnectorDescriptor,
     PublicationDispatchRequest,
     PublicationDispatchResult,
@@ -19,6 +20,7 @@ from .types import (
 __all__ = [
     "DisabledPublicationTransport",
     "DryRunPublicationTransport",
+    "PublicationAssetRepresentation",
     "PublicationConnectorDescriptor",
     "PublicationDispatchRequest",
     "PublicationDispatchResult",

@@ -5,6 +5,7 @@ import unittest
 from integrations.connectors.types import AvailabilityState, Platform
 from integrations.publishing import (
     DryRunPublicationTransport,
+    PublicationAssetRepresentation,
     PublicationDispatchRequest,
     PublicationDispatchResult,
     PublicationDispatchStatus,
@@ -18,14 +19,20 @@ from integrations.publishing import (
 def request(
     platform: Platform = Platform.TIKTOK,
     mode: PublicationMode = PublicationMode.API,
+    representation_kind: PublicationAssetRepresentation = (
+        PublicationAssetRepresentation.EXTERNAL_URL
+    ),
 ) -> PublicationDispatchRequest:
+    is_inline = representation_kind is PublicationAssetRepresentation.INLINE_TEXT
     return PublicationDispatchRequest(
         platform=platform,
         mode=mode,
         operation_key="publish:daily:123",
         account_ref="puko-us",
         asset_version_id="asset-version-1",
-        asset_external_url="https://drafts.example.com/puko/v1",
+        asset_representation_kind=representation_kind,
+        asset_external_url="" if is_inline else "https://drafts.example.com/puko/v1",
+        asset_inline_content="A complete TikTok post ready to publish." if is_inline else "",
         gate_id="gate-1",
         gate_context_sha256="a" * 64,
         human_confirmation_id="confirmation-1",
@@ -90,6 +97,49 @@ class PublicationConnectorTests(unittest.TestCase):
         self.assertEqual(result.status, PublicationDispatchStatus.SUCCEEDED)
         self.assertEqual(result.external_publication_id, "video-123")
         self.assertEqual(len(transport.calls), 1)
+
+    def test_inline_text_is_passed_to_api_and_browser_as_the_exact_approved_asset(self):
+        for mode in (PublicationMode.API, PublicationMode.BROWSER):
+            with self.subTest(mode=mode):
+                transport = _SuccessfulTransport()
+                runtime = PublicationRuntime(
+                    PublicationRuntimeConfig({(Platform.TIKTOK, mode): transport})
+                )
+                result = runtime.dispatch(
+                    request(
+                        mode=mode,
+                        representation_kind=PublicationAssetRepresentation.INLINE_TEXT,
+                    )
+                )
+                self.assertEqual(result.status, PublicationDispatchStatus.SUCCEEDED)
+                dispatched = transport.calls[0]
+                self.assertEqual(
+                    dispatched.asset_representation_kind,
+                    PublicationAssetRepresentation.INLINE_TEXT,
+                )
+                self.assertEqual(
+                    dispatched.asset_inline_content,
+                    "A complete TikTok post ready to publish.",
+                )
+                self.assertEqual(dispatched.asset_external_url, "")
+
+    def test_asset_envelope_requires_exactly_one_matching_representation(self):
+        base = request()
+        values = {
+            field: getattr(base, field)
+            for field in base.__dataclass_fields__
+        }
+        values.update(
+            asset_representation_kind=PublicationAssetRepresentation.INLINE_TEXT,
+            asset_external_url="https://drafts.example.com/puko/v1",
+            asset_inline_content="inline",
+        )
+        with self.assertRaisesRegex(ValueError, "cannot also contain an external URL"):
+            PublicationDispatchRequest(**values)
+
+        values.update(asset_external_url="", asset_inline_content="   ")
+        with self.assertRaisesRegex(ValueError, "non-blank content"):
+            PublicationDispatchRequest(**values)
 
     def test_dry_run_is_offline_and_never_returns_external_proof(self):
         runtime = PublicationRuntime(

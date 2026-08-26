@@ -7,13 +7,44 @@
 
 <section class="task-detail-hero">
     <div>
-        <p class="eyebrow">{{ task.product.name }} · {% ui '合同' 'Contract' %} v{{ task.contract_version.version_number }}</p>
+        <p class="eyebrow">{{ task.product.name }}</p>
         <h2>{{ task.title }}</h2>
         <p>{% if task.description %}{{ task.description }}{% else %}{% ui '任务暂时没有背景说明，请先向负责人确认。' 'This task has no background yet. Ask the person responsible before starting.' %}{% endif %}</p>
     </div>
     <div class="detail-status-stack">
         <span class="task-state task-state-{{ task.current_state|lower }}">{% ui_task_state task.current_state %}</span>
-        <small>{% ui '状态版本' 'State version' %} {{ task.state_version }}</small>
+        <div class="task-management-control">
+            <span class="task-label">{% ui '管理任务' 'Manage task' %}</span>
+            {% if management_kind == 'delete-draft' or management_kind == 'abandon' or management_kind == 'withdraw-abandon' %}
+            <details class="secondary-action-block secondary-action-danger">
+                <summary class="button button-secondary">
+                    {% if management_kind == 'delete-draft' %}{% ui '删除草稿' 'Remove draft' %}
+                    {% elif management_kind == 'withdraw-abandon' %}{% ui '撤回并放弃' 'Withdraw and abandon' %}
+                    {% else %}{% ui '放弃任务' 'Abandon task' %}{% endif %}
+                </summary>
+                <p class="action-explanation">
+                    {% if management_kind == 'delete-draft' %}{% ui '这份草稿会从活跃列表隐藏，但审计历史仍会保留。' 'The draft is hidden from active lists while its audit history remains.' %}
+                    {% elif management_kind == 'withdraw-abandon' %}{% ui '只有审核尚未作出结论时才能操作。系统会直接结束任务，并保留旧提交。' 'This is available only before a final review. The task ends directly and the sealed submission remains.' %}
+                    {% else %}{% ui '任务会从待办列表隐藏，但已有工作与审计历史不会被删除。' 'The task is hidden from active work while its existing work and audit history remain.' %}{% endif %}
+                </p>
+                <form class="task-action-form" action="{% url 'dashboard:task-action' task.id 'cancel' %}" method="post">
+                    {% csrf_token %}{{ cancel_form.command_id }}{{ cancel_form.expected_state_version }}{{ cancel_form.non_field_errors }}
+                    {% for field in cancel_form.visible_fields %}<div class="field-row">{{ field.label_tag }}{{ field }}{{ field.errors }}{% if field.help_text %}<small>{{ field.help_text }}</small>{% endif %}</div>{% endfor %}
+                    <button class="button button-danger" type="submit">
+                        {% if management_kind == 'delete-draft' %}{% ui '确认删除草稿' 'Confirm draft removal' %}
+                        {% elif management_kind == 'withdraw-abandon' %}{% ui '确认撤回并放弃' 'Confirm withdrawal and abandonment' %}
+                        {% else %}{% ui '确认放弃任务' 'Confirm task abandonment' %}{% endif %}
+                    </button>
+                </form>
+            </details>
+            {% elif management_kind == 'stop-publication' %}
+            <a class="button button-secondary" href="{% url 'dashboard:release-detail' task.id %}">{% ui '打开发布页停止这项工作' 'Open publishing page to stop this work' %}</a>
+            {% elif management_kind == 'read-only' %}
+            <small>{% ui '流程已结束，只能查看历史' 'The workflow is complete and read-only' %}</small>
+            {% else %}
+            <small>{% ui '当前账号不能结束这项任务' 'This account cannot end this task' %}</small>
+            {% endif %}
+        </div>
     </div>
 </section>
 
@@ -24,27 +55,70 @@
     <article><span class="task-label">{% ui '交付检查当前结果' 'Current delivery check' %}</span><p>{% if task.latest_dod %}<strong class="check-result-{{ task.latest_dod.aggregate_result|lower }}">{% ui_check_result task.latest_dod.aggregate_result %}</strong> · {% ui '第' 'Attempt' %} {{ task.latest_dod.attempt_number }} {% ui '次' '' %}{% else %}{% ui '尚未检查' 'Not checked' %}{% endif %}</p></article>
 </section>
 
+<section class="detail-panel spaced-panel" aria-label="{% ui '当前轮到谁处理' 'Who acts next' %}">
+    <p class="eyebrow">{% ui '现在轮到' 'Up next' %}</p>
+    <h3>{% ui current_turn.who_zh current_turn.who_en %}：{% ui current_turn.action_zh current_turn.action_en %}</h3>
+    <p class="action-explanation">{% ui current_turn.note_zh current_turn.note_en %}</p>
+</section>
+
 {% if compilation_context %}
 <section class="detail-panel" aria-label="{% ui 'Daily Operations 编译上下文' 'Daily Operations compilation context' %}">
-    <p class="eyebrow">{% ui 'Daily Operations 编译上下文（只读）' 'Daily Operations context (read only)' %}</p>
-    <h3>{% ui '这项任务要在哪个平台、哪个账号执行' 'Where and under which account this task runs' %}</h3>
-    <p class="action-explanation">{% ui '以下内容来自任务生成时封存的确切 ChannelPlan。这里不能修改；配置变化也不会悄悄改写旧任务。' 'This is the exact channel plan sealed when the task was created. It cannot be changed here, and later configuration changes do not rewrite this task.' %}</p>
+    <p class="eyebrow">{% ui '执行位置' 'Where this work happens' %}</p>
+    <h3>{% ui '用哪个平台账号完成这项任务' 'Platform account for this task' %}</h3>
+    <p class="action-explanation">{% ui '这些信息在任务生成时已经确认，避免做完后才发现发错账号。' 'These details were confirmed when the task was created so the work is not published under the wrong account.' %}</p>
     <dl class="submission-summary">
-        <dt>{% ui '目标平台' 'Target platform' %}</dt><dd>{{ channel_plan.platform_code }}</dd>
-        <dt>{% ui '确切平台账号' 'Exact platform account' %}</dt><dd>{{ channel_plan.channel_account.display_name }} ({{ channel_plan.channel_account.account_code }})</dd>
-        <dt>{% ui '运行环境' 'Runtime environment' %}</dt><dd>{{ compilation_context.capability_state.account_environment_binding.runtime_environment.environment_code }} · {{ compilation_context.capability_state.account_environment_binding.runtime_environment.environment_type }}</dd>
-        <dt>{% ui '能力快照' 'Capability snapshot' %}</dt><dd>{{ compilation_context.capability_state.capability_code }} · {{ compilation_context.capability_state.state }} · v{{ compilation_context.capability_state.state_version }}</dd>
-        <dt>{% ui '计划目标' 'Plan goals' %}</dt><dd>{% for key, value in plan_goal_items %}{{ key }}: {{ value }}{% if not forloop.last %}<br>{% endif %}{% empty %}{% ui '未填写结构化目标' 'No structured goals' %}{% endfor %}</dd>
+        <dt>{% ui '平台' 'Platform' %}</dt><dd>{{ platform_label }}</dd>
+        <dt>{% ui '账号' 'Account' %}</dt><dd>{{ channel_plan.channel_account.display_name }}</dd>
+        <dt>{% ui '在哪里运行' 'Environment' %}</dt><dd>{% ui environment_label_zh environment_label_en %}</dd>
+        <dt>{% ui '当前能否发布' 'Publishing availability' %}</dt><dd>{% ui capability_label_zh compilation_context.capability_state.get_state_display %}</dd>
     </dl>
+</section>
+{% endif %}
+
+{% if may_edit_content %}
+<section class="detail-panel spaced-panel" aria-label="{% ui '内容制作区' 'Content workspace' %}">
+    <p class="eyebrow">{% ui '内容制作' 'Content creation' %}</p>
+    {% if generate_form %}
+        <h3>{% ui '根据已确认的数据生成一份完整草稿' 'Generate a complete draft from the approved data' %}</h3>
+        <p class="action-explanation">{% ui '本轮只使用本机离线生成器，不会连接 DeepSeek 或任何付费 API。结果只是可编辑草稿，保存、送审、发布仍然是独立人工步骤。' 'This round uses the offline generator only. It does not connect to DeepSeek or any paid API. The result is an editable draft; saving, review, and publishing remain separate human steps.' %}</p>
+        <form action="{% url 'dashboard:task-action' task.id 'generate-content' %}" method="post">
+            {% csrf_token %}{{ generate_form.command_id }}{{ generate_form.expected_state_version }}
+            <button class="button button-primary" type="submit">{% ui '生成完整内容草稿' 'Generate complete content draft' %}</button>
+        </form>
+    {% elif latest_inline_version and revision_form %}
+        <h3>{% ui '完整内容草稿' 'Complete content draft' %} · v{{ latest_inline_version.version_number }}</h3>
+        <p class="action-explanation">
+            {% ui '下方是本次真正准备送审和发布的完整内容。你可以直接复制，也可以修改后“另存为新版本”；系统不会覆盖旧版本。' 'This is the complete content intended for review and publishing. Copy it as-is or edit and save a new version; the previous version is never overwritten.' %}
+            {% if latest_inline_version.metadata.provider == 'dry-run' or latest_inline_version.metadata.execution_status == 'DRY_RUN' %}<br><strong>{% ui '来源：本机离线测试草稿（未调用 DeepSeek）' 'Source: offline test draft (DeepSeek was not called)' %}</strong>{% endif %}
+        </p>
+        {% if latest_inline_version.metadata.production_notes %}
+        <details class="compact-details">
+            <summary>{% ui '制作提醒（不会包含在发布正文里）' 'Production notes (not included in publishable copy)' %}</summary>
+            <p>{{ latest_inline_version.metadata.production_notes }}</p>
+        </details>
+        {% endif %}
+        <form class="task-action-form" action="{% url 'dashboard:task-action' task.id 'revise-content' %}" method="post">
+            {% csrf_token %}{{ revision_form.command_id }}{{ revision_form.expected_state_version }}{{ revision_form.source_version }}{{ revision_form.non_field_errors }}
+            <div class="field-row">
+                {{ revision_form.inline_content.label_tag }}{{ revision_form.inline_content }}{{ revision_form.inline_content.errors }}
+                {% if revision_form.inline_content.help_text %}<small>{{ revision_form.inline_content.help_text }}</small>{% endif %}
+            </div>
+            <div>
+                <button class="button button-secondary" id="copy-inline-content" type="button">{% ui '复制完整内容' 'Copy complete content' %}</button>
+                <button class="button button-primary" type="submit">{% ui '另存为新版本' 'Save as a new version' %}</button>
+            </div>
+        </form>
+    {% endif %}
 </section>
 {% endif %}
 
 <section class="detail-columns">
     <article class="detail-panel">
-        <p class="eyebrow">{% ui '任务合同' 'Task contract' %}</p><h3>{% ui '开始前与交付时要核对什么' 'What to check before starting and before delivery' %}</h3>
-        <div class="criteria-block"><span class="task-label">{% ui '开工检查（DoR）' 'Readiness check (DoR)' %}</span><ul>{% for item in task.dor_summary %}<li>{{ item }}</li>{% empty %}<li>{% ui '没有配置 DoR' 'No readiness checks configured' %}</li>{% endfor %}</ul></div>
-        <div class="criteria-block"><span class="task-label">{% ui '交付检查（DoD）' 'Delivery check (DoD)' %}</span><ul>{% for item in task.dod_summary %}<li>{{ item }}</li>{% empty %}<li>{% ui '没有配置 DoD' 'No delivery checks configured' %}</li>{% endfor %}</ul></div>
-        <div class="criteria-block gate-summary"><span class="task-label">{% ui '门禁摘要（仅供查看）' 'Release-check summary (read only)' %}</span><ul>{% for item in task.release_gate_summary %}<li>{{ item }}</li>{% empty %}<li>{% ui '没有配置门禁摘要' 'No release checks configured' %}</li>{% endfor %}</ul><p>{% ui '本页不会审核、通过门禁或发布内容。' 'This page cannot review, pass release checks, or publish content.' %}</p></div>
+        <p class="eyebrow">{% ui '完成标准' 'Completion checklist' %}</p><h3>{% ui '这项任务要过三道检查' 'Three checks for this task' %}</h3>
+        <p class="action-explanation">{% ui '它们的作用很简单：避免没准备好就开工、没做完就送审、没核对权限就发布。' 'They prevent work from starting before it is ready, being reviewed before it is complete, or being published before permissions are checked.' %}</p>
+        <div class="criteria-block"><span class="task-label">{% ui '1. 开始前要准备好' '1. Before starting' %}</span><ul>{% for item in task.dor_summary %}<li>{{ item }}</li>{% empty %}<li>{% ui '没有额外准备项' 'No additional readiness items' %}</li>{% endfor %}</ul></div>
+        <div class="criteria-block"><span class="task-label">{% ui '2. 送审前要交齐' '2. Before review' %}</span><ul>{% for item in task.dod_summary %}<li>{{ item }}</li>{% empty %}<li>{% ui '没有额外交付项' 'No additional delivery items' %}</li>{% endfor %}</ul></div>
+        <div class="criteria-block gate-summary"><span class="task-label">{% ui '3. 发布前系统会再检查' '3. Before publishing' %}</span><ul>{% for item in task.release_gate_summary %}<li>{{ item }}</li>{% empty %}<li>{% ui '没有额外发布检查' 'No additional publishing checks' %}</li>{% endfor %}</ul><p>{% ui '审核和发布会在各自的队列里完成，本页不会跳过这些步骤。' 'Review and publishing happen in their own queues; this page cannot skip them.' %}</p></div>
     </article>
 
     <article class="detail-panel action-panel">
@@ -63,17 +137,17 @@
         {% elif action_kind == "assign" %}
             <h3>{% ui '明确分配一位执行人员' 'Assign one operator' %}</h3><p class="action-explanation">{% ui '只能选择对本产品拥有有效执行权限的团队成员。分配完成后，只有当前负责人可以点击开工。' 'Only team members with live execution access for this product are available. After assignment, only the current assignee can start the task.' %}</p>
             <form class="task-action-form" action="{% url 'dashboard:task-action' task.id 'assign' %}" method="post">
-                {% csrf_token %}{{ action_form.command_id }}{{ action_form.expected_state_version }}{{ action_form.non_field_errors }}
+                {% csrf_token %}{{ action_form.command_id }}{{ action_form.expected_state_version }}{{ action_form.expected_current_assignment_id }}{{ action_form.non_field_errors }}
                 {% for field in action_form.visible_fields %}<div class="field-row"><label for="{{ field.id_for_label }}">{% ui '分配给哪位执行人员' 'Assign to' %}</label>{{ field }}{{ field.errors }}</div>{% endfor %}<button class="button button-primary" type="submit">{% ui '确认分配' 'Confirm assignment' %}</button>
             </form>
         {% elif action_kind == "start" %}
-            <h3>{% ui '确认开始执行' 'Confirm that work is starting' %}</h3><p class="action-explanation">{% ui '点击后任务进入“执行中”，届时才能提交交付链接并填写交付检查。' 'The task moves to In progress. You can then submit the delivery link and complete the delivery check.' %}</p>
+            <h3>{% ui '确认开始执行' 'Confirm that work is starting' %}</h3><p class="action-explanation">{% ui '点击后任务进入“执行中”，你可以生成并修改完整内容，也可以继续使用外部内容链接，然后填写交付检查并送审。' 'The task moves to In progress. You can generate and edit complete content here or keep using an external link, then complete the delivery check and submit it.' %}</p>
             <form action="{% url 'dashboard:task-action' task.id 'start' %}" method="post">{% csrf_token %}{{ action_form.command_id }}{{ action_form.expected_state_version }}<button class="button button-primary" type="submit">{% ui '开始执行' 'Start work' %}</button></form>
         {% elif action_kind == "resume-work" %}
-            <h3>{% ui '审核要求修改，恢复制作新版本' 'A reviewer requested changes; create a new version' %}</h3><p class="action-explanation">{% ui '旧链接、旧交付检查和旧提交会原样保留。恢复后请提交新的内容链接，并重新逐项填写交付检查。' 'The previous link, delivery check, and submission remain unchanged. Submit a new link and complete a new delivery check.' %}</p>
+            <h3>{% ui '审核要求修改，恢复制作新版本' 'A reviewer requested changes; create a new version' %}</h3><p class="action-explanation">{% ui '旧内容、旧交付检查和旧提交会原样保留。恢复后请修改或生成新的完整内容版本，再重新填写交付检查。' 'The previous content, delivery check, and submission remain unchanged. Revise or generate a new complete content version, then complete a new delivery check.' %}</p>
             <form action="{% url 'dashboard:task-action' task.id 'resume-work' %}" method="post">{% csrf_token %}{{ action_form.command_id }}{{ action_form.expected_state_version }}<button class="button button-primary" type="submit">{% ui '恢复制作' 'Resume work' %}</button></form>
         {% elif action_kind == "deliver" %}
-            <h3>{% ui '提交本次交付链接，并逐项确认是否完成' 'Submit the delivery link and confirm each completion item' %}</h3><p class="action-explanation">{% ui '系统会把链接作为不可变交付版本封存。链接变化必须创建新版本并重新送审；选择“尚未准备好”会保留本次结果，但不会送审。' 'The system seals the link as an immutable delivery version. A changed link creates a new version and requires another review. Selecting Not ready keeps the result without sending it for review.' %}</p>
+            <h3>{% ui '选择这次送审的完整内容，并逐项确认' 'Choose the complete content to submit and confirm each item' %}</h3><p class="action-explanation">{% ui '优先选择上方刚保存的系统内内容；如果内容放在其他工具，也可改选外部链接。系统会封存你选择的确切版本，之后不会悄悄改变。' 'Prefer the content version saved above. If the content lives in another tool, choose an external link instead. The system seals the exact selected version so it cannot change silently.' %}</p>
             <form class="task-action-form" action="{% url 'dashboard:task-action' task.id 'deliver' %}" method="post">
                 {% csrf_token %}{{ action_form.command_id }}{{ action_form.expected_state_version }}{{ action_form.non_field_errors }}
                 {% for field in action_form.visible_fields %}
@@ -83,13 +157,25 @@
                     {{ field.errors }}{% if field.help_text %}<small>{{ field.help_text }}</small>{% endif %}
                 </div>
                 {% endfor %}
-                <button class="button button-primary" type="submit">{% ui '封存交付并送审' 'Seal delivery and send for review' %}</button>
+                <button class="button button-primary" type="submit">{% ui '封存这份内容并送审' 'Seal this content and send for review' %}</button>
             </form>
         {% elif task.current_state == "UNDER_REVIEW" %}
-            <h3>{% ui '交付已送入人工审核' 'Delivery sent for human review' %}</h3><p class="action-explanation">{% ui '现在无需在本页操作。等待具备审核权限的人员处理；本页没有审核、门禁或发布按钮。' 'No action is needed here. Wait for an authorized reviewer. This page has no review, release-check, or publishing controls.' %}</p>
+            <h3>{% ui '交付已送入人工审核' 'Delivery sent for human review' %}</h3><p class="action-explanation">{% ui 'Owner 自己提交时，可在“审核”队列做最终批准；Admin 或 Operator 提交时，必须由另一位有审核权限的账号处理。右上角铃铛会明确提示现在轮到谁。' 'When the Owner submits, they may give final approval in the Review queue. Admin and Operator submissions must be handled by another authorized reviewer. The top-right bell shows whose action is next.' %}</p>
             {% if submission %}<dl class="submission-summary"><dt>{% ui '提交批次' 'Submission' %}</dt><dd>#{{ submission.submission_number }}</dd><dt>{% ui '封存时间' 'Sealed at' %}</dt><dd>{{ submission.sealed_at }}</dd></dl>{% endif %}
         {% else %}
             <h3>{% ui '当前没有可执行动作' 'No action is available now' %}</h3><p class="action-explanation">{% ui '可能是当前状态暂不需要你操作，或你没有该产品的编辑权限。任务事实仍可在左侧查看。' 'The current state may not need your action, or you may not have edit access for this product. You can still view the task facts on the left.' %}</p>
+        {% endif %}
+
+        {% if reassign_form %}
+        <div class="secondary-action-block">
+            <h3>{% ui '分错人了？现在可以改派' 'Assigned to the wrong person? Reassign it now' %}</h3>
+            <p class="action-explanation">{% ui '只允许在送审前改派。系统不会删除旧分配记录，新负责人会从当前进度继续。' 'Reassignment is allowed only before review. The previous assignment remains in history, and the new assignee continues from the current progress.' %}</p>
+            <form class="task-action-form" action="{% url 'dashboard:task-action' task.id 'reassign' %}" method="post">
+                {% csrf_token %}{{ reassign_form.command_id }}{{ reassign_form.expected_state_version }}{{ reassign_form.expected_current_assignment_id }}{{ reassign_form.non_field_errors }}
+                {% for field in reassign_form.visible_fields %}<div class="field-row"><label for="{{ field.id_for_label }}">{% ui '改派给' 'Reassign to' %}</label>{{ field }}{{ field.errors }}</div>{% endfor %}
+                <button class="button button-secondary" type="submit">{% ui '确认改派' 'Confirm reassignment' %}</button>
+            </form>
+        </div>
         {% endif %}
 
         {% if withdraw_form %}
@@ -104,17 +190,26 @@
         </div>
         {% endif %}
 
-        {% if cancel_form %}
-        <div class="secondary-action-block secondary-action-danger">
-            <h3>{% ui '这份草稿建错了？' 'Created the wrong draft?' %}</h3>
-            <p class="action-explanation">{% ui '取消后它会从“今日任务”隐藏，但系统仍保留历史，避免误删审计记录。' 'Cancelling hides it from Today while preserving its audit history.' %}</p>
-            <form class="task-action-form" action="{% url 'dashboard:task-action' task.id 'cancel' %}" method="post">
-                {% csrf_token %}{{ cancel_form.command_id }}{{ cancel_form.expected_state_version }}{{ cancel_form.non_field_errors }}
-                {% for field in cancel_form.visible_fields %}<div class="field-row">{{ field.label_tag }}{{ field }}{{ field.errors }}{% if field.help_text %}<small>{{ field.help_text }}</small>{% endif %}</div>{% endfor %}
-                <button class="button button-danger" type="submit">{% ui '取消这份草稿' 'Cancel this draft' %}</button>
-            </form>
-        </div>
-        {% endif %}
     </article>
 </section>
+{% if revision_form %}
+<script>
+(function () {
+    const button = document.getElementById("copy-inline-content");
+    const content = document.getElementById("id_inline_content");
+    if (!button || !content) return;
+    button.addEventListener("click", async function () {
+        try {
+            await navigator.clipboard.writeText(content.value);
+            button.textContent = "{% ui '已复制' 'Copied' %}";
+        } catch (error) {
+            content.focus();
+            content.select();
+            document.execCommand("copy");
+            button.textContent = "{% ui '已复制' 'Copied' %}";
+        }
+    });
+})();
+</script>
+{% endif %}
 {% endblock %}

@@ -333,7 +333,7 @@ class FrozenV1AcceptanceTests(TestCase):
         body = f"Exact immutable acceptance content {label}".encode()
         version = ContentAssetVersion.create_next(
             content_asset=asset,
-            object_key=f"acceptance/{task.pk}/primary-{label}.txt",
+            object_key=f"https://assets.example.com/acceptance/{task.pk}/primary-{label}.txt",
             mime_type="text/plain",
             byte_size=len(body),
             content_sha256=hashlib.sha256(body).hexdigest(),

@@ -46,6 +46,13 @@ esac
 [ -n "${STAGING_IMAGE_DIGEST:-}" ] || fail "STAGING_IMAGE_DIGEST is required."
 [ -n "${POSTGRES_IMAGE:-}" ] || fail "POSTGRES_IMAGE is required."
 [ -n "${NGINX_IMAGE:-}" ] || fail "NGINX_IMAGE is required."
+for required_name in STAGING_OWNER_USERNAME STAGING_ADMIN_USERNAME \
+    STAGING_OPERATOR_USERNAME STAGING_PRODUCT_CODE STAGING_PUBLISH_ACCOUNT_CODE
+do
+    eval "required_value=\${${required_name}:-}"
+    [ -n "$required_value" ] || fail "$required_name is required."
+done
+unset required_name required_value
 require_digest_image POSTGRES_IMAGE
 require_digest_image NGINX_IMAGE
 case "$STAGING_HOSTNAME" in
@@ -134,33 +141,125 @@ compose exec -T web python manage.py migrate --check
 compose exec -T web python manage.py check
 compose exec -T web python manage.py check --deploy
 
+# Verify the complete exact base Grant plan without committing any writes.
+compose exec -T web python manage.py provision_staging_staff \
+    --owner-username "$STAGING_OWNER_USERNAME" \
+    --admin-username "$STAGING_ADMIN_USERNAME" \
+    --operator-username "$STAGING_OPERATOR_USERNAME" \
+    --product-code "$STAGING_PRODUCT_CODE" \
+    --publish-account-code "$STAGING_PUBLISH_ACCOUNT_CODE"
+
+# The rollback-only dry run can model missing publish authority. Independently
+# prove all three current exact Grants are already committed, bounded and
+# granted by the Owner before accepting the running candidate.
 compose exec -T web python -c '
+import sys
+from datetime import timedelta
+from django.db.models import Q
+from django.utils import timezone
+
+from accounts.models import PermissionGrant, Principal
+
+usernames = sys.argv[1:4]
+account_ref = sys.argv[4]
+principals = {
+    principal.username: principal
+    for principal in Principal.objects.filter(username__in=usernames)
+}
+if set(principals) != set(usernames):
+    raise SystemExit("VERIFY_PUBLISH_PRINCIPAL_SET_NOT_EXACT")
+owner = principals[usernames[0]]
+now = timezone.now()
+grants = list(PermissionGrant.objects.filter(
+    principal__in=principals.values(),
+    scope_kind=PermissionGrant.ScopeKind.ACCOUNT,
+    product__isnull=True,
+    platform_code="",
+    account_ref=account_ref,
+    surface_ref="",
+    action=PermissionGrant.Action.PUBLISH,
+    effect=PermissionGrant.Effect.ALLOW,
+    risk_level=PermissionGrant.RiskLevel.HIGH,
+    grant_status=PermissionGrant.GrantStatus.ACTIVE,
+    valid_from__lte=now,
+).filter(Q(valid_until__isnull=True) | Q(valid_until__gt=now)))
+for username in usernames:
+    exact = [grant for grant in grants if grant.principal_id == principals[username].pk]
+    if len(exact) != 1:
+        raise SystemExit(f"VERIFY_EXACT_BOUNDED_PUBLISH_GRANT_MISSING:{username}")
+    grant = exact[0]
+    if (
+        grant.valid_until is None
+        or grant.valid_until - grant.valid_from > timedelta(days=31)
+        or grant.granted_by_principal_id != owner.pk
+    ):
+        raise SystemExit(f"VERIFY_PUBLISH_GRANT_NOT_OWNER_GRANTED_OR_BOUNDED:{username}")
+print("Running exact bounded Owner/Admin/Operator PUBLISH Grants: PASS")
+' "$STAGING_OWNER_USERNAME" "$STAGING_ADMIN_USERNAME" "$STAGING_OPERATOR_USERNAME" \
+    "$STAGING_PUBLISH_ACCOUNT_CODE"
+
+compose exec -T web python -c '
+import hashlib
+from urllib.parse import urlsplit
+
 from contentops.models import ContentAssetVersion
 
 invalid_count = 0
 sample_ids = []
 total = 0
+legacy_count = 0
+external_url_count = 0
+inline_text_count = 0
 for version in ContentAssetVersion.objects.only(
-    "id", "mime_type", "metadata", "object_key"
+    "id", "payload_schema_version", "representation_kind", "object_key",
+    "inline_content", "byte_size", "content_sha256"
 ).iterator():
     total += 1
-    metadata = version.metadata
-    if (
-        version.mime_type != "text/uri-list"
-        or not isinstance(metadata, dict)
-        or metadata.get("source") != "external-url"
-        or not version.object_key.startswith(("http://", "https://"))
-    ):
+    valid = False
+    if version.payload_schema_version == ContentAssetVersion.PayloadSchemaVersion.V1:
+        # Historical V1 rows keep their original object-key payload and hashes.
+        # They are compatibility-only; current code can create V2 rows only.
+        legacy_count += 1
+        valid = (
+            version.representation_kind == ContentAssetVersion.RepresentationKind.EXTERNAL_URL
+            and bool(version.object_key)
+            and not version.inline_content
+        )
+    elif version.payload_schema_version == ContentAssetVersion.PayloadSchemaVersion.V2:
+        if version.representation_kind == ContentAssetVersion.RepresentationKind.EXTERNAL_URL:
+            parsed = urlsplit(version.object_key)
+            external_url_count += 1
+            valid = (
+                parsed.scheme in {"http", "https"}
+                and bool(parsed.netloc)
+                and not parsed.username
+                and not parsed.password
+                and not version.inline_content
+            )
+        elif version.representation_kind == ContentAssetVersion.RepresentationKind.INLINE_TEXT:
+            encoded = version.inline_content.encode("utf-8")
+            inline_text_count += 1
+            valid = (
+                not version.object_key
+                and bool(version.inline_content.strip())
+                and version.byte_size == len(encoded)
+                and version.content_sha256 == hashlib.sha256(encoded).hexdigest()
+            )
+    if not valid:
         invalid_count += 1
         if len(sample_ids) < 5:
             sample_ids.append(str(version.pk))
 if invalid_count:
     rendered_ids = ",".join(sample_ids)
     raise SystemExit(
-        "LINK_ONLY_CONTENT_VERSION_GATE_FAILED: "
+        "CONTENT_REPRESENTATION_GATE_FAILED: "
         f"invalid_count={invalid_count}; sample_ids={rendered_ids}"
     )
-print(f"Link-only ContentAssetVersion gate: PASS ({total} versions)")
+print(
+    "ContentAssetVersion representation gate: PASS "
+    f"(total={total}, legacy_v1={legacy_count}, external_url_v2={external_url_count}, "
+    f"inline_text_v2={inline_text_count})"
+)
 '
 
 compose exec -T nginx nginx -t

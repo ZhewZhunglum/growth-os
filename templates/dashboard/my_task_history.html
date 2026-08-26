@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% load ui_i18n %}
+{% block title %}{% ui '我的工作记录' 'My work history' %} · PUKO Growth OS{% endblock %}
+{% block page_title %}{% ui '我的工作记录' 'My work history' %}{% endblock %}
+{% block content %}
+<a class="back-link" href="{% url 'dashboard:home' %}">← {% ui '返回首页' 'Back to home' %}</a>
+
+<section class="hero-panel">
+    <div>
+        <p class="eyebrow">{% ui '个人记录 · 只读' 'Personal record · read only' %}</p>
+        <h2>{% ui '我参与过的任务' 'Tasks I worked on' %}</h2>
+        <p>{% ui '这里汇总你创建、执行、提交、审核或参与发布的任务。记录不会在这里被修改。' 'This is a summary of tasks you created, worked on, submitted, reviewed, or helped publish. Nothing can be changed here.' %}</p>
+    </div>
+</section>
+
+<section class="section-heading">
+    <div><h2>{% ui '工作记录' 'Work history' %}</h2></div>
+    <span class="section-note">{{ page_obj.paginator.count }} {% ui '项' 'items' %}</span>
+</section>
+
+<section class="task-list" aria-label="{% ui '我的任务历史' 'My task history' %}">
+    {% for task in page_obj.object_list %}
+    <article class="task-card">
+        <header class="task-card-header">
+            <div>
+                <p class="task-meta">{{ task.product.name }}</p>
+                <h3>{{ task.title }}</h3>
+            </div>
+            <span class="task-state">{% ui_task_state task.current_state %}</span>
+        </header>
+        <div class="task-section">
+            <span class="task-label">{% ui '我的参与' 'My involvement' %}</span>
+            <p>
+                {% for label in task.participation_labels %}
+                <span class="task-state">{% ui label.zh label.en %}</span>{% if not forloop.last %} {% endif %}
+                {% endfor %}
+            </p>
+        </div>
+        <footer class="task-card-footer">
+            <span>{% ui '最近更新' 'Last updated' %}: {{ task.updated_at }}</span>
+            <span>{% ui '只读摘要' 'Read-only summary' %}</span>
+        </footer>
+    </article>
+    {% empty %}
+    <article class="empty-state task-empty-state">
+        <span class="empty-number">00</span>
+        <div>
+            <h3>{% ui '暂时没有可查看的工作记录' 'No work history to show yet' %}</h3>
+            <p>{% ui '参与任务后，记录会出现在这里；已失去查看权限的产品不会显示。' 'Tasks appear after you participate. Products you can no longer view stay hidden.' %}</p>
+        </div>
+    </article>
+    {% endfor %}
+</section>
+
+{% if page_obj.paginator.num_pages > 1 %}
+<nav class="task-card-footer" aria-label="{% ui '工作记录分页' 'Work-history pages' %}">
+    <span>{% ui '第' 'Page' %} {{ page_obj.number }} / {{ page_obj.paginator.num_pages }} {% ui '页' '' %}</span>
+    <span>
+        {% if page_obj.has_previous %}<a class="button button-secondary" href="?page={{ page_obj.previous_page_number }}">← {% ui '上一页' 'Previous' %}</a>{% endif %}
+        {% if page_obj.has_next %}<a class="button button-secondary" href="?page={{ page_obj.next_page_number }}">{% ui '下一页' 'Next' %} →</a>{% endif %}
+    </span>
+</nav>
+{% endif %}
+{% endblock %}

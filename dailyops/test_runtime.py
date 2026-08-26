@@ -70,7 +70,10 @@ class FakeAITransport:
             status_code=200,
             payload={
                 "id": "deepseek-test-1",
-                "choices": [{"message": {"content": json.dumps(self.output)}}],
+                "choices": [{
+                    "finish_reason": "stop",
+                    "message": {"content": json.dumps(self.output)},
+                }],
                 "usage": {"prompt_tokens": 100, "completion_tokens": 100, "total_tokens": 200},
             },
             request_id="deepseek-test-1",
@@ -184,6 +187,7 @@ class DailyOperationsRuntimeTests(unittest.TestCase):
                         )
                     },
                     browser_clients={Platform.QUORA: browser},
+                    browser_clocks={Platform.QUORA: lambda: NOW},
                 )
             )
         )

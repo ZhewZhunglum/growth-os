@@ -6,6 +6,7 @@ import re
 import uuid
 from collections.abc import Iterable
 from typing import Any
+from urllib.parse import urlsplit
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
@@ -18,6 +19,7 @@ from workflow.services import guard_review, guard_submission
 
 
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+DAILY_OPERATIONS_MIN_INLINE_CHARS = 20
 
 
 def canonical_sha256(payload: Any) -> str:
@@ -30,6 +32,14 @@ def canonical_sha256(payload: Any) -> str:
 def validate_sha256(value: str) -> None:
     if not SHA256_PATTERN.fullmatch(value):
         raise ValidationError("Expected a lowercase 64-character SHA-256 digest.")
+
+
+def _task_requires_inline_primary(task_id) -> bool:
+    """Use the typed compilation context as the Daily Operations marker."""
+
+    from intelligence.models import TaskCompilationContext
+
+    return TaskCompilationContext.objects.filter(task_id=task_id).exists()
 
 
 class ActingRole(models.TextChoices):
@@ -208,9 +218,27 @@ class ContentAsset(AppendOnlyFact):
 
 
 class ContentAssetVersion(AppendOnlyFact):
+    class PayloadSchemaVersion(models.IntegerChoices):
+        V1 = 1, "Legacy object-key payload"
+        V2 = 2, "Representation-aware payload"
+
+    class RepresentationKind(models.TextChoices):
+        EXTERNAL_URL = "EXTERNAL_URL", "External URL"
+        INLINE_TEXT = "INLINE_TEXT", "Inline text"
+
     content_asset = models.ForeignKey(ContentAsset, on_delete=models.PROTECT, related_name="versions")
     version_number = models.PositiveIntegerField()
-    object_key = models.CharField(max_length=1024)
+    payload_schema_version = models.PositiveSmallIntegerField(
+        choices=PayloadSchemaVersion.choices,
+        default=PayloadSchemaVersion.V2,
+    )
+    representation_kind = models.CharField(
+        max_length=16,
+        choices=RepresentationKind.choices,
+        default=RepresentationKind.EXTERNAL_URL,
+    )
+    object_key = models.CharField(max_length=1024, blank=True, default="")
+    inline_content = models.TextField(blank=True, default="")
     mime_type = models.CharField(max_length=255)
     byte_size = models.PositiveBigIntegerField()
     content_sha256 = models.CharField(max_length=64, validators=[validate_sha256])
@@ -237,11 +265,24 @@ class ContentAssetVersion(AppendOnlyFact):
                 fields=["content_asset", "version_number"], name="contentops_unique_asset_version"
             ),
             models.CheckConstraint(condition=Q(version_number__gte=1), name="contentops_asset_version_gte_one"),
-            models.CheckConstraint(condition=~Q(object_key=""), name="contentops_object_key_not_empty"),
+            models.CheckConstraint(
+                condition=(
+                    Q(representation_kind="EXTERNAL_URL")
+                    & ~Q(object_key="")
+                    & Q(inline_content="")
+                )
+                | (
+                    Q(representation_kind="INLINE_TEXT")
+                    & Q(object_key="")
+                    & ~Q(inline_content="")
+                ),
+                name="contentops_asset_version_representation_valid",
+            ),
         ]
 
-    def command_payload(self) -> dict[str, Any]:
-        return {
+    def command_payload(self, *, schema_version: int | None = None) -> dict[str, Any]:
+        version = self.payload_schema_version if schema_version is None else schema_version
+        legacy_payload = {
             "content_asset_id": str(self.content_asset_id),
             "object_key": self.object_key,
             "mime_type": self.mime_type,
@@ -249,12 +290,50 @@ class ContentAssetVersion(AppendOnlyFact):
             "content_sha256": self.content_sha256,
             "metadata": self.metadata,
         }
+        if version == self.PayloadSchemaVersion.V1:
+            return legacy_payload
+        if version != self.PayloadSchemaVersion.V2:
+            raise ValidationError({"payload_schema_version": "Unsupported content payload schema version."})
+        return {
+            **legacy_payload,
+            "payload_schema_version": self.PayloadSchemaVersion.V2,
+            "representation_kind": self.representation_kind,
+            "inline_content": self.inline_content,
+        }
 
     def manifest_payload(self) -> dict[str, Any]:
         return {**self.command_payload(), "version_number": self.version_number}
 
     def clean(self):
         super().clean()
+        if self.payload_schema_version == self.PayloadSchemaVersion.V1:
+            if self.representation_kind != self.RepresentationKind.EXTERNAL_URL or self.inline_content:
+                raise ValidationError(
+                    {"representation_kind": "Legacy content payloads must remain object-key references."}
+                )
+        elif self.payload_schema_version != self.PayloadSchemaVersion.V2:
+            raise ValidationError({"payload_schema_version": "Unsupported content payload schema version."})
+        elif self.representation_kind == self.RepresentationKind.EXTERNAL_URL:
+            parsed = urlsplit(self.object_key)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                raise ValidationError({"object_key": "External content must use an absolute HTTP(S) URL."})
+            if parsed.username or parsed.password:
+                raise ValidationError({"object_key": "External content URLs must not embed credentials."})
+            if self.inline_content:
+                raise ValidationError({"inline_content": "External URL content cannot also contain inline text."})
+        elif self.representation_kind == self.RepresentationKind.INLINE_TEXT:
+            if self.object_key:
+                raise ValidationError({"object_key": "Inline text content cannot also contain an external URL."})
+            if not self.inline_content.strip():
+                raise ValidationError({"inline_content": "Inline text content cannot be blank."})
+            inline_bytes = self.inline_content.encode("utf-8")
+            if self.byte_size != len(inline_bytes):
+                raise ValidationError({"byte_size": "Inline byte size must match the UTF-8 content."})
+            if self.content_sha256 != hashlib.sha256(inline_bytes).hexdigest():
+                raise ValidationError({"content_sha256": "Inline content hash does not match the UTF-8 content."})
+        else:
+            raise ValidationError({"representation_kind": "Unsupported content representation."})
+
         expected_payload_hash = canonical_sha256(self.command_payload())
         expected_manifest_hash = canonical_sha256(self.manifest_payload())
         if not self.creation_payload_hash:
@@ -279,10 +358,12 @@ class ContentAssetVersion(AppendOnlyFact):
         cls,
         *,
         content_asset: ContentAsset,
-        object_key: str,
+        object_key: str = "",
+        inline_content: str = "",
+        representation_kind: str = RepresentationKind.EXTERNAL_URL,
         mime_type: str,
-        byte_size: int,
-        content_sha256: str,
+        byte_size: int | None = None,
+        content_sha256: str | None = None,
         metadata: dict[str, Any] | None = None,
         command_id: uuid.UUID,
         actor_principal,
@@ -291,19 +372,34 @@ class ContentAssetVersion(AppendOnlyFact):
         recorded_by_principal,
     ) -> ContentAssetVersion:
         metadata = metadata or {}
-        payload_hash = canonical_sha256(
-            {
-                "content_asset_id": str(content_asset.pk),
-                "object_key": object_key,
-                "mime_type": mime_type,
-                "byte_size": byte_size,
-                "content_sha256": content_sha256,
-                "metadata": metadata,
-            }
+        if representation_kind == cls.RepresentationKind.INLINE_TEXT:
+            inline_bytes = inline_content.encode("utf-8")
+            if byte_size is None:
+                byte_size = len(inline_bytes)
+            if content_sha256 is None:
+                content_sha256 = hashlib.sha256(inline_bytes).hexdigest()
+        elif byte_size is None or content_sha256 is None:
+            raise ValidationError("External URL versions require byte_size and content_sha256.")
+
+        provisional = cls(
+            content_asset=content_asset,
+            version_number=1,
+            payload_schema_version=cls.PayloadSchemaVersion.V2,
+            representation_kind=representation_kind,
+            object_key=object_key,
+            inline_content=inline_content,
+            mime_type=mime_type,
+            byte_size=byte_size,
+            content_sha256=content_sha256,
+            metadata=metadata,
         )
+        payload_hash = canonical_sha256(provisional.command_payload())
         existing = cls.objects.filter(creation_command_id=command_id).first()
         if existing:
-            if existing.creation_payload_hash != payload_hash:
+            replay_hash = canonical_sha256(
+                provisional.command_payload(schema_version=existing.payload_schema_version)
+            )
+            if existing.creation_payload_hash != replay_hash:
                 raise ValidationError("The command_id was already used with a different payload.")
             return existing
 
@@ -314,7 +410,10 @@ class ContentAssetVersion(AppendOnlyFact):
             return cls.objects.create(
                 content_asset=locked_asset,
                 version_number=next_number,
+                payload_schema_version=cls.PayloadSchemaVersion.V2,
+                representation_kind=representation_kind,
                 object_key=object_key,
+                inline_content=inline_content,
                 mime_type=mime_type,
                 byte_size=byte_size,
                 content_sha256=content_sha256,
@@ -489,9 +588,28 @@ class TaskSubmission(AppendOnlyFact):
         except ReviewDecision.DoesNotExist:
             final_review = None
         withdrawal = previous.withdrawal_events.filter(event_type="SUBMISSION_WITHDRAWN").first()
+        approved_rework = previous.withdrawal_events.filter(
+            event_type="APPROVED_REWORK_REQUESTED"
+        ).first()
         if final_review is not None:
-            if final_review.decision != ReviewDecision.Decision.CHANGES_REQUESTED:
-                raise ValidationError({"supersedes_submission": "Only CHANGES_REQUESTED may trigger human rework."})
+            valid_review_trigger = (
+                final_review.decision == ReviewDecision.Decision.CHANGES_REQUESTED
+                and approved_rework is None
+            ) or (
+                final_review.decision == ReviewDecision.Decision.APPROVED
+                and approved_rework is not None
+                and approved_rework.task_id == self.task_id
+                and approved_rework.submission_id == previous.pk
+            )
+            if not valid_review_trigger:
+                raise ValidationError(
+                    {
+                        "supersedes_submission": (
+                            "Rework requires exact CHANGES_REQUESTED review or an authorized "
+                            "approved-submission rework event."
+                        )
+                    }
+                )
             if self.triggering_review_id != final_review.pk:
                 raise ValidationError({"triggering_review": "Human rework must bind the exact final review."})
             if withdrawal is not None:
@@ -513,6 +631,29 @@ class TaskSubmission(AppendOnlyFact):
         if self.primary_asset_version_id and self.task_id:
             if self.primary_asset_version.content_asset.task_id != self.task_id:
                 raise ValidationError({"primary_asset_version": "The primary asset belongs to a different task."})
+            if _task_requires_inline_primary(self.task_id):
+                if (
+                    self.primary_asset_version.representation_kind
+                    != ContentAssetVersion.RepresentationKind.INLINE_TEXT
+                ):
+                    raise ValidationError(
+                        {
+                            "primary_asset_version": (
+                                "Daily Operations requires complete inline text as the primary "
+                                "deliverable; external URLs may be supporting references only."
+                            )
+                        }
+                    )
+                normalized_inline = self.primary_asset_version.inline_content.strip()
+                if len(normalized_inline) < DAILY_OPERATIONS_MIN_INLINE_CHARS:
+                    raise ValidationError(
+                        {
+                            "primary_asset_version": (
+                                "Daily Operations publishable content must contain at least "
+                                f"{DAILY_OPERATIONS_MIN_INLINE_CHARS} non-whitespace characters."
+                            )
+                        }
+                    )
         if self.dod_check_run_id and self.task_id:
             self._validate_passing_dod()
         normalized = self._normalized_asset_manifest()
@@ -681,6 +822,7 @@ class ReviewDecision(AppendOnlyFact):
     class PayloadSchemaVersion(models.IntegerChoices):
         V1 = 1, "Legacy review command"
         V2 = 2, "Reviewer-bound review command"
+        V3 = 3, "Reviewer and Owner-edit-bound review command"
 
     class Decision(models.TextChoices):
         APPROVED = "APPROVED", "Approved"
@@ -696,7 +838,7 @@ class ReviewDecision(AppendOnlyFact):
     payload_hash = models.CharField(max_length=64, validators=[validate_sha256], blank=True)
     payload_schema_version = models.PositiveSmallIntegerField(
         choices=PayloadSchemaVersion.choices,
-        default=PayloadSchemaVersion.V2,
+        default=PayloadSchemaVersion.V3,
     )
     expected_task_version = models.PositiveIntegerField()
     reviewer_principal = models.ForeignKey(
@@ -706,6 +848,13 @@ class ReviewDecision(AppendOnlyFact):
     reviewer_grant = models.ForeignKey(
         "accounts.PermissionGrant", on_delete=models.PROTECT, related_name="review_decisions_made"
     )
+    owner_edit_grant = models.ForeignKey(
+        "accounts.PermissionGrant",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="owner_self_approvals_made",
+    )
     recorded_by_principal = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="review_decisions_recorded"
     )
@@ -713,6 +862,69 @@ class ReviewDecision(AppendOnlyFact):
 
     class Meta:
         ordering = ["decided_at", "id"]
+
+    @staticmethod
+    def owner_self_approval_allowed(
+        *,
+        submission: TaskSubmission,
+        decision: str,
+        reviewer_principal,
+        acting_role: str,
+    ) -> bool:
+        """Allow one explicit exception to submitter/reviewer separation.
+
+        The product Owner may give the final approval to their own content,
+        but only while acting as Owner and only through an exact REVIEW grant.
+        Admins and Operators remain unable to self-review, and an Owner cannot
+        use this exception to create a self-authored rework/rejection fact.
+        """
+
+        return bool(
+            reviewer_principal.pk == submission.submitted_by_principal_id
+            and reviewer_principal.role == ActingRole.OWNER
+            and acting_role == ActingRole.OWNER
+            and decision == ReviewDecision.Decision.APPROVED
+        )
+
+    @staticmethod
+    def owner_self_approval_has_product_edit_authorization(
+        *,
+        submission: TaskSubmission,
+        reviewer_principal,
+        acting_role: str,
+        owner_edit_grant,
+        at=None,
+    ) -> bool:
+        """Require a current, exact Product EDIT allow with DENY precedence.
+
+        The review row and its V3 command hash store both the exact REVIEW and
+        EDIT grants.  The Task transition in the same application transaction
+        independently records that same EDIT grant.  This check is mirrored by
+        the database trigger so raw inserts cannot manufacture the Owner
+        exception without both live permissions.
+        """
+
+        from accounts.authorization import resolve_authorization
+        from accounts.models import PermissionGrant
+
+        decision = resolve_authorization(
+            principal=reviewer_principal,
+            acting_role=acting_role,
+            action=PermissionGrant.Action.EDIT,
+            scope_kind=PermissionGrant.ScopeKind.PRODUCT,
+            product=submission.task.product_id,
+            at=at or timezone.now(),
+        )
+        grant = decision.grant
+        return bool(
+            decision.allowed
+            and grant is not None
+            and owner_edit_grant is not None
+            and grant.pk == owner_edit_grant.pk
+            and grant.action == PermissionGrant.Action.EDIT
+            and grant.scope_kind == PermissionGrant.ScopeKind.PRODUCT
+            and grant.product_id == submission.task.product_id
+        )
 
     def command_payload(self, *, schema_version: int | None = None) -> dict[str, Any]:
         """Return the exact payload shape used by the stored hash.
@@ -732,14 +944,25 @@ class ReviewDecision(AppendOnlyFact):
         }
         if version == self.PayloadSchemaVersion.V1:
             return legacy_payload
-        if version != self.PayloadSchemaVersion.V2:
+        if version not in {
+            self.PayloadSchemaVersion.V2,
+            self.PayloadSchemaVersion.V3,
+        }:
             raise ValidationError({"payload_schema_version": "Unsupported review payload schema version."})
-        return {
+        reviewer_bound_payload = {
             **legacy_payload,
-            "payload_schema_version": self.PayloadSchemaVersion.V2,
+            "payload_schema_version": version,
             "reviewer_principal_id": str(self.reviewer_principal_id),
             "reviewer_acting_role": self.reviewer_acting_role,
             "reviewer_grant_id": str(self.reviewer_grant_id),
+        }
+        if version == self.PayloadSchemaVersion.V2:
+            return reviewer_bound_payload
+        return {
+            **reviewer_bound_payload,
+            "owner_edit_grant_id": (
+                str(self.owner_edit_grant_id) if self.owner_edit_grant_id else None
+            ),
         }
 
     def clean(self):
@@ -761,8 +984,82 @@ class ReviewDecision(AppendOnlyFact):
             self.submission_id
             and self.reviewer_principal_id
             and self.reviewer_principal_id == self.submission.submitted_by_principal_id
+            and not self.owner_self_approval_allowed(
+                submission=self.submission,
+                decision=self.decision,
+                reviewer_principal=self.reviewer_principal,
+                acting_role=self.reviewer_acting_role,
+            )
         ):
-            raise ValidationError({"reviewer_principal": "A submitter cannot review their own submission."})
+            raise ValidationError(
+                {
+                    "reviewer_principal": (
+                        "A non-Owner submitter cannot review their own submission; "
+                        "only an Owner may approve it."
+                    )
+                }
+            )
+        is_owner_self_approval = bool(
+            self.submission_id
+            and self.reviewer_principal_id
+            and self.owner_self_approval_allowed(
+                submission=self.submission,
+                decision=self.decision,
+                reviewer_principal=self.reviewer_principal,
+                acting_role=self.reviewer_acting_role,
+            )
+        )
+        if is_owner_self_approval:
+            from accounts.models import PermissionGrant
+
+            if self.payload_schema_version != self.PayloadSchemaVersion.V3:
+                raise ValidationError(
+                    {
+                        "payload_schema_version": (
+                            "Owner final approval must use the exact-grant-bound V3 payload."
+                        )
+                    }
+                )
+            if not self.rationale.strip():
+                raise ValidationError(
+                    {"rationale": "Owner final approval requires a non-empty audit reason."}
+                )
+            if (
+                not self.reviewer_grant_id
+                or self.reviewer_grant.action != PermissionGrant.Action.REVIEW
+                or self.reviewer_grant.scope_kind != PermissionGrant.ScopeKind.PRODUCT
+                or self.reviewer_grant.product_id != self.submission.task.product_id
+            ):
+                raise ValidationError(
+                    {
+                        "reviewer_grant": (
+                            "Owner final approval requires the exact REVIEW grant for this Product."
+                        )
+                    }
+                )
+            if not self.owner_self_approval_has_product_edit_authorization(
+                submission=self.submission,
+                reviewer_principal=self.reviewer_principal,
+                acting_role=self.reviewer_acting_role,
+                owner_edit_grant=self.owner_edit_grant,
+                at=self.decided_at or timezone.now(),
+            ):
+                raise ValidationError(
+                    {
+                        "reviewer_principal": (
+                            "Owner final approval also requires the exact current Product EDIT grant."
+                        )
+                    }
+                )
+        elif self.owner_edit_grant_id:
+            raise ValidationError(
+                {
+                    "owner_edit_grant": (
+                        "The Owner EDIT grant may only be recorded for an Owner approving "
+                        "their own submission."
+                    )
+                }
+            )
         if self.reviewer_grant_id and self.reviewer_principal_id and self.submission_id:
             _validate_grant(
                 grant=self.reviewer_grant,
@@ -791,7 +1088,13 @@ class ReviewDecision(AppendOnlyFact):
         acting_role: str,
         permission_grant,
         recorded_by_principal,
+        owner_edit_grant=None,
     ) -> ReviewDecision:
+        rationale = str(rationale or "").strip()
+        if not rationale:
+            raise ValidationError(
+                {"rationale": "A non-empty review or approval reason is required."}
+            )
         criteria_results = criteria_results or {}
         provisional = cls(
             submission=submission,
@@ -799,20 +1102,45 @@ class ReviewDecision(AppendOnlyFact):
             rationale=rationale,
             criteria_results=criteria_results,
             command_id=command_id,
-            payload_schema_version=cls.PayloadSchemaVersion.V2,
+            payload_schema_version=cls.PayloadSchemaVersion.V3,
             expected_task_version=expected_task_version,
             reviewer_principal=reviewer_principal,
             reviewer_acting_role=acting_role,
             reviewer_grant=permission_grant,
+            owner_edit_grant=owner_edit_grant,
             recorded_by_principal=recorded_by_principal,
             decided_at=timezone.now(),
         )
-        provisional.payload_hash = canonical_sha256(provisional.command_payload())
-        provisional.decision_sha256 = provisional.payload_hash
-        if reviewer_principal.pk == submission.submitted_by_principal_id:
-            raise ValidationError({"reviewer_principal": "A submitter cannot review their own submission."})
+        is_owner_self_approval = cls.owner_self_approval_allowed(
+            submission=submission,
+            decision=decision,
+            reviewer_principal=reviewer_principal,
+            acting_role=acting_role,
+        )
+        if (
+            reviewer_principal.pk == submission.submitted_by_principal_id
+            and not is_owner_self_approval
+        ):
+            raise ValidationError(
+                {
+                    "reviewer_principal": (
+                        "A non-Owner submitter cannot review their own submission; "
+                        "only an Owner may approve it."
+                    )
+                }
+            )
+        if not is_owner_self_approval and owner_edit_grant is not None:
+            raise ValidationError(
+                {
+                    "owner_edit_grant": (
+                        "The Owner EDIT grant may only be recorded for an Owner approving "
+                        "their own submission."
+                    )
+                }
+            )
 
         with transaction.atomic():
+            from accounts.models import PermissionGrant
             from workflow.models import Task, TaskStateEvent
 
             # Withdrawal uses this same Task -> Submission order.  The first
@@ -821,6 +1149,27 @@ class ReviewDecision(AppendOnlyFact):
             locked_submission = TaskSubmission.objects.select_for_update().get(pk=submission.pk)
             locked_submission.task = locked_task
             provisional.submission = locked_submission
+
+            grant_ids = {permission_grant.pk}
+            if owner_edit_grant is not None:
+                grant_ids.add(owner_edit_grant.pk)
+            locked_grants = {
+                grant.pk: grant
+                for grant in PermissionGrant.objects.select_for_update()
+                .filter(pk__in=sorted(grant_ids, key=str))
+                .order_by("id")
+            }
+            if set(locked_grants) != grant_ids:
+                raise ValidationError("One or more exact review authorization grants no longer exist.")
+            locked_review_grant = locked_grants[permission_grant.pk]
+            locked_owner_edit_grant = (
+                locked_grants[owner_edit_grant.pk] if owner_edit_grant is not None else None
+            )
+            provisional.reviewer_grant = locked_review_grant
+            provisional.owner_edit_grant = locked_owner_edit_grant
+            provisional.decided_at = timezone.now()
+            provisional.payload_hash = canonical_sha256(provisional.command_payload())
+            provisional.decision_sha256 = provisional.payload_hash
 
             existing_command = cls.objects.filter(command_id=command_id).first()
             if existing_command:
@@ -834,20 +1183,76 @@ class ReviewDecision(AppendOnlyFact):
                     or existing_command.reviewer_principal_id != reviewer_principal.pk
                     or existing_command.reviewer_acting_role != acting_role
                     or existing_command.reviewer_grant_id != permission_grant.pk
+                    or existing_command.owner_edit_grant_id
+                    != (owner_edit_grant.pk if owner_edit_grant is not None else None)
                 ):
                     raise ValidationError("The command_id was already used with a different review command.")
                 return existing_command
 
+            if is_owner_self_approval and locked_owner_edit_grant is None:
+                raise ValidationError(
+                    {
+                        "owner_edit_grant": (
+                            "Owner final approval requires the exact Product EDIT grant."
+                        )
+                    }
+                )
+
             guard_review(locked_task, submission=locked_submission)
-            if locked_submission.submitted_by_principal_id == reviewer_principal.pk:
-                raise ValidationError({"reviewer_principal": "A submitter cannot review their own submission."})
+            if (
+                locked_submission.submitted_by_principal_id == reviewer_principal.pk
+                and not cls.owner_self_approval_allowed(
+                    submission=locked_submission,
+                    decision=decision,
+                    reviewer_principal=reviewer_principal,
+                    acting_role=acting_role,
+                )
+            ):
+                raise ValidationError(
+                    {
+                        "reviewer_principal": (
+                            "A non-Owner submitter cannot review their own submission; "
+                            "only an Owner may approve it."
+                        )
+                    }
+                )
             if TaskStateEvent.objects.filter(
-                event_type=TaskStateEvent.EventType.SUBMISSION_WITHDRAWN,
+                event_type__in={
+                    TaskStateEvent.EventType.SUBMISSION_WITHDRAWN,
+                    TaskStateEvent.EventType.SUBMISSION_ABANDONED,
+                },
                 submission=locked_submission,
             ).exists():
-                raise ValidationError("A withdrawn submission cannot receive a review decision.")
+                raise ValidationError(
+                    "A withdrawn or abandoned submission cannot receive a review decision."
+                )
             if cls.objects.filter(submission=locked_submission).exists():
                 raise ValidationError("This submission already has its one final review decision.")
+            # Re-resolve both exact grants only after the Task, Submission and
+            # grant rows are locked.  DENY precedence and expiry therefore
+            # cannot be bypassed with a stale object prepared by the caller.
+            _validate_grant(
+                grant=locked_review_grant,
+                principal=reviewer_principal,
+                acting_role=acting_role,
+                allowed_actions={"REVIEW", "APPROVE"},
+                product_id=locked_task.product_id,
+            )
+            if is_owner_self_approval and not cls.owner_self_approval_has_product_edit_authorization(
+                submission=locked_submission,
+                reviewer_principal=reviewer_principal,
+                acting_role=acting_role,
+                owner_edit_grant=locked_owner_edit_grant,
+                at=provisional.decided_at,
+            ):
+                raise ValidationError(
+                    {
+                        "owner_edit_grant": (
+                            "Owner final approval requires the centrally resolved, exact current "
+                            "Product EDIT grant."
+                        )
+                    }
+                )
             provisional._record_final_authorized = True
             provisional.save()
             return provisional
