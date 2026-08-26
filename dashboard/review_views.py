@@ -7,7 +7,7 @@ from django.contrib.auth.decorators import login_required
 from django.core.exceptions import ImproperlyConfigured, PermissionDenied, ValidationError
 from django.db import transaction
 from django.core.paginator import Paginator
-from django.http import Http404, HttpRequest, HttpResponse
+from django.http import Http404, HttpRequest, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.views.decorators.http import require_POST
 
@@ -585,6 +585,69 @@ def review_action(request: HttpRequest, task_id) -> HttpResponse:
     except ValidationError as error:
         messages.error(request, _validation_text(error))
     return redirect("dashboard:review-detail", task_id=task.pk)
+
+
+@login_required
+@require_POST
+def review_batch_action(request: HttpRequest) -> JsonResponse:
+    """Batch approve reviews. Each task is processed independently; failures are skipped and reported."""
+    task_ids = request.POST.getlist("task_ids")
+    if not task_ids:
+        return JsonResponse({"ok": False, "message": "未选择任何任务。"}, status=400)
+    approved = []
+    failed = []
+    for task_id in task_ids:
+        try:
+            task = Task.objects.select_related("product", "contract_version").get(pk=task_id)
+            if task.current_state != Task.State.UNDER_REVIEW:
+                failed.append({"id": str(task_id), "reason": "任务不在审核中状态。"})
+                continue
+            review_grant = _require_product_grant(request.user, task, PermissionGrant.Action.REVIEW)
+            edit_grant = _require_product_grant(request.user, task, PermissionGrant.Action.EDIT)
+            submission = _latest_submission(task)
+            owner_self_approval = bool(
+                submission.submitted_by_principal_id == request.user.pk
+                and request.user.role == Principal.Role.OWNER
+            )
+            if submission.submitted_by_principal_id == request.user.pk and not owner_self_approval:
+                failed.append({"id": str(task_id), "reason": "不能审核自己提交的内容。"})
+                continue
+            root = uuid.uuid4()
+            with transaction.atomic():
+                ReviewDecision.record_final(
+                    submission=submission,
+                    decision=ReviewDecision.Decision.APPROVED,
+                    rationale="批量审核通过。",
+                    command_id=_subcommand(root, "review-decision"),
+                    expected_task_version=task.state_version,
+                    reviewer_principal=request.user,
+                    acting_role=request.user.role,
+                    permission_grant=review_grant,
+                    recorded_by_principal=request.user,
+                )
+                Task.transition(
+                    task_id=task.pk,
+                    to_state=Task.State.APPROVED,
+                    command_id=_subcommand(root, "review-transition"),
+                    expected_task_version=task.state_version,
+                    actor_principal=request.user,
+                    acting_role=request.user.role,
+                    permission_grant=edit_grant,
+                    recorded_by_principal=request.user,
+                    reason="Batch human review approved.",
+                )
+            approved.append(str(task_id))
+        except (Task.DoesNotExist, PermissionDenied, ValidationError) as error:
+            failed.append({"id": str(task_id), "reason": str(error) if hasattr(error, "messages") else "处理失败。"})
+        except Exception:
+            failed.append({"id": str(task_id), "reason": "未知错误。"})
+    return JsonResponse({
+        "ok": True,
+        "approved_count": len(approved),
+        "failed_count": len(failed),
+        "failed": failed,
+        "redirect": "/review/",
+    })
 
 
 @login_required

@@ -48,6 +48,18 @@
     </div>
 </section>
 
+<section class="workflow-stepper" aria-label="{% ui '任务流程进度' 'Task workflow progress' %}">
+    {% for step in workflow_steps %}
+    <div class="stepper-step{% if step.is_current %} is-current{% elif step.is_complete %} is-complete{% else %} is-upcoming{% endif %}">
+        <div class="stepper-circle">
+            {% if step.is_complete %}<span aria-hidden="true">✓</span>{% else %}<span>{{ forloop.counter }}</span>{% endif %}
+        </div>
+        <span class="stepper-label">{% if request.LANGUAGE_CODE|slice:":2" == "zh" %}{{ step.label_zh }}{% else %}{{ step.label_en }}{% endif %}</span>
+        {% if not forloop.last %}<div class="stepper-connector"></div>{% endif %}
+    </div>
+    {% endfor %}
+</section>
+
 <section class="detail-summary-grid" aria-label="{% ui '任务上下文' 'Task context' %}">
     <article><span class="task-label">{% ui '为什么做' 'Purpose' %}</span><p>{% if task.description %}{{ task.description }}{% else %}{% ui '暂无说明' 'No description' %}{% endif %}</p></article>
     <article><span class="task-label">{% ui '当前负责人' 'Current assignee' %}</span><p>{% if task.current_assignee_principal %}{{ task.current_assignee_principal.display_name|default:task.current_assignee_principal.username }}{% else %}{% ui '尚未分配' 'Not assigned' %}{% endif %}</p></article>

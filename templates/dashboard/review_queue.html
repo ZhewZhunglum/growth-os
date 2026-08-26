@@ -12,10 +12,20 @@
     </div>
 </section>
 <section class="section-heading"><div><p class="eyebrow">{% ui '正在审核' 'In review' %}</p><h2>{% ui '等待你处理' 'Waiting for you' %}</h2></div><span class="section-note">{{ tasks|length }} {% ui '项' 'items' %}</span></section>
-<section class="task-list">
+{% if tasks %}
+<div class="batch-action-bar" id="batch-action-bar">
+    <label class="batch-select-all"><input type="checkbox" id="batch-select-all"> <span>{% ui '全选当前页' 'Select all on page' %}</span></label>
+    <span class="batch-selected-count">{% ui '已选' 'Selected' %}: <strong id="batch-selected-count">0</strong></span>
+    <button class="button button-primary" id="batch-approve-btn" type="button" disabled>{% ui '批量通过' 'Batch approve' %}</button>
+</div>
+{% endif %}
+<section class="task-list" id="review-task-list">
     {% for task in tasks %}
-    <article class="task-card">
-        <header class="task-card-header"><div><p class="task-meta">{{ task.product.name }}</p><h3>{{ task.title }}</h3></div><span class="task-state">{% ui_task_state task.current_state %}</span></header>
+    <article class="task-card review-task-card" data-task-id="{{ task.id }}">
+        <header class="task-card-header">
+            <label class="task-checkbox-label"><input type="checkbox" class="task-checkbox" value="{{ task.id }}"></label>
+            <div><p class="task-meta">{{ task.product.name }}</p><h3>{{ task.title }}</h3></div><span class="task-state">{% ui_task_state task.current_state %}</span>
+        </header>
         <div class="task-section"><span class="task-label">{% ui '为什么做' 'Purpose' %}</span><p>{% if task.description %}{{ task.description }}{% else %}{% ui '暂无背景说明' 'No background provided' %}{% endif %}</p></div>
         <footer class="task-card-footer"><span>{% if task.owner_self_approval %}{% ui '由 Owner 做最终批准，并保留独立审计记录' 'Owner final approval with a separate audit record' %}{% else %}{% ui '提交内容需要人工核对' 'This submission needs a human check' %}{% endif %}</span><a class="button button-primary" href="{% url 'dashboard:review-detail' task.id %}">{% if task.owner_self_approval %}{% ui 'Owner 最终批准' 'Owner final approval' %}{% else %}{% ui '打开审核' 'Open review' %}{% endif %}</a></footer>
     </article>
@@ -64,4 +74,59 @@
     {% if history_page_obj.has_next %}<a href="?history_page={{ history_page_obj.next_page_number }}">{% ui '下一页' 'Next' %}</a>{% else %}<span class="is-disabled">{% ui '下一页' 'Next' %}</span>{% endif %}
 </nav>
 {% endif %}
+<script>
+(function () {
+    const selectAll = document.getElementById("batch-select-all");
+    const checkboxes = document.querySelectorAll(".task-checkbox");
+    const selectedCount = document.getElementById("batch-selected-count");
+    const approveBtn = document.getElementById("batch-approve-btn");
+    if (!selectAll || !checkboxes.length) return;
+
+    function updateState() {
+        const checked = document.querySelectorAll(".task-checkbox:checked");
+        const count = checked.length;
+        selectedCount.textContent = count;
+        approveBtn.disabled = count === 0;
+        selectAll.checked = count === checkboxes.length;
+        selectAll.indeterminate = count > 0 && count < checkboxes.length;
+    }
+
+    selectAll.addEventListener("change", function () {
+        checkboxes.forEach(function (cb) { cb.checked = selectAll.checked; });
+        updateState();
+    });
+    checkboxes.forEach(function (cb) { cb.addEventListener("change", updateState); });
+
+    approveBtn.addEventListener("click", async function () {
+        const ids = Array.from(document.querySelectorAll(".task-checkbox:checked")).map(function (cb) { return cb.value; });
+        if (!ids.length) return;
+        if (!window.confirm("确认批量通过 " + ids.length + " 项审核？将使用默认说明“批量审核通过”。")) return;
+        approveBtn.disabled = true;
+        approveBtn.textContent = "处理中…";
+        try {
+            const formData = new FormData();
+            ids.forEach(function (id) { formData.append("task_ids", id); });
+            const csrf = document.querySelector("[name=csrfmiddlewaretoken]");
+            if (csrf) formData.append("csrfmiddlewaretoken", csrf.value);
+            const resp = await fetch("{% url 'dashboard:review-batch-action' %}", {
+                method: "POST", body: formData, credentials: "same-origin",
+                headers: { "X-Requested-With": "XMLHttpRequest" },
+            });
+            const data = await resp.json();
+            if (data.ok) {
+                alert("批量通过完成：成功 " + data.approved_count + " 项，失败 " + data.failed_count + " 项。");
+                window.location.reload();
+            } else {
+                alert("批量操作失败：" + (data.message || "未知错误"));
+                approveBtn.disabled = false;
+                approveBtn.textContent = "批量通过";
+            }
+        } catch (e) {
+            alert("网络错误，请重试。");
+            approveBtn.disabled = false;
+            approveBtn.textContent = "批量通过";
+        }
+    });
+})();
+</script>
 {% endblock %}

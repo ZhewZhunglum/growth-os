@@ -393,6 +393,41 @@
   }
 
   /* ──────────────────────────────────────────────
+   * 6. Notification polling (every 30s)
+   * ────────────────────────────────────────────── */
+  function initNotificationPolling() {
+    var badge = document.querySelector(".notification-badge");
+    if (!badge) return;
+    var apiUrl = "/api/notifications/";
+    var lastCount = parseInt(badge.textContent, 10) || 0;
+
+    function poll() {
+      fetch(apiUrl, { credentials: "same-origin" })
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (data) {
+          if (!data) return;
+          var count = data.total_count || 0;
+          if (count !== lastCount) {
+            badge.textContent = count;
+            if (count === 0) {
+              badge.style.display = "none";
+            } else {
+              badge.style.display = "";
+              // Brief pulse animation on change
+              badge.style.transition = "transform .3s";
+              badge.style.transform = "scale(1.3)";
+              setTimeout(function () { badge.style.transform = "scale(1)"; }, 300);
+            }
+            lastCount = count;
+          }
+        })
+        .catch(function () { /* silent fail, retry next interval */ });
+    }
+
+    setInterval(poll, 30000);
+  }
+
+  /* ──────────────────────────────────────────────
    * Boot
    * ────────────────────────────────────────────── */
   document.addEventListener("DOMContentLoaded", function () {
@@ -400,6 +435,7 @@
     initAsyncForms();
     initConfirmForms();
     initMarkdownEditors();
+    initNotificationPolling();
   });
 
   // Expose for template inline use

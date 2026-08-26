@@ -7,11 +7,12 @@ from dashboard.review_views import (
     release_proof_action,
     release_queue,
     review_action,
+    review_batch_action,
     review_detail,
     review_history_detail,
     review_queue,
 )
-from dashboard.views import home, task_action, task_create, task_detail
+from dashboard.views import home, notification_counts, task_action, task_create, task_detail
 from dashboard.release_actions import release_rework_action, release_stop_action
 from dashboard.feature_center_views import feature_center
 from dashboard.guide_views import guide
@@ -35,12 +36,14 @@ from dashboard.team_views import (
 app_name = "dashboard"
 urlpatterns = [
     path("", home, name="home"),
+    path("api/notifications/", notification_counts, name="notification-counts"),
     path("features/", feature_center, name="feature-center"),
     path("guide/", guide, name="guide"),
     path("tasks/new/", task_create, name="task-create"),
     path("tasks/<uuid:task_id>/", task_detail, name="task-detail"),
     path("tasks/<uuid:task_id>/actions/<str:action>/", task_action, name="task-action"),
     path("review/", review_queue, name="review-queue"),
+    path("review/batch/", review_batch_action, name="review-batch-action"),
     path("review/<uuid:task_id>/", review_detail, name="review-detail"),
     path("review/<uuid:task_id>/action/", review_action, name="review-action"),
     path("review/history/<uuid:review_id>/", review_history_detail, name="review-history-detail"),

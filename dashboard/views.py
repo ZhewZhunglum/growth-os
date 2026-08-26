@@ -532,8 +532,39 @@ def _detail_context(
         and task.current_assignee_principal_id == user.pk
         and _authorization(user, task, PermissionGrant.Action.EDIT).allowed
     )
+    # Workflow stepper data
+    _workflow_states = [
+        ("DRAFT", "草稿", "Draft"),
+        ("READY", "准备", "Ready"),
+        ("ASSIGNED", "分配", "Assigned"),
+        ("IN_PROGRESS", "执行", "In progress"),
+        ("UNDER_REVIEW", "审核", "In review"),
+        ("APPROVED", "发布", "Publishing"),
+        ("DONE", "完成", "Done"),
+    ]
+    _state_to_step = {
+        "DRAFT": 0, "BLOCKED": 0,
+        "READY": 1,
+        "ASSIGNED": 2,
+        "IN_PROGRESS": 3, "HUMAN_REWORK": 3,
+        "SUBMITTED": 4, "UNDER_REVIEW": 4,
+        "APPROVED": 5,
+        "DONE": 6, "CANCELLED": 6,
+    }
+    _current_step = _state_to_step.get(task.current_state, 0)
+    workflow_steps = []
+    for idx, (state_key, label_zh, label_en) in enumerate(_workflow_states):
+        workflow_steps.append({
+            "state": state_key,
+            "label_zh": label_zh,
+            "label_en": label_en,
+            "is_complete": idx < _current_step,
+            "is_current": idx == _current_step,
+            "is_upcoming": idx > _current_step,
+        })
     return {
         "task": task,
+        "workflow_steps": workflow_steps,
         "compilation_context": compilation_context,
         "channel_plan": compilation_context.channel_plan if compilation_context else None,
         "plan_goal_items": (
@@ -633,11 +664,47 @@ def home(request: HttpRequest) -> HttpResponse:
     all_tasks = list(action_center.tasks)
     for task in all_tasks:
         _decorate_task(task)
+
+    # Search and filter
+    search_q = request.GET.get("q", "").strip().lower()
+    filter_state = request.GET.get("state", "").strip()
+    if search_q:
+        all_tasks = [
+            t for t in all_tasks
+            if search_q in (t.title or "").lower()
+            or search_q in (t.description or "").lower()
+            or search_q in (t.product.name or "").lower()
+        ]
+    if filter_state:
+        all_tasks = [t for t in all_tasks if t.current_state == filter_state]
+
     paginator = Paginator(all_tasks, 10)
     page_number = request.GET.get("page", 1)
     page_obj = paginator.get_page(page_number)
     tasks = page_obj.object_list
     can_create_task = _editable_profiles(request.user).exists()
+
+    # Stats for dashboard cards
+    state_counts = {}
+    for task in all_tasks:
+        state = task.current_state
+        state_counts[state] = state_counts.get(state, 0) + 1
+    in_progress_count = state_counts.get(Task.State.IN_PROGRESS, 0) + state_counts.get(Task.State.HUMAN_REWORK, 0)
+    draft_count = state_counts.get(Task.State.DRAFT, 0) + state_counts.get(Task.State.READY, 0) + state_counts.get(Task.State.ASSIGNED, 0)
+    review_count = state_counts.get(Task.State.UNDER_REVIEW, 0) + state_counts.get(Task.State.SUBMITTED, 0)
+    approved_count = state_counts.get(Task.State.APPROVED, 0)
+    blocked_count = state_counts.get(Task.State.BLOCKED, 0)
+    max_state_count = max(state_counts.values(), default=1)
+
+    # State distribution for bar chart (ordered by workflow)
+    state_distribution = [
+        {"label": "准备中", "label_en": "Draft", "count": draft_count, "state": "draft", "percent": round(draft_count / max_state_count * 100) if max_state_count else 0},
+        {"label": "执行中", "label_en": "In progress", "count": in_progress_count, "state": "progress", "percent": round(in_progress_count / max_state_count * 100) if max_state_count else 0},
+        {"label": "审核中", "label_en": "In review", "count": review_count, "state": "review", "percent": round(review_count / max_state_count * 100) if max_state_count else 0},
+        {"label": "待发布", "label_en": "Approved", "count": approved_count, "state": "approved", "percent": round(approved_count / max_state_count * 100) if max_state_count else 0},
+        {"label": "阻塞", "label_en": "Blocked", "count": blocked_count, "state": "blocked", "percent": round(blocked_count / max_state_count * 100) if max_state_count else 0},
+    ]
+
     return render(
         request,
         "dashboard/home.html",
@@ -645,12 +712,23 @@ def home(request: HttpRequest) -> HttpResponse:
             "tasks": tasks,
             "page_obj": page_obj,
             "task_count": len(all_tasks),
-            "blocked_task_count": sum(task.current_state == Task.State.BLOCKED for task in all_tasks),
+            "blocked_task_count": blocked_count,
             "can_create_task": can_create_task,
             "action_center": action_center,
             "pending_review_count": action_center.pending_review_count,
             "pending_publish_count": action_center.pending_publish_count,
             "pending_complete_count": action_center.pending_complete_count,
+            "stats": {
+                "total": len(all_tasks),
+                "in_progress": in_progress_count,
+                "review": review_count,
+                "approved": approved_count,
+                "draft": draft_count,
+            },
+            "state_distribution": state_distribution,
+            "max_state_count": max_state_count,
+            "search_q": search_q,
+            "filter_state": filter_state,
         },
     )
 
@@ -1290,3 +1368,16 @@ def task_action(request: HttpRequest, task_id, action: str) -> HttpResponse:
     if request.headers.get("X-Requested-With") == "XMLHttpRequest":
         return JsonResponse({"ok": True, "redirect": reverse("dashboard:task-detail", args=[task.pk]), "reload": True})
     return redirect("dashboard:task-detail", task_id=task.pk)
+
+
+@login_required
+def notification_counts(request: HttpRequest) -> JsonResponse:
+    """Lightweight JSON endpoint for polling action-inbox counts."""
+    action_center = build_action_center(request.user)
+    return JsonResponse({
+        "total_count": action_center.total_count,
+        "waiting_count": action_center.waiting_count,
+        "pending_review_count": action_center.pending_review_count,
+        "pending_publish_count": action_center.pending_publish_count,
+        "pending_complete_count": action_center.pending_complete_count,
+    })

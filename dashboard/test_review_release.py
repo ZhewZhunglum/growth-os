@@ -30,6 +30,7 @@ from dashboard.review_views import (
     release_proof_action,
     release_queue,
     review_action,
+    review_batch_action,
     review_detail,
     review_history_detail,
     review_queue,
@@ -69,6 +70,7 @@ dashboard_patterns = [
     path("tasks/new/", empty_view, name="task-create"),
     path("tasks/<uuid:task_id>/", empty_view, name="task-detail"),
     path("review/", review_queue, name="review-queue"),
+    path("review/batch/", review_batch_action, name="review-batch-action"),
     path("review/<uuid:task_id>/", review_detail, name="review-detail"),
     path("review/<uuid:task_id>/action/", review_action, name="review-action"),
     path(
