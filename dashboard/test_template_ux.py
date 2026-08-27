@@ -1,6 +1,8 @@
+from pathlib import Path
 from types import SimpleNamespace
 
 from django import forms
+from django.conf import settings
 from django.contrib.auth.forms import AuthenticationForm
 from django.contrib.auth.models import AnonymousUser
 from django.template.loader import render_to_string
@@ -21,6 +23,63 @@ class DeliveryChoiceForm(forms.Form):
 
 
 class DashboardTemplateUXTests(SimpleTestCase):
+    def test_major_authenticated_pages_have_explicit_logical_parent_links(self):
+        cases = (
+            (
+                "dashboard/feature_center.html",
+                {"feature_center": SimpleNamespace(groups=())},
+                'href="/"',
+                "返回首页",
+            ),
+            ("dashboard/review_queue.html", {"tasks": [], "completed_reviews": []}, 'href="/"', "返回首页"),
+            ("dashboard/release_queue.html", {"tasks": []}, 'href="/"', "返回首页"),
+            ("dashboard/configuration_home.html", {"products": []}, 'href="/features/"', "返回功能中心"),
+            ("dashboard/team_members.html", {"staff_rows": []}, 'href="/features/"', "返回功能中心"),
+            ("dashboard/guide.html", {}, 'href="/features/"', "返回功能中心"),
+            ("dashboard/change_password.html", {}, 'href="/features/"', "返回功能中心"),
+            (
+                "dailyops/home.html",
+                {
+                    "configured_source_count": 0,
+                    "expected_source_count": 0,
+                    "data_recommendations": [],
+                    "recent_batches": [],
+                },
+                'href="/features/"',
+                "返回功能中心",
+            ),
+            (
+                "feedbackui/home.html",
+                {"can_record_geo": False, "can_configure_geo": False},
+                'href="/features/"',
+                "返回功能中心",
+            ),
+            (
+                "governanceui/home.html",
+                {"policy_definitions": [], "issues": [], "meetings": [], "proposals": []},
+                'href="/features/"',
+                "返回功能中心",
+            ),
+        )
+
+        for template_name, context, expected_href, expected_label in cases:
+            with self.subTest(template=template_name):
+                html = render_to_string(
+                    template_name,
+                    {"user": AnonymousUser(), **context},
+                )
+                self.assertIn(f'<a class="back-link" {expected_href}', html)
+                self.assertIn(expected_label, html)
+                self.assertNotIn("history.back", html)
+
+    def test_global_clickable_cursor_rules_keep_disabled_controls_distinct(self):
+        css = (Path(settings.BASE_DIR) / "static" / "css" / "app.css").read_text(encoding="utf-8")
+
+        self.assertIn("a[href],button:not(:disabled),summary,select:not(:disabled)", css)
+        self.assertIn('input[type="checkbox"]:not(:disabled)', css)
+        self.assertIn('[role="button"]:not([aria-disabled="true"]),label[for]{cursor:pointer}', css)
+        self.assertIn('[aria-disabled="true"],.is-disabled{cursor:not-allowed}', css)
+
     def test_login_uses_password_manager_metadata_and_stores_username_only(self):
         html = render_to_string(
             "registration/login.html",

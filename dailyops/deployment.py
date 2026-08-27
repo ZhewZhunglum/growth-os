@@ -172,6 +172,9 @@ def build_deployment_daily_operations_runtime(
     if ai_transport is None:
         raise ImproperlyConfigured("Live DeepSeek requires an explicitly enabled injected HTTP transport")
 
+    cached_input_price = _setting(
+        values, "DAILYOPS_DEEPSEEK_CACHE_HIT_INPUT_USD_PER_MILLION"
+    )
     pricing = ModelPricing(
         input_usd_per_million_tokens=_decimal_setting(
             values,
@@ -182,6 +185,15 @@ def build_deployment_daily_operations_runtime(
             values,
             "DAILYOPS_DEEPSEEK_OUTPUT_USD_PER_MILLION",
             strictly_positive=True,
+        ),
+        cached_input_usd_per_million_tokens=(
+            _decimal_setting(
+                values,
+                "DAILYOPS_DEEPSEEK_CACHE_HIT_INPUT_USD_PER_MILLION",
+                strictly_positive=True,
+            )
+            if cached_input_price not in (None, "")
+            else None
         ),
     )
     budget = BudgetGuard(

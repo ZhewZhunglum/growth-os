@@ -317,6 +317,7 @@ class ConnectorRuntimeTests(unittest.TestCase):
                 )
             },
             browser_clients={Platform.QUORA: client},
+            browser_clocks={Platform.QUORA: lambda: NOW},
         )
         result = build_connector_registry(config)[Platform.QUORA].collect(request(Platform.QUORA))
         self.assertEqual(result.status, ConnectorRunStatus.SUCCEEDED)

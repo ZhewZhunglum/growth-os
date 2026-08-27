@@ -7,5 +7,5 @@ if (-not (Test-Path -LiteralPath $python)) {
     throw 'Local virtual environment is missing. Create .venv and install requirements.txt first.'
 }
 
-& $python (Join-Path $PSScriptRoot '..\manage.py') runserver 127.0.0.1:8000
+& $python (Join-Path $PSScriptRoot '..\manage.py') runserver 127.0.0.1:8000 --noreload
 

@@ -39,9 +39,65 @@
 </section>
 {% endif %}
 
+{% if stats and stats.total > 0 %}
+<section class="dashboard-stats" aria-label="{% ui '任务概览' 'Task overview' %}">
+    <div class="stat-card">
+        <span class="stat-number">{{ stats.total }}</span>
+        <span class="stat-label">{% ui '活跃任务' 'Active tasks' %}</span>
+    </div>
+    <div class="stat-card stat-card-progress">
+        <span class="stat-number">{{ stats.in_progress }}</span>
+        <span class="stat-label">{% ui '执行中' 'In progress' %}</span>
+    </div>
+    <div class="stat-card stat-card-review">
+        <span class="stat-number">{{ stats.review }}</span>
+        <span class="stat-label">{% ui '审核中' 'In review' %}</span>
+    </div>
+    <div class="stat-card stat-card-approved">
+        <span class="stat-number">{{ stats.approved }}</span>
+        <span class="stat-label">{% ui '待发布' 'Approved' %}</span>
+    </div>
+    <div class="stat-card stat-card-draft">
+        <span class="stat-number">{{ stats.draft }}</span>
+        <span class="stat-label">{% ui '准备中' 'Draft' %}</span>
+    </div>
+</section>
+
+<section class="dashboard-chart" aria-label="{% ui '状态分布' 'State distribution' %}">
+    <h3>{% ui '任务状态分布' 'Task state distribution' %}</h3>
+    <div class="chart-bars">
+        {% for item in state_distribution %}
+        <div class="chart-bar-row">
+            <span class="chart-bar-label">{% if request.LANGUAGE_CODE|slice:":2" == "zh" %}{{ item.label }}{% else %}{{ item.label_en }}{% endif %}</span>
+            <div class="chart-bar-track">
+                <div class="chart-bar-fill chart-bar-{{ item.state }}" style="width: {{ item.percent }}%;" data-count="{{ item.count }}"></div>
+            </div>
+            <span class="chart-bar-value">{{ item.count }}</span>
+        </div>
+        {% endfor %}
+    </div>
+</section>
+{% endif %}
+
 <section class="section-heading compact-heading" id="my-tasks">
     <div><h2>{% ui '我的任务' 'My tasks' %}</h2><p>{% ui '这里只放当前轮到你处理的任务。' 'Only tasks that currently need you are shown here.' %}</p></div>
-    {% if can_create_task %}<a class="button button-secondary" href="{% url 'dashboard:task-create' %}">{% ui '新建任务' 'New task' %}</a>{% endif %}
+    <div class="task-filter-bar">
+        <form method="get" class="task-search-form">
+            <input type="text" name="q" value="{{ search_q }}" placeholder="{% ui '搜索任务标题、描述或产品' 'Search tasks by title, description, or product' %}" aria-label="{% ui '搜索任务' 'Search tasks' %}">
+            <select name="state" aria-label="{% ui '按状态筛选' 'Filter by state' %}">
+                <option value="">{% ui '全部状态' 'All states' %}</option>
+                <option value="DRAFT" {% if filter_state == 'DRAFT' %}selected{% endif %}>{% ui '草稿' 'Draft' %}</option>
+                <option value="READY" {% if filter_state == 'READY' %}selected{% endif %}>{% ui '可分配' 'Ready' %}</option>
+                <option value="ASSIGNED" {% if filter_state == 'ASSIGNED' %}selected{% endif %}>{% ui '已分配' 'Assigned' %}</option>
+                <option value="IN_PROGRESS" {% if filter_state == 'IN_PROGRESS' %}selected{% endif %}>{% ui '执行中' 'In progress' %}</option>
+                <option value="BLOCKED" {% if filter_state == 'BLOCKED' %}selected{% endif %}>{% ui '阻塞' 'Blocked' %}</option>
+                <option value="UNDER_REVIEW" {% if filter_state == 'UNDER_REVIEW' %}selected{% endif %}>{% ui '审核中' 'In review' %}</option>
+                <option value="APPROVED" {% if filter_state == 'APPROVED' %}selected{% endif %}>{% ui '待发布' 'Approved' %}</option>
+            </select>
+            <button type="submit" class="button button-secondary">{% ui '筛选' 'Filter' %}</button>
+        </form>
+        {% if can_create_task %}<a class="button button-secondary" href="{% url 'dashboard:task-create' %}">{% ui '新建任务' 'New task' %}</a>{% endif %}
+    </div>
 </section>
 <section class="compact-task-list">
     {% for task in tasks %}
@@ -65,4 +121,12 @@
     </article>
     {% endfor %}
 </section>
+{% if page_obj and page_obj.paginator.num_pages > 1 %}
+<nav class="pagination" aria-label="{% ui '分页导航' 'Pagination' %}">
+    {% if page_obj.has_previous %}<a href="?q={{ search_q }}&state={{ filter_state }}&page={{ page_obj.previous_page_number }}">{% ui '上一页' 'Prev' %}</a>{% else %}<span class="is-disabled">{% ui '上一页' 'Prev' %}</span>{% endif %}
+    {% for num in page_obj.paginator.page_range %}{% if num == page_obj.number %}<span class="is-current">{{ num }}</span>{% elif num > page_obj.number|add:"-3" and num < page_obj.number|add:"3" %}<a href="?q={{ search_q }}&state={{ filter_state }}&page={{ num }}">{{ num }}</a>{% endif %}{% endfor %}
+    {% if page_obj.has_next %}<a href="?q={{ search_q }}&state={{ filter_state }}&page={{ page_obj.next_page_number }}">{% ui '下一页' 'Next' %}</a>{% else %}<span class="is-disabled">{% ui '下一页' 'Next' %}</span>{% endif %}
+</nav>
+<p class="pagination-info">{% ui '共' 'Total' %} {{ page_obj.paginator.count }} {% ui '项，第' 'items, page' %} {{ page_obj.number }} / {{ page_obj.paginator.num_pages }}</p>
+{% endif %}
 {% endblock %}

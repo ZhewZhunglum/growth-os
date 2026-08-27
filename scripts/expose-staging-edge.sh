@@ -159,25 +159,34 @@ compose run --rm --no-deps --entrypoint python web \
     --product-code "$STAGING_PRODUCT_CODE" \
     --publish-account-code "$STAGING_PUBLISH_ACCOUNT_CODE"
 
-# The provisioning dry run is permitted to model creation of a missing
-# high-risk PUBLISH grant and then roll it back. Prove a current exact grant was
-# already committed before exposing the edge.
+# The provisioning dry run is permitted to model creation of missing high-risk
+# PUBLISH grants and then roll them back. Prove Owner, Admin, and Operator each
+# already have an exact, bounded, Owner-granted Grant before exposing the edge.
 compose exec -T web python -c '
 import sys
+from datetime import timedelta
 from django.db.models import Q
 from django.utils import timezone
 
 from accounts.models import PermissionGrant, Principal
 
-operator = Principal.objects.get(username=sys.argv[1])
+usernames = sys.argv[1:4]
+account_ref = sys.argv[4]
+principals = {
+    principal.username: principal
+    for principal in Principal.objects.filter(username__in=usernames)
+}
+if set(principals) != set(usernames):
+    raise SystemExit("PRE_EDGE_PUBLISH_PRINCIPAL_SET_NOT_EXACT")
+owner = principals[usernames[0]]
 now = timezone.now()
 grants = list(
     PermissionGrant.objects.filter(
-        principal=operator,
+        principal__in=principals.values(),
         scope_kind=PermissionGrant.ScopeKind.ACCOUNT,
         product__isnull=True,
         platform_code="",
-        account_ref=sys.argv[2],
+        account_ref=account_ref,
         surface_ref="",
         action=PermissionGrant.Action.PUBLISH,
         effect=PermissionGrant.Effect.ALLOW,
@@ -186,10 +195,20 @@ grants = list(
         valid_from__lte=now,
     ).filter(Q(valid_until__isnull=True) | Q(valid_until__gt=now))
 )
-if len(grants) != 1 or grants[0].valid_until is None:
-    raise SystemExit("PRE_EDGE_EXACT_BOUNDED_PUBLISH_GRANT_MISSING")
-print("Pre-edge exact bounded Operator PUBLISH grant: PASS")
-' "$STAGING_OPERATOR_USERNAME" "$STAGING_PUBLISH_ACCOUNT_CODE"
+for username in usernames:
+    exact = [grant for grant in grants if grant.principal_id == principals[username].pk]
+    if len(exact) != 1:
+        raise SystemExit(f"PRE_EDGE_EXACT_BOUNDED_PUBLISH_GRANT_MISSING:{username}")
+    grant = exact[0]
+    if (
+        grant.valid_until is None
+        or grant.valid_until - grant.valid_from > timedelta(days=31)
+        or grant.granted_by_principal_id != owner.pk
+    ):
+        raise SystemExit(f"PRE_EDGE_PUBLISH_GRANT_NOT_OWNER_GRANTED_OR_BOUNDED:{username}")
+print("Pre-edge exact bounded Owner/Admin/Operator PUBLISH grants: PASS")
+' "$STAGING_OWNER_USERNAME" "$STAGING_ADMIN_USERNAME" "$STAGING_OPERATOR_USERNAME" \
+    "$STAGING_PUBLISH_ACCOUNT_CODE"
 
 certificate="$SECRETS_DIR/tls_fullchain.pem"
 private_key="$SECRETS_DIR/tls_privkey.pem"

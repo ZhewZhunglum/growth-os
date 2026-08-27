@@ -6,8 +6,10 @@
 <style>
   /* Keep finished work out of the way; its step dot remains available above. */
   .daily-stage.is-complete:not(.is-manually-open) { display: none; }
+  .daily-flow.is-disposed .daily-stage form,
+  .daily-flow.is-disposed .daily-plan-builder { display: none; }
 </style>
-<div class="daily-page daily-flow" id="daily-flow"
+<div class="daily-page daily-flow{% if batch_disposition %} is-disposed{% endif %}" id="daily-flow"
      data-current-step="{{ current_step }}">
   <a class="back-link" href="{% url 'dailyops:home' %}">← {% ui '返回机会与计划' 'Back to opportunities' %}</a>
 
@@ -18,6 +20,18 @@
     </div>
     <span class="status-pill"><span></span>{% ui '人工确认模式' 'Human confirmation mode' %}</span>
   </header>
+
+  {% if batch_disposition %}
+  <aside class="daily-notice" role="status">
+    <div>
+      <strong>
+        {% if batch_disposition.disposition == 'ARCHIVED' %}{% ui '这次工作已从最近工作隐藏（任务保留）' 'This run is hidden from Recent work (tasks remain)' %}{% else %}{% ui '这次草稿已从最近工作隐藏' 'This draft is hidden from Recent work' %}{% endif %}
+      </strong>
+      <p>{% ui '本页仅供查看历史；采集、证据、项目、计划、任务和审计记录均未删除，也不能从这里继续修改。' 'This page is read-only history. Collection, evidence, project, plan, task, and audit facts remain and cannot be changed here.' %}</p>
+      <small>{{ batch_disposition.reason }}</small>
+    </div>
+  </aside>
+  {% endif %}
 
   <nav class="daily-stepper" aria-label="{% ui '今日工作进度' "Today's workflow progress" %}">
     <a class="daily-step is-complete" href="{% url 'dailyops:home' %}"><span>1</span><small>{% ui '确定问题' 'Question' %}</small></a>

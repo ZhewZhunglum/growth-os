@@ -56,6 +56,20 @@ class CommandForm(forms.Form):
     command_id = forms.UUIDField(widget=forms.HiddenInput, initial=uuid.uuid4)
 
 
+class BatchDispositionForm(CommandForm):
+    reason = forms.CharField(
+        label="原因",
+        max_length=2_000,
+        widget=forms.Textarea(
+            attrs={"rows": 2, "placeholder": "例如：选错了研究问题，重新开始一轮"}
+        ),
+    )
+    confirm = forms.BooleanField(
+        label="我确认从最近工作隐藏；历史记录仍会保留",
+        required=True,
+    )
+
+
 class DailyBatchForm(CommandForm):
     product = forms.ModelChoiceField(queryset=Product.objects.none(), label="产品")
     query = forms.CharField(

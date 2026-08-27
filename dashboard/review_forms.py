@@ -78,12 +78,30 @@ class ReviewDecisionForm(CommandVersionForm):
     )
 
     def __init__(self, *args, **kwargs):
+        owner_self_approval = kwargs.pop("owner_self_approval", False)
         super().__init__(*args, **kwargs)
-        if _is_english():
+        if owner_self_approval:
             self.fields["decision"].choices = (
-                (ReviewDecision.Decision.APPROVED, "Approve and continue to release checks"),
-                (ReviewDecision.Decision.CHANGES_REQUESTED, "Request changes and return for revision"),
+                (ReviewDecision.Decision.APPROVED, "Owner 最终批准（已审计）"),
             )
+            self.fields["decision"].help_text = "Owner 可批准自己提交的内容；本次批准会保留独立审计记录。"
+            self.fields["rationale"].label = "批准说明"
+            self.fields["rationale"].help_text = "请简要记录为什么批准进入发布检查。"
+        if _is_english():
+            if owner_self_approval:
+                self.fields["decision"].choices = (
+                    (ReviewDecision.Decision.APPROVED, "Owner final approval (audited)"),
+                )
+                self.fields["decision"].help_text = (
+                    "An Owner may approve their own submission; this approval is recorded separately."
+                )
+                self.fields["rationale"].label = "Approval note"
+                self.fields["rationale"].help_text = "Briefly record why this may continue to release checks."
+            else:
+                self.fields["decision"].choices = (
+                    (ReviewDecision.Decision.APPROVED, "Approve and continue to release checks"),
+                    (ReviewDecision.Decision.CHANGES_REQUESTED, "Request changes and return for revision"),
+                )
 
 
 class ReleaseGateForm(CommandVersionForm):
@@ -105,6 +123,50 @@ class ReleaseGateForm(CommandVersionForm):
         if _is_english():
             self.fields["channel_account"].empty_label = "Select an account"
             self.fields["runtime_environment"].empty_label = "Select an environment"
+
+
+class StopPublicationForm(CommandVersionForm):
+    reason = forms.CharField(
+        label="停止发布原因",
+        max_length=1000,
+        widget=forms.Textarea(attrs={"rows": 3}),
+        help_text="不会删除任务、审核或门禁历史；停止后旧门禁不可继续使用。",
+    )
+    confirmed = forms.BooleanField(
+        label="我确认停止这项发布工作",
+        required=True,
+    )
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if _is_english():
+            self.fields["reason"].label = "Reason for stopping publication"
+            self.fields["reason"].help_text = (
+                "The task, review and gate history stay intact; the old gate cannot be reused."
+            )
+            self.fields["confirmed"].label = "I confirm that this publication should stop"
+
+
+class ReturnToInlineContentForm(CommandVersionForm):
+    reason = forms.CharField(
+        label="退回制作原因",
+        max_length=1000,
+        widget=forms.Textarea(attrs={"rows": 3}),
+        help_text="保留旧链接、提交、审核和门禁；下一版必须提交完整正文。",
+    )
+    confirmed = forms.BooleanField(
+        label="我确认退回制作完整内容",
+        required=True,
+    )
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if _is_english():
+            self.fields["reason"].label = "Reason for returning to production"
+            self.fields["reason"].help_text = (
+                "The old link, submission, review and gate stay intact; the next version must contain the full text."
+            )
+            self.fields["confirmed"].label = "I confirm return for complete inline content"
 
 
 class PublicationProofForm(forms.Form):

@@ -1,8 +1,9 @@
 {% extends "base.html" %}
-{% block title %}新建规则提案 · PUKO{% endblock %}
-{% block page_title %}新建规则提案{% endblock %}
+{% load ui_i18n %}
+{% block title %}{% ui '新建规则提案' 'New rule proposal' %} · PUKO{% endblock %}
+{% block page_title %}{% ui '新建规则提案' 'New rule proposal' %}{% endblock %}
 {% block content %}
-<a class="back-link" href="{% url 'governanceui:home' %}">← 返回问题与规则治理</a>
-<section class="detail-columns"><article class="detail-panel action-panel"><p class="eyebrow">只是提案，不会生效</p><h3>绑定确切来源和候选规则版本</h3><p class="muted">列表里没有需要的版本？<a href="{% url 'governanceui:policy-definition-create' %}">新建规则定义</a>或<a href="{% url 'governanceui:policy-version-create' %}">追加候选版本</a>。</p><form class="config-form" method="post">{% csrf_token %}{{ form.as_p }}<button class="button button-primary" type="submit">创建提案</button></form></article>
-<article class="detail-panel"><p class="eyebrow">强制流程</p><h3>Replay → Shadow → 人工批准 → Canary → 启用</h3><p class="muted">Learning 只能来到这里；它不能代替人批准。RELAX 必须由 Owner 本人批准并启用。</p></article></section>
+<a class="back-link" href="{% url 'governanceui:home' %}">← {% ui '返回问题与规则治理' 'Back to issues and rules' %}</a>
+<section class="detail-columns"><article class="detail-panel action-panel"><p class="eyebrow">{% ui '只是提案，不会生效' 'A proposal does not take effect' %}</p><h3>{% ui '绑定确切来源和候选规则版本' 'Bind the exact source and candidate rule version' %}</h3><p class="muted">{% ui '列表里没有需要的版本？' 'Need a version that is not listed?' %} <a href="{% url 'governanceui:policy-definition-create' %}">{% ui '新建规则定义' 'Create a rule definition' %}</a>{% ui '或' ' or ' %}<a href="{% url 'governanceui:policy-version-create' %}">{% ui '追加候选版本' 'add a candidate version' %}</a>。</p><form class="config-form" method="post">{% csrf_token %}{{ form.as_p }}<button class="button button-primary" type="submit">{% ui '创建提案' 'Create proposal' %}</button></form></article>
+<article class="detail-panel"><p class="eyebrow">{% ui '强制流程' 'Required process' %}</p><h3>Replay → Shadow → {% ui '人工批准' 'Human approval' %} → Canary → {% ui '启用' 'Activation' %}</h3><p class="muted">{% ui 'Learning 只能来到这里；它不能代替人批准。RELAX 必须由 Owner 本人批准并启用。' 'A Learning can only propose a change here; it cannot replace human approval. RELAX changes must be approved and activated by the Owner.' %}</p></article></section>
 {% endblock %}

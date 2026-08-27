@@ -218,6 +218,32 @@ def orchestrate_v1_release_gate(
     publisher = Principal.objects.get(pk=publisher_principal.pk)
     channel_account = ChannelAccount.objects.get(pk=channel_account.pk)
     runtime_environment = RuntimeEnvironment.objects.get(pk=runtime_environment.pk)
+    # A Daily Operations Task is compiled against one exact account and one
+    # exact environment/capability snapshot.  Do not let another active
+    # binding silently redirect that sealed task at release time.
+    from intelligence.models import TaskCompilationContext
+
+    compilation_context = (
+        TaskCompilationContext.objects.select_related(
+            "channel_plan__channel_account",
+            "capability_state__account_environment_binding__runtime_environment",
+        )
+        .filter(task_id=task.pk)
+        .first()
+    )
+    if compilation_context is not None:
+        exact_account_id = compilation_context.channel_plan.channel_account_id
+        exact_environment_id = (
+            compilation_context.capability_state.account_environment_binding.runtime_environment_id
+        )
+        if channel_account.pk != exact_account_id:
+            raise ValidationError(
+                {"channel_account": "Release must use the exact account sealed into the compiled Task."}
+            )
+        if runtime_environment.pk != exact_environment_id:
+            raise ValidationError(
+                {"runtime_environment": "Release must use the exact environment sealed into the compiled Task."}
+            )
     if submission.task_id != task.pk:
         raise ValidationError({"submission": "The submission does not belong to the exact Task."})
     try:

@@ -229,6 +229,142 @@ class WorkflowFoundationTests(TestCase):
                 permission_grant=self.grants[PermissionGrant.Action.ASSIGN_TASK], recorded_by_principal=self.owner,
             )
 
+    def test_cancel_task_is_append_only_idempotent_and_requires_exact_cancel_grant(self):
+        command_id = uuid.uuid4()
+        event = Task.cancel_task(
+            task_id=self.task.pk,
+            command_id=command_id,
+            expected_state_version=0,
+            actor_principal=self.owner,
+            acting_role=ActingRole.OWNER,
+            permission_grant=self.grants[PermissionGrant.Action.CANCEL_TASK],
+            recorded_by_principal=self.owner,
+            reason="This draft is not needed.",
+        )
+        replay = Task.cancel_task(
+            task_id=self.task.pk,
+            command_id=command_id,
+            expected_state_version=0,
+            actor_principal=self.owner,
+            acting_role=ActingRole.OWNER,
+            permission_grant=self.grants[PermissionGrant.Action.CANCEL_TASK],
+            recorded_by_principal=self.owner,
+            reason="This draft is not needed.",
+        )
+
+        self.assertEqual(replay.pk, event.pk)
+        self.task.refresh_from_db()
+        self.assertEqual(self.task.current_state, Task.State.CANCELLED)
+        self.assertEqual(self.task.state_events.count(), 1)
+        self.assertEqual(event.permission_grant_id, self.grants[PermissionGrant.Action.CANCEL_TASK].pk)
+
+        with self.assertRaises(CommandReplayConflict):
+            Task.cancel_task(
+                task_id=self.task.pk,
+                command_id=command_id,
+                expected_state_version=0,
+                actor_principal=self.owner,
+                acting_role=ActingRole.OWNER,
+                permission_grant=self.grants[PermissionGrant.Action.CANCEL_TASK],
+                recorded_by_principal=self.owner,
+                reason="A different reason must not replay.",
+            )
+
+    def test_non_assignee_operator_cannot_cancel_another_principals_task(self):
+        operator_cancel = PermissionGrant.objects.create(
+            principal=self.operator,
+            scope_kind=PermissionGrant.ScopeKind.PRODUCT,
+            product=self.product,
+            action=PermissionGrant.Action.CANCEL_TASK,
+            valid_from=timezone.now() - timedelta(minutes=1),
+            valid_until=timezone.now() + timedelta(hours=1),
+            granted_by_principal=self.owner,
+        )
+
+        with self.assertRaises(PermissionDenied):
+            Task.cancel_task(
+                task_id=self.task.pk,
+                command_id=uuid.uuid4(),
+                expected_state_version=0,
+                actor_principal=self.operator,
+                acting_role=ActingRole.OPERATOR,
+                permission_grant=operator_cancel,
+                recorded_by_principal=self.operator,
+                reason="This task does not belong to this operator.",
+            )
+        self.task.refresh_from_db()
+        self.assertEqual(self.task.current_state, Task.State.DRAFT)
+        self.assertFalse(self.task.state_events.exists())
+
+    def test_unassigned_creator_can_cancel_draft_ready_and_blocked_with_exact_grant(self):
+        operator_cancel = PermissionGrant.objects.create(
+            principal=self.operator,
+            scope_kind=PermissionGrant.ScopeKind.PRODUCT,
+            product=self.product,
+            action=PermissionGrant.Action.CANCEL_TASK,
+            valid_from=timezone.now() - timedelta(minutes=1),
+            valid_until=timezone.now() + timedelta(hours=1),
+            granted_by_principal=self.owner,
+        )
+
+        for target_state in (Task.State.DRAFT, Task.State.READY, Task.State.BLOCKED):
+            with self.subTest(target_state=target_state):
+                task = Task.objects.create(
+                    product=self.product,
+                    product_profile_version=self.profile,
+                    contract_version=self.contract,
+                    title=f"Unassigned creator task in {target_state}",
+                    created_by_principal=self.operator,
+                    updated_by_principal=self.operator,
+                )
+                if target_state != Task.State.DRAFT:
+                    check_result = (
+                        TaskCheckRun.Result.PASS
+                        if target_state == Task.State.READY
+                        else TaskCheckRun.Result.BLOCKED
+                    )
+                    TaskCheckRun.record_completed(
+                        task=task,
+                        check_kind=TaskCheckRun.Kind.DOR,
+                        results=[{
+                            "criterion_key": "source_ready",
+                            "result": check_result,
+                            "evidence": {"source": "creator-cancellation-test"},
+                        }],
+                        command_id=uuid.uuid4(),
+                        evaluator_principal=self.operator,
+                        acting_role=ActingRole.OPERATOR,
+                        permission_grant=self.operator_edit_grant,
+                        recorded_by_principal=self.operator,
+                    )
+                    Task.transition(
+                        task_id=task.pk,
+                        to_state=target_state,
+                        command_id=uuid.uuid4(),
+                        expected_state_version=0,
+                        actor_principal=self.operator,
+                        acting_role=ActingRole.OPERATOR,
+                        permission_grant=self.operator_edit_grant,
+                        recorded_by_principal=self.operator,
+                    )
+                    task.refresh_from_db()
+
+                event = Task.cancel_task(
+                    task_id=task.pk,
+                    command_id=uuid.uuid4(),
+                    expected_state_version=task.state_version,
+                    actor_principal=self.operator,
+                    acting_role=ActingRole.OPERATOR,
+                    permission_grant=operator_cancel,
+                    recorded_by_principal=self.operator,
+                    reason="The creator no longer needs this unassigned work.",
+                )
+
+                task.refresh_from_db()
+                self.assertEqual(task.current_state, Task.State.CANCELLED)
+                self.assertEqual(event.from_state, target_state)
+                self.assertEqual(event.permission_grant_id, operator_cancel.pk)
+
     def test_completed_check_facts_are_immutable(self):
         run = self.record_dor()
         run.aggregate_result = TaskCheckRun.Result.FAIL
@@ -292,6 +428,179 @@ class WorkflowFoundationTests(TestCase):
         self.task.refresh_from_db()
         self.assertIsNone(self.task.current_assignee_principal_id)
         self.assertFalse(self.task.assignments.exists())
+
+    def test_reassignment_appends_a_new_assignment_and_rejects_a_stale_manager_tab(self):
+        second_operator = Principal.objects.create_user(
+            username="second-operator",
+            password="local-test-only",
+            role=Principal.Role.OPERATOR,
+        )
+        second_operator_edit = PermissionGrant.objects.create(
+            principal=second_operator,
+            scope_kind=PermissionGrant.ScopeKind.PRODUCT,
+            product=self.product,
+            action=PermissionGrant.Action.EDIT,
+            valid_from=timezone.now() - timedelta(minutes=1),
+            valid_until=timezone.now() + timedelta(hours=1),
+            granted_by_principal=self.owner,
+        )
+        self.assertIsNotNone(second_operator_edit.pk)
+        self.record_dor()
+        self.transition(Task.State.READY)
+        first = TaskAssignment.record(
+            task=self.task,
+            assignee_principal=self.operator,
+            command_id=uuid.uuid4(),
+            expected_task_version=self.task.state_version,
+            assigned_by_principal=self.owner,
+            acting_role=ActingRole.OWNER,
+            permission_grant=self.grants[PermissionGrant.Action.ASSIGN_TASK],
+            recorded_by_principal=self.owner,
+        )
+        self.transition(Task.State.ASSIGNED)
+
+        second = TaskAssignment.record(
+            task=self.task,
+            assignee_principal=second_operator,
+            command_id=uuid.uuid4(),
+            expected_task_version=self.task.state_version,
+            expected_current_assignment_id=first.pk,
+            assigned_by_principal=self.owner,
+            acting_role=ActingRole.OWNER,
+            permission_grant=self.grants[PermissionGrant.Action.ASSIGN_TASK],
+            recorded_by_principal=self.owner,
+        )
+        self.task.refresh_from_db()
+        self.assertEqual(self.task.current_state, Task.State.ASSIGNED)
+        self.assertEqual(self.task.current_assignee_principal_id, second_operator.pk)
+        self.assertEqual(second.assignment_number, 2)
+        self.assertEqual(second.supersedes_assignment_id, first.pk)
+        self.assertEqual(self.task.assignments.count(), 2)
+
+        with self.assertRaises(OptimisticConcurrencyConflict):
+            TaskAssignment.record(
+                task=self.task,
+                assignee_principal=self.operator,
+                command_id=uuid.uuid4(),
+                expected_task_version=self.task.state_version,
+                expected_current_assignment_id=first.pk,
+                assigned_by_principal=self.owner,
+                acting_role=ActingRole.OWNER,
+                permission_grant=self.grants[PermissionGrant.Action.ASSIGN_TASK],
+                recorded_by_principal=self.owner,
+            )
+        self.assertEqual(self.task.assignments.count(), 2)
+
+    def test_operator_cannot_assign_and_admin_can_assign_only_operators(self):
+        admin = Principal.objects.create_user(
+            username="assignment-admin",
+            password="local-test-only",
+            role=Principal.Role.OPERATIONS_ADMIN,
+        )
+        now = timezone.now()
+        admin_assign = PermissionGrant.objects.create(
+            principal=admin,
+            scope_kind=PermissionGrant.ScopeKind.PRODUCT,
+            product=self.product,
+            action=PermissionGrant.Action.ASSIGN_TASK,
+            valid_from=now - timedelta(minutes=1),
+            valid_until=now + timedelta(hours=1),
+            granted_by_principal=self.owner,
+        )
+        operator_assign = PermissionGrant.objects.create(
+            principal=self.operator,
+            scope_kind=PermissionGrant.ScopeKind.PRODUCT,
+            product=self.product,
+            action=PermissionGrant.Action.ASSIGN_TASK,
+            valid_from=now - timedelta(minutes=1),
+            valid_until=now + timedelta(hours=1),
+            granted_by_principal=self.owner,
+        )
+        self.record_dor()
+        self.transition(Task.State.READY)
+
+        with self.assertRaises(PermissionDenied):
+            TaskAssignment.record(
+                task=self.task,
+                assignee_principal=self.owner,
+                command_id=uuid.uuid4(),
+                expected_task_version=self.task.state_version,
+                assigned_by_principal=admin,
+                acting_role=ActingRole.OPERATIONS_ADMIN,
+                permission_grant=admin_assign,
+                recorded_by_principal=admin,
+            )
+        with self.assertRaises(PermissionDenied):
+            TaskAssignment.record(
+                task=self.task,
+                assignee_principal=self.operator,
+                command_id=uuid.uuid4(),
+                expected_task_version=self.task.state_version,
+                assigned_by_principal=self.operator,
+                acting_role=ActingRole.OPERATOR,
+                permission_grant=operator_assign,
+                recorded_by_principal=self.operator,
+            )
+        self.assertFalse(self.task.assignments.exists())
+
+        # Admin may manage Operator work, but may not take a task away from an
+        # Owner/Admin even when the proposed replacement is an Operator.
+        first = TaskAssignment.record(
+            task=self.task,
+            assignee_principal=self.owner,
+            command_id=uuid.uuid4(),
+            expected_task_version=self.task.state_version,
+            assigned_by_principal=self.owner,
+            acting_role=ActingRole.OWNER,
+            permission_grant=self.grants[PermissionGrant.Action.ASSIGN_TASK],
+            recorded_by_principal=self.owner,
+        )
+        self.transition(Task.State.ASSIGNED)
+        with self.assertRaises(PermissionDenied):
+            TaskAssignment.record(
+                task=self.task,
+                assignee_principal=self.operator,
+                command_id=uuid.uuid4(),
+                expected_task_version=self.task.state_version,
+                expected_current_assignment_id=first.pk,
+                assigned_by_principal=admin,
+                acting_role=ActingRole.OPERATIONS_ADMIN,
+                permission_grant=admin_assign,
+                recorded_by_principal=admin,
+            )
+        self.task.refresh_from_db()
+        self.assertEqual(self.task.current_assignee_principal_id, self.owner.pk)
+        self.assertEqual(self.task.assignments.count(), 1)
+
+    def test_reassignment_chain_must_link_the_immediately_previous_assignment(self):
+        self.record_dor()
+        self.transition(Task.State.READY)
+        first = TaskAssignment.record(
+            task=self.task,
+            assignee_principal=self.operator,
+            command_id=uuid.uuid4(),
+            expected_task_version=self.task.state_version,
+            assigned_by_principal=self.owner,
+            acting_role=ActingRole.OWNER,
+            permission_grant=self.grants[PermissionGrant.Action.ASSIGN_TASK],
+            recorded_by_principal=self.owner,
+        )
+        with self.assertRaises(ValidationError):
+            TaskAssignment.objects.create(
+                task=self.task,
+                assignee_principal=self.operator,
+                assignment_number=2,
+                command_id=uuid.uuid4(),
+                payload_hash="a" * 64,
+                expected_task_version=self.task.state_version,
+                assigned_by_principal=self.owner,
+                acting_role=ActingRole.OWNER,
+                permission_grant=self.grants[PermissionGrant.Action.ASSIGN_TASK],
+                recorded_by_principal=self.owner,
+                assigned_at=timezone.now(),
+                supersedes_assignment=None,
+            )
+        self.assertEqual(self.task.assignments.get().pk, first.pk)
 
     def test_only_current_assignee_can_start_and_record_dod(self):
         self.record_dor()
@@ -520,7 +829,7 @@ class WorkflowFoundationTests(TestCase):
         body = b"An exact immutable answer draft."
         version = ContentAssetVersion.create_next(
             content_asset=asset,
-            object_key=f"tasks/{self.task.pk}/answer-v1.txt",
+            object_key=f"https://assets.example.com/tasks/{self.task.pk}/answer-v1.txt",
             mime_type="text/plain",
             byte_size=len(body),
             content_sha256=hashlib.sha256(body).hexdigest(),

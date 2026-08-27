@@ -155,7 +155,7 @@ class ReleaseGateDomainTests(TestCase):
             permission_grant=self.edit_grant, recorded_by_principal=self.owner,
         )
         self.asset_version = ContentAssetVersion.create_next(
-            content_asset=self.asset, object_key="staging/puko/copy-v1.txt", mime_type="text/plain",
+            content_asset=self.asset, object_key="https://assets.example.com/staging/puko/copy-v1.txt", mime_type="text/plain",
             byte_size=42, content_sha256="a" * 64, command_id=uuid.uuid4(),
             actor_principal=self.owner, acting_role=ActingRole.OWNER,
             permission_grant=self.edit_grant, recorded_by_principal=self.owner,

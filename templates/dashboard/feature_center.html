@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% load ui_i18n %}
+{% block title %}{% ui '功能中心' 'Feature center' %} · PUKO Growth OS{% endblock %}
+{% block page_title %}{% ui '功能中心' 'Feature center' %}{% endblock %}
+{% block content %}
+<a class="back-link" href="{% url 'dashboard:home' %}">← {% ui '返回首页' 'Back to home' %}</a>
+<section class="hero-panel config-hero">
+  <div>
+    <p class="eyebrow">{% ui '按业务阶段找功能' 'Features grouped by work stage' %}</p>
+    <h2>{% ui '不用猜入口：先看现在处于哪一步' 'No guessing: start with the current stage' %}</h2>
+    <p>{% ui '这里按“找机会、执行发布、看结果”分组，并且只显示你当前有权使用的功能。日常待办仍以首页和右上角铃铛为准。' 'Features are grouped into finding opportunities, execution and publishing, and reviewing results. Only currently permitted features are shown. Home and the top-right inbox remain the source of daily actions.' %}</p>
+  </div>
+  <a class="button button-secondary" href="{% url 'dashboard:guide' %}">{% ui '看使用说明' 'Open guide' %}</a>
+</section>
+
+{% for group in feature_center.groups %}
+<section class="config-history">
+  <header class="section-heading">
+    <div>
+      <p class="eyebrow">{% ui group.label_zh group.label_en %}</p>
+      <h2>{% ui group.hint_zh group.hint_en %}</h2>
+    </div>
+  </header>
+  <div class="config-grid">
+    {% for item in group.links %}
+    <article class="detail-panel">
+      <h3>{% ui item.label_zh item.label_en %}</h3>
+      <p class="action-explanation">{% ui item.hint_zh item.hint_en %}</p>
+      <a class="button button-primary" href="{{ item.url }}">{% ui '打开' 'Open' %}</a>
+    </article>
+    {% endfor %}
+  </div>
+</section>
+{% endfor %}
+{% endblock %}

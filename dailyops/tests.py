@@ -11,6 +11,8 @@ from django.utils import timezone
 
 from accounts.models import PermissionGrant, Principal
 from accounts.services import revoke_permission_grant
+from contentops.models import ContentAssetVersion
+from dailyops.models import DailyBatchDispositionEvent
 from dailyops.services import PLATFORMS, ensure_default_sources
 from integrations.connectors.types import Platform
 from intelligence.models import (
@@ -71,6 +73,7 @@ class DailyOperationsUITests(TestCase):
             PermissionGrant.Action.VIEW,
             PermissionGrant.Action.EDIT,
             PermissionGrant.Action.CREATE_TASK,
+            PermissionGrant.Action.CANCEL_TASK,
         ):
             PermissionGrant.objects.create(
                 principal=self.owner,
@@ -151,9 +154,9 @@ class DailyOperationsUITests(TestCase):
         contract = TaskContractVersion.objects.create(
             product_profile_version=profile,
             version_number=1,
-            title="Daily link-first task",
+            title="Daily complete-content task",
             dor_criteria=[{"key": "source_ready", "required": True}],
-            dod_criteria=[{"key": "external_link", "required": True}],
+            dod_criteria=[{"key": "primary_deliverable", "required": True}],
             release_gate_criteria=[{"key": "policy_pass", "required": True}],
             success_criteria=[{"key": "published_url", "required": True}],
             sealed_at=timezone.now(),
@@ -168,7 +171,7 @@ class DailyOperationsUITests(TestCase):
         policy = PolicyVersion.objects.create(
             policy_definition=definition,
             version_number=1,
-            rules=[{"rule_code": "NO_UNSUPPORTED_CLAIMS", "required": True}],
+            rules=[{"rule_code": "exact_release_context", "required": True}],
             created_by_principal=self.owner,
             recorded_by_principal=self.owner,
         )
@@ -598,13 +601,45 @@ class DailyOperationsUITests(TestCase):
         self.assertEqual(compiled.url, reverse("dashboard:task-detail", args=[task.pk]))
 
         task_detail = self.client.get(compiled.url)
-        self.assertContains(task_detail, "Daily Operations 编译上下文（只读）")
-        self.assertContains(task_detail, "TIKTOK")
+        self.assertContains(task_detail, "执行位置")
+        self.assertContains(task_detail, "TikTok")
         self.assertContains(task_detail, self.account.display_name)
-        self.assertContains(task_detail, self.account.account_code)
-        self.assertContains(task_detail, "daily-ui-staging")
-        self.assertContains(task_detail, CapabilityState.MANUAL_PUBLISH)
+        self.assertContains(task_detail, "测试环境")
+        self.assertContains(task_detail, "可以进行人工发布")
+        self.assertNotContains(task_detail, self.account.account_code)
+        self.assertNotContains(task_detail, "daily-ui-staging")
+        self.assertNotContains(task_detail, CapabilityState.MANUAL_PUBLISH)
         self.assertContains(task_detail, "回答下午注意力问题")
+
+        # Even if the same account is also bound to another active runtime,
+        # this compiled task stays sealed to the environment represented by
+        # its exact capability snapshot.
+        alternate_environment = RuntimeEnvironment.objects.create(
+            environment_code="daily-ui-production-like",
+            environment_type=RuntimeEnvironment.EnvironmentType.PRODUCTION,
+            identity_namespace="daily-ui-other",
+            database_namespace="daily-ui-other",
+            object_storage_namespace="link-only-other",
+            created_by_principal=self.owner,
+            updated_by_principal=self.owner,
+        )
+        AccountEnvironmentBinding.objects.create(
+            channel_account=self.account,
+            runtime_environment=alternate_environment,
+            binding_version=2,
+            identity_reference="daily-ui-other-browser-profile",
+            created_by_principal=self.owner,
+            recorded_by_principal=self.owner,
+        )
+        from dashboard.review_views import _allowed_environments
+
+        allowed_environment_ids = set(
+            _allowed_environments(
+                ChannelAccount.objects.filter(pk=self.account.pk),
+                task=task,
+            ).values_list("pk", flat=True)
+        )
+        self.assertEqual(allowed_environment_ids, {self.environment.pk})
 
         self.client.post(compile_url, compile_data)
         self.assertEqual(Task.objects.filter(product=self.product).count(), 1)
@@ -1025,12 +1060,22 @@ class DailyOperationsUITests(TestCase):
             command_data(),
         )
         self.assertEqual(started.status_code, 302)
+        generated = self.client.post(
+            reverse("dashboard:task-action", args=[task.pk, "generate-content"]),
+            command_data(),
+        )
+        self.assertEqual(generated.status_code, 302)
+        content_version = ContentAssetVersion.objects.get(
+            content_asset__task=task,
+            representation_kind=ContentAssetVersion.RepresentationKind.INLINE_TEXT,
+        )
         submitted = self.client.post(
             reverse("dashboard:task-action", args=[task.pk, "deliver"]),
             command_data(
-                external_url="https://docs.example.test/daily-flow/v1",
+                delivery_mode="SYSTEM_CONTENT",
+                content_version=str(content_version.pk),
                 submission_note="Ready for independent admin review.",
-                criterion__external_link=TaskCheckRun.Result.PASS,
+                criterion__primary_deliverable=TaskCheckRun.Result.PASS,
             ),
         )
         self.assertEqual(submitted.status_code, 302)
@@ -1063,6 +1108,201 @@ class DailyOperationsUITests(TestCase):
             },
         )
         self.assertEqual(response.status_code, 404)
+
+    def test_draft_can_be_hidden_idempotently_without_deleting_collection_history(self):
+        batch_key, _, _ = self._start()
+        run_count = CollectionRun.objects.filter(batch_key=batch_key).count()
+        home = self.client.get(reverse("dailyops:home"))
+        self.assertContains(home, "删除这次草稿")
+        self.assertContains(home, "afternoon focus")
+
+        command_id = uuid.uuid4()
+        url = reverse("dailyops:batch-dispose", args=[self.product.pk, batch_key])
+        payload = {
+            "command_id": str(command_id),
+            "reason": "研究问题选错了，重新开始。",
+            "confirm": "on",
+        }
+        response = self.client.post(url, payload, follow=True)
+        self.assertContains(response, "这次草稿已从最近工作隐藏")
+        self.assertNotContains(response, "afternoon focus")
+        self.assertEqual(CollectionRun.objects.filter(batch_key=batch_key).count(), run_count)
+        event = DailyBatchDispositionEvent.objects.get(batch_key=batch_key)
+        self.assertEqual(event.disposition, DailyBatchDispositionEvent.Disposition.ABANDONED)
+        self.assertEqual(event.principal, self.owner)
+        self.assertIsNotNone(event.permission_grant_id)
+
+        replay = self.client.post(url, payload, follow=True)
+        self.assertContains(replay, "这次草稿此前已经隐藏")
+        self.assertEqual(DailyBatchDispositionEvent.objects.filter(batch_key=batch_key).count(), 1)
+
+        detail = self.client.get(reverse("dailyops:batch-detail", args=[self.product.pk, batch_key]))
+        self.assertContains(detail, "本页仅供查看历史")
+        blocked = self.client.post(
+            reverse("dailyops:analysis-propose", args=[self.product.pk, batch_key]),
+            {"command_id": str(uuid.uuid4())},
+        )
+        self.assertEqual(blocked.status_code, 403)
+
+    def test_formal_run_is_archived_without_removing_initiative(self):
+        batch_key, initiative = self._approved_initiative()
+        home = self.client.get(reverse("dailyops:home"))
+        self.assertContains(home, "从最近工作隐藏（任务保留）")
+        response = self.client.post(
+            reverse("dailyops:batch-dispose", args=[self.product.pk, batch_key]),
+            {
+                "command_id": str(uuid.uuid4()),
+                "reason": "本轮策略停止，保留正式执行历史。",
+                "confirm": "on",
+            },
+            follow=True,
+        )
+        self.assertContains(response, "已有项目、计划和任务均保留")
+        event = DailyBatchDispositionEvent.objects.get(batch_key=batch_key)
+        self.assertEqual(event.disposition, DailyBatchDispositionEvent.Disposition.ARCHIVED)
+        self.assertTrue(Initiative.objects.filter(pk=initiative.pk).exists())
+        self.assertNotContains(response, initiative.title)
+
+    def test_batch_disposition_requires_confirmation_and_current_cancel_permission(self):
+        batch_key, _, _ = self._start()
+        url = reverse("dailyops:batch-dispose", args=[self.product.pk, batch_key])
+        missing_confirmation = self.client.post(
+            url,
+            {
+                "command_id": str(uuid.uuid4()),
+                "reason": "测试缺少确认。",
+            },
+            follow=True,
+        )
+        self.assertContains(missing_confirmation, "没有隐藏这次工作")
+        self.assertFalse(DailyBatchDispositionEvent.objects.filter(batch_key=batch_key).exists())
+
+        cancel_grant = PermissionGrant.objects.get(
+            principal=self.owner,
+            product=self.product,
+            action=PermissionGrant.Action.CANCEL_TASK,
+        )
+        revoke_permission_grant(
+            actor=self.owner,
+            grant_id=cancel_grant.pk,
+            reason="Verify disposition uses live authorization.",
+        )
+        denied = self.client.post(
+            url,
+            {
+                "command_id": str(uuid.uuid4()),
+                "reason": "没有实时权限时不得隐藏。",
+                "confirm": "on",
+            },
+        )
+        self.assertEqual(denied.status_code, 403)
+        self.assertFalse(DailyBatchDispositionEvent.objects.filter(batch_key=batch_key).exists())
+
+        now = timezone.now()
+        PermissionGrant.objects.create(
+            principal=self.owner,
+            scope_kind=PermissionGrant.ScopeKind.GLOBAL,
+            action=PermissionGrant.Action.CANCEL_TASK,
+            valid_from=now - timedelta(minutes=1),
+            valid_until=now + timedelta(days=1),
+            granted_by_principal=self.owner,
+        )
+        global_only = self.client.post(
+            url,
+            {
+                "command_id": str(uuid.uuid4()),
+                "reason": "Global scope must not replace exact Product scope.",
+                "confirm": "on",
+            },
+        )
+        self.assertEqual(global_only.status_code, 403)
+        self.assertFalse(DailyBatchDispositionEvent.objects.filter(batch_key=batch_key).exists())
+
+    def test_operator_with_edit_cannot_dispose_daily_batch(self):
+        batch_key, _, _ = self._start()
+        now = timezone.now()
+        for action in (PermissionGrant.Action.VIEW, PermissionGrant.Action.EDIT):
+            PermissionGrant.objects.create(
+                principal=self.outsider,
+                scope_kind=PermissionGrant.ScopeKind.PRODUCT,
+                product=self.product,
+                action=action,
+                valid_from=now - timedelta(minutes=1),
+                valid_until=now + timedelta(days=1),
+                granted_by_principal=self.owner,
+            )
+        self.client.force_login(self.outsider)
+        home = self.client.get(reverse("dailyops:home"))
+        self.assertNotContains(home, "删除这次草稿")
+
+        denied = self.client.post(
+            reverse("dailyops:batch-dispose", args=[self.product.pk, batch_key]),
+            {
+                "command_id": str(uuid.uuid4()),
+                "reason": "Operator must not hide shared work.",
+                "confirm": "on",
+            },
+        )
+        self.assertEqual(denied.status_code, 403)
+        self.assertFalse(DailyBatchDispositionEvent.objects.filter(batch_key=batch_key).exists())
+
+    def test_view_only_product_has_no_recommendation_or_start_action(self):
+        batch_key, proposal = self._pending_proposal()
+        self.client.post(
+            reverse("dailyops:analysis-accept", args=[self.product.pk, batch_key, proposal.pk]),
+            {"command_id": str(uuid.uuid4())},
+        )
+        now = timezone.now()
+        PermissionGrant.objects.create(
+            principal=self.outsider,
+            scope_kind=PermissionGrant.ScopeKind.PRODUCT,
+            product=self.product,
+            action=PermissionGrant.Action.VIEW,
+            valid_from=now - timedelta(minutes=1),
+            valid_until=now + timedelta(days=1),
+            granted_by_principal=self.owner,
+        )
+        self.client.force_login(self.outsider)
+        home = self.client.get(reverse("dailyops:home"))
+        self.assertEqual(home.context["data_recommendations"], ())
+        self.assertFalse(home.context["can_start_batch"])
+        self.assertEqual(home.context["form"].fields["product"].queryset.count(), 0)
+        self.assertContains(home, 'disabled aria-disabled="true"', html=False)
+
+    def test_home_recommends_only_current_valid_external_demand(self):
+        empty = self.client.get(reverse("dailyops:home"))
+        self.assertContains(empty, "系统建议先研究什么")
+        self.assertContains(empty, "目前没有可直接采用的数据建议")
+
+        batch_key, proposal = self._pending_proposal()
+        self.client.post(
+            reverse("dailyops:analysis-accept", args=[self.product.pk, batch_key, proposal.pk]),
+            {"command_id": str(uuid.uuid4())},
+        )
+        opportunity = ProductOpportunity.objects.get(opportunity_key=f"daily-{batch_key.hex}")
+        suggested = self.client.get(reverse("dailyops:home"))
+        self.assertContains(suggested, opportunity.title)
+        self.assertContains(suggested, "已确认的外部需求")
+        self.assertContains(suggested, "按这个建议开始研究")
+
+        evidence = ExternalEvidenceItem.objects.get(collection_run__batch_key=batch_key)
+        self.client.post(
+            reverse(
+                "dailyops:evidence-invalidate",
+                args=[self.product.pk, batch_key, evidence.pk],
+            ),
+            {
+                "command_id": str(uuid.uuid4()),
+                "reason": "这条证据已经失效。",
+            },
+        )
+        invalidated = self.client.get(reverse("dailyops:home"))
+        self.assertNotContains(invalidated, opportunity.title)
+        self.assertContains(invalidated, "目前没有可直接采用的数据建议")
+
+        self.client.force_login(self.outsider)
+        outsider_home = self.client.get(reverse("dailyops:home"))
+        self.assertNotContains(outsider_home, opportunity.title)
 
     def test_post_requires_csrf(self):
         csrf_client = Client(enforce_csrf_checks=True)

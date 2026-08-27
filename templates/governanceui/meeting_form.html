@@ -1,7 +1,8 @@
 {% extends "base.html" %}
-{% block title %}记录会议 · PUKO{% endblock %}
-{% block page_title %}记录会议{% endblock %}
+{% load ui_i18n %}
+{% block title %}{% ui '记录会议' 'Record meeting' %} · PUKO{% endblock %}
+{% block page_title %}{% ui '记录会议' 'Record meeting' %}{% endblock %}
 {% block content %}
-<a class="back-link" href="{% url 'governanceui:home' %}">← 返回问题与规则治理</a>
-<section class="detail-columns"><article class="detail-panel action-panel"><p class="eyebrow">结构化留痕</p><h3>会议基本信息</h3><form class="config-form" method="post">{% csrf_token %}{{ form.as_p }}<button class="button button-primary" type="submit">创建会议记录</button></form></article><article class="detail-panel"><p class="eyebrow">下一步</p><h3>创建后再记录结论</h3><p class="muted">会议摘要本身不能改规则。只有单独保存的结构化结论，才可以作为 Rule Proposal 的 typed source。</p></article></section>
+<a class="back-link" href="{% url 'governanceui:home' %}">← {% ui '返回问题与规则治理' 'Back to issues and rules' %}</a>
+<section class="detail-columns"><article class="detail-panel action-panel"><p class="eyebrow">{% ui '结构化留痕' 'Structured record' %}</p><h3>{% ui '会议基本信息' 'Meeting details' %}</h3><form class="config-form" method="post">{% csrf_token %}{{ form.as_p }}<button class="button button-primary" type="submit">{% ui '创建会议记录' 'Create meeting record' %}</button></form></article><article class="detail-panel"><p class="eyebrow">{% ui '下一步' 'Next step' %}</p><h3>{% ui '创建后再记录结论' 'Record decisions after creating the meeting' %}</h3><p class="muted">{% ui '会议摘要本身不能改规则。只有单独保存的结构化结论，才可以作为 Rule Proposal 的 typed source。' 'A meeting summary cannot change a rule. Only a separately saved structured decision can become a typed source for a Rule Proposal.' %}</p></article></section>
 {% endblock %}

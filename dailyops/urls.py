@@ -11,6 +11,11 @@ urlpatterns = [
     path("start/", views.batch_start, name="batch-start"),
     path("<uuid:product_id>/<uuid:batch_key>/", views.batch_detail, name="batch-detail"),
     path(
+        "<uuid:product_id>/<uuid:batch_key>/dispose/",
+        views.batch_dispose,
+        name="batch-dispose",
+    ),
+    path(
         "<uuid:product_id>/<uuid:batch_key>/collect/automatic/",
         views.automatic_collect,
         name="automatic-collect",

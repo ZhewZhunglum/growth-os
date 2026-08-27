@@ -457,26 +457,28 @@ class ProvisionStagingStaffTests(TestCase):
         self.assertFalse(Principal.objects.filter(username__in=["owner", "admin"]).exists())
         self.assertFalse(PermissionGrant.objects.exists())
 
-    def test_publish_grant_is_operator_only_account_scoped_and_high_risk(self):
+    def test_publish_grants_are_exact_account_scoped_high_risk_for_all_staff(self):
         channel, binding, capability = self._add_publish_context()
 
         self._call(publish_account_code=channel.account_code)
 
-        grant = PermissionGrant.objects.get(action=PermissionGrant.Action.PUBLISH)
-        self.assertEqual(grant.principal.username, "operator")
-        self.assertEqual(grant.scope_kind, PermissionGrant.ScopeKind.ACCOUNT)
-        self.assertEqual(grant.account_ref, channel.account_code)
-        self.assertIsNone(grant.product)
-        self.assertEqual(grant.risk_level, PermissionGrant.RiskLevel.HIGH)
-        self.assertEqual(grant.effect, PermissionGrant.Effect.ALLOW)
+        owner = Principal.objects.get(username="owner")
+        grants = PermissionGrant.objects.filter(action=PermissionGrant.Action.PUBLISH)
+        self.assertSetEqual(
+            set(grants.values_list("principal__username", flat=True)),
+            {"owner", "admin", "operator"},
+        )
+        self.assertEqual(grants.count(), 3)
+        for grant in grants:
+            self.assertEqual(grant.scope_kind, PermissionGrant.ScopeKind.ACCOUNT)
+            self.assertEqual(grant.account_ref, channel.account_code)
+            self.assertIsNone(grant.product)
+            self.assertEqual(grant.risk_level, PermissionGrant.RiskLevel.HIGH)
+            self.assertEqual(grant.effect, PermissionGrant.Effect.ALLOW)
+            self.assertEqual(grant.granted_by_principal, owner)
+            self.assertIsNotNone(grant.valid_until)
         self.assertTrue(binding.is_current_at())
         self.assertTrue(capability.is_current_open_at())
-        self.assertFalse(
-            PermissionGrant.objects.filter(
-                principal__username__in=["owner", "admin"],
-                action=PermissionGrant.Action.PUBLISH,
-            ).exists()
-        )
 
     def test_future_overlapping_publish_grant_is_rejected_without_creating_an_allow(self):
         channel, _binding, _capability = self._add_publish_context()

@@ -46,6 +46,35 @@ $env:DATABASE_ENGINE='sqlite'
 .\.venv\Scripts\python.exe manage.py runserver
 ```
 
+### 本地登录一直加载：Python/Django 进程排障
+
+2026-08-24 的本地测试中出现过一次：登录页可以打开，提交正确账号和密码后却一直加载。检查确认这不是腾讯云服务器故障，也不是密码策略拒绝；当时旧的本地 Django `runserver` Python 进程仍占用 `127.0.0.1:8000`，并积累了大量 `CLOSE_WAIT` 连接。停止该旧进程并用 `--noreload` 重新启动后，完整登录请求与首页均恢复正常。
+
+再次遇到相同现象时：
+
+1. 先在原启动窗口按 `Ctrl+C` 停止本地服务，不要同时运行多个 `runserver`。
+2. 如果原窗口已经找不到，先核对 8000 端口对应的进程；只有确认命令行属于本项目的 `manage.py runserver` 后才停止它：
+
+   ```powershell
+   $serverConnection = Get-NetTCPConnection -LocalPort 8000 -State Listen
+   $serverProcessId = $serverConnection.OwningProcess
+   Get-CimInstance Win32_Process -Filter "ProcessId = $serverProcessId" |
+       Select-Object ProcessId, ExecutablePath, CommandLine
+   Stop-Process -Id $serverProcessId
+   ```
+
+3. 在项目根目录重新启动一个不带自动重载器的本地服务：
+
+   ```powershell
+   $env:GROWTH_OS_ENV='local'
+   $env:DATABASE_ENGINE='sqlite'
+   .\.venv\Scripts\python.exe manage.py runserver 127.0.0.1:8000 --noreload
+   ```
+
+4. 重新打开 `http://127.0.0.1:8000/accounts/login/` 验证。若仍然卡住，再检查最新终端报错和 `logs/` 下对应的本地运行日志，不要先反复改密码。
+
+本记录不包含任何测试密码。密码重置与进程卡死是两个不同问题。
+
 Do not run `createsuperuser` before the Dogfood bootstrap unless you intend to
 reuse that exact username with `--owner-username`. The bootstrap is the canonical
 way to create the first Owner and frozen test context. Open
@@ -56,7 +85,8 @@ batch, save at least one provenance-linked evidence item (automatic route, CSV,
 or manual link), generate an AI/dry-run proposal, and accept it as a human only
 when it is useful.  Move the Opportunity through Initiative and ChannelPlan,
 then compile the exact plan into a real Task.  Employees use **Today** for
-DoR/DoD and link-only submission, a different Principal uses **Content review**,
+DoR/DoD and an inline-text or external-link submission, a different Principal
+uses **Content review**,
 and an explicitly authorized publisher uses **Manual publishing**.  API and
 paired-browser publishing may be enabled by reviewed deployment code, but the
 same final human confirmation and fresh Release Gate re-check remain mandatory.
@@ -76,8 +106,10 @@ arguments or embedded in the seed.
 The normal `--full-demo` setup creates three human identities—`owner`, `admin`
 and `operator`—plus a non-login rule-evaluator service identity. Reviewer and
 Publisher are capabilities, not additional staff roles: Admin receives an
-explicit product-scoped REVIEW grant, while Operator receives an explicit
-account-scoped HIGH-risk PUBLISH grant. A fresh database therefore needs three
+explicit product-scoped REVIEW grant, while Owner, Admin, and Operator each
+receive their own exact account-scoped HIGH-risk PUBLISH grant. Those three
+publish grants are granted by Owner, bounded to 30 days, and never inferred
+from a role name. A fresh database therefore needs three
 distinct temporary values in `BOOTSTRAP_OWNER_PASSWORD`,
 `BOOTSTRAP_ADMIN_PASSWORD`, and `BOOTSTRAP_OPERATOR_PASSWORD`. Existing matching
 accounts are reused without resetting their passwords. Missing or reused
@@ -134,8 +166,8 @@ python manage.py provision_staging_staff --product-code PUKO --apply
 The first command validates the complete plan and commits zero writes. The
 second atomically creates the three Principals and their 30-day exact grants.
 Owner and Admin receive product-scoped task-management and REVIEW grants;
-Operator receives product-scoped EDIT. To give that Operator the separately
-controlled manual-publish capability, pass an existing account only after its
+Operator receives product-scoped EDIT. To give all three staff accounts their
+separate controlled manual-publish capabilities, pass an existing account only after its
 ACTIVE Staging binding and current OPEN capability have been established:
 
 ```text
@@ -143,12 +175,13 @@ python manage.py provision_staging_staff --product-code PUKO --publish-account-c
 python manage.py provision_staging_staff --product-code PUKO --publish-account-code puko-us --apply
 ```
 
-This adds only an account-scoped HIGH-risk PUBLISH grant. Replaying the command
-with all three matching accounts verifies/reuses them without reading or
+This adds exactly three independent account-scoped HIGH-risk PUBLISH grants—one
+each for Owner, Admin, and Operator—granted by Owner and bounded to 30 days.
+Replaying the command with all three matching accounts verifies/reuses them without reading or
 resetting passwords. For an existing three-account set, every base Product
 grant must already be complete and exact; the command refuses to silently add
 missing ordinary authority. Only an explicit `--publish-account-code` may add
-the separate PUBLISH grant. Password values must never be placed in `.env`, Compose,
+the three separate PUBLISH grants. Password values must never be placed in `.env`, Compose,
 Git, chat, screenshots, logs, shell history, or command arguments. Remove the
 three temporary Secret injections immediately after the applied command.
 
@@ -174,13 +207,16 @@ topology is a single-web-instance bootstrap environment.
 Before adding multiple web replicas, migrations must move into a one-off release
 job so several instances cannot race the same schema change.
 
-Content delivery is link-first in every environment. An immutable
-`ContentAssetVersion` stores an external URL rather than file bytes. A changed
-link creates a new version and must be submitted and reviewed again; existing
-review and release-gate records remain bound to the exact version they approved.
-Publication proof records an external publication URL or platform content ID.
-Growth OS is not a file asset store, and V1 requires no separate content-storage
-backend or related credentials.
+Content delivery supports two explicit immutable representations in every
+environment: a complete `INLINE_TEXT` body stored in PostgreSQL, or an
+`EXTERNAL_URL` using an absolute HTTP(S) reference. Neither route uploads a
+file or accepts an arbitrary storage key. A changed body or link creates a new
+`ContentAssetVersion` and must be submitted and reviewed again; existing review
+and release-gate records remain bound to the exact version they approved.
+Historical V1 object-key facts remain readable and hash-stable, but new writes
+use the strict V2 representation. Publication proof records an external
+publication URL or platform content ID. Growth OS is not a file asset store,
+and V1 requires no separate content-storage backend or related credentials.
 
 ## External runtime safety
 
@@ -191,7 +227,7 @@ and the MANUAL publication route after human confirmation. This is the default.
 The DeepSeek adapter targets `deepseek-v4-flash`, but open model weights do not
 mean that DeepSeek's hosted API is automatically free. Live AI requires an
 explicit reviewed runtime factory, an ACTIVE stage-matched `SecretReference`, a
-read-only secret file, current official input/output prices, and hard request
+read-only secret file, current reviewed uncached-input/cache-hit/output prices, and hard request
 and dollar budgets. Missing or invalid configuration fails closed. Connector
 and publication networking follow the same rule: they remain disabled until a
 reviewed deployment factory supplies exact routes and transports. User form
@@ -288,8 +324,9 @@ $env:DATABASE_ENGINE='sqlite'
 
 The full test suite exercises identity and exact Grants, sealed configuration,
 seven-platform collection outcomes, provenance and data-domain isolation,
-human-approved opportunity/task compilation, task checks, link-only content
-review, idempotency, optimistic locking, stale-context detection, fail-closed
+human-approved opportunity/task compilation, task checks, inline-text and
+external-link content review, legacy V1 compatibility, idempotency, optimistic
+locking, stale-context detection, fail-closed
 publication, publication-level performance, GEO, Learning, and rule governance.
 It also contains one end-to-end offline Daily Operations V1 test. SQLite passing
 is a local development checkpoint; PostgreSQL/Staging evidence is still required

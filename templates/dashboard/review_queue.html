@@ -3,6 +3,7 @@
 {% block title %}{% ui '待审核' 'Review queue' %} · PUKO Growth OS{% endblock %}
 {% block page_title %}{% ui '待审核' 'Review queue' %}{% endblock %}
 {% block content %}
+<a class="back-link" href="{% url 'dashboard:home' %}">← {% ui '返回首页' 'Back to home' %}</a>
 <section class="hero-panel">
     <div>
         <p class="eyebrow">{% ui '人工审核 · 不会发布' 'Human review · no publishing' %}</p>
@@ -11,17 +12,46 @@
     </div>
 </section>
 <section class="section-heading"><div><p class="eyebrow">{% ui '正在审核' 'In review' %}</p><h2>{% ui '等待你处理' 'Waiting for you' %}</h2></div><span class="section-note">{{ tasks|length }} {% ui '项' 'items' %}</span></section>
-<section class="task-list">
+{% if tasks %}
+<div class="batch-action-bar" id="batch-action-bar">
+    <label class="batch-select-all"><input type="checkbox" id="batch-select-all"> <span>{% ui '全选当前页' 'Select all on page' %}</span></label>
+    <span class="batch-selected-count">{% ui '已选' 'Selected' %}: <strong id="batch-selected-count">0</strong></span>
+    <button class="button button-primary" id="batch-approve-btn" type="button" disabled>{% ui '批量通过' 'Batch approve' %}</button>
+</div>
+{% endif %}
+<section class="task-list" id="review-task-list">
     {% for task in tasks %}
-    <article class="task-card">
-        <header class="task-card-header"><div><p class="task-meta">{{ task.product.name }}</p><h3>{{ task.title }}</h3></div><span class="task-state">{% ui_task_state task.current_state %}</span></header>
+    <article class="task-card review-task-card" data-task-id="{{ task.id }}">
+        <header class="task-card-header">
+            <label class="task-checkbox-label"><input type="checkbox" class="task-checkbox" value="{{ task.id }}"></label>
+            <div><p class="task-meta">{{ task.product.name }}</p><h3>{{ task.title }}</h3></div><span class="task-state">{% ui_task_state task.current_state %}</span>
+        </header>
         <div class="task-section"><span class="task-label">{% ui '为什么做' 'Purpose' %}</span><p>{% if task.description %}{{ task.description }}{% else %}{% ui '暂无背景说明' 'No background provided' %}{% endif %}</p></div>
-        <footer class="task-card-footer"><span>{% ui '提交内容需要人工核对' 'This submission needs a human check' %}</span><a class="button button-primary" href="{% url 'dashboard:review-detail' task.id %}">{% ui '打开审核' 'Open review' %}</a></footer>
+        <footer class="task-card-footer"><span>{% if task.owner_self_approval %}{% ui '由 Owner 做最终批准，并保留独立审计记录' 'Owner final approval with a separate audit record' %}{% else %}{% ui '提交内容需要人工核对' 'This submission needs a human check' %}{% endif %}</span><a class="button button-primary" href="{% url 'dashboard:review-detail' task.id %}">{% if task.owner_self_approval %}{% ui 'Owner 最终批准' 'Owner final approval' %}{% else %}{% ui '打开审核' 'Open review' %}{% endif %}</a></footer>
     </article>
     {% empty %}
     <article class="empty-state task-empty-state"><span class="empty-number">00</span><div><h3>{% ui '当前没有待审核任务' 'No tasks are waiting for review' %}</h3><p>{% ui '你不需要做任何操作。' 'No action is needed.' %}</p></div></article>
     {% endfor %}
 </section>
+{% if review_page_obj and review_page_obj.paginator.num_pages > 1 %}
+<nav class="pagination" aria-label="{% ui '待审核分页' 'Review queue pagination' %}">
+    {% if review_page_obj.has_previous %}<a href="?review_page={{ review_page_obj.previous_page_number }}">{% ui '上一页' 'Prev' %}</a>{% else %}<span class="is-disabled">{% ui '上一页' 'Prev' %}</span>{% endif %}
+    <span class="is-current">{{ review_page_obj.number }} / {{ review_page_obj.paginator.num_pages }}</span>
+    {% if review_page_obj.has_next %}<a href="?review_page={{ review_page_obj.next_page_number }}">{% ui '下一页' 'Next' %}</a>{% else %}<span class="is-disabled">{% ui '下一页' 'Next' %}</span>{% endif %}
+</nav>
+{% endif %}
+{% if waiting_reviews %}
+<section class="section-heading review-handoff-heading"><div><p class="eyebrow">{% ui '只读进度' 'Read-only progress' %}</p><h2>{% ui '我送审的内容正在等待他人' 'My submissions waiting on someone else' %}</h2></div><span class="section-note">{{ waiting_reviews|length }} {% ui '项' 'items' %}</span></section>
+<section class="task-list review-handoff-list" aria-label="{% ui '等待他人审核的提交' 'Submissions waiting for someone else to review' %}">
+    {% for item in waiting_reviews %}
+    <article class="task-card review-handoff-card">
+        <header class="task-card-header"><div><p class="task-meta">{% ui '已成功送审' 'Successfully submitted' %}</p><h3>{% ui item.label_zh item.label_en %}</h3></div><span class="task-state">{% ui '等待他人' 'Waiting' %}</span></header>
+        <div class="task-section"><span class="task-label">{% ui '现在由谁处理' 'Who handles it now' %}</span><p>{% ui item.hint_zh item.hint_en %}</p></div>
+        <footer class="task-card-footer"><span>{% ui '这不是你的审核待办；请等待有权限的账号处理。' 'This is not your review action; wait for an authorized account to handle it.' %}</span><a class="button button-secondary" href="{{ item.url }}">{% ui '查看任务进度' 'View task progress' %}</a></footer>
+    </article>
+    {% endfor %}
+</section>
+{% endif %}
 <section class="section-heading review-history-heading"><div><p class="eyebrow">{% ui '只读历史' 'Read-only history' %}</p><h2>{% ui '我已完成的审核' 'My completed reviews' %}</h2></div><span class="section-note">{{ completed_reviews|length|default:0 }} {% ui '项' 'items' %}</span></section>
 <section class="task-list review-history-list" aria-label="{% ui '已完成审核记录' 'Completed review records' %}">
     {% for review in completed_reviews %}
@@ -37,4 +67,66 @@
     <article class="empty-state task-empty-state"><span class="empty-number">00</span><div><h3>{% ui '还没有已完成的审核记录' 'No completed reviews yet' %}</h3><p>{% ui '完成审核后，历史结论会在这里以只读方式显示。' 'Completed reviews appear here as read-only records.' %}</p></div></article>
     {% endfor %}
 </section>
+{% if history_page_obj and history_page_obj.paginator.num_pages > 1 %}
+<nav class="pagination" aria-label="{% ui '审核历史分页' 'Review history pagination' %}">
+    {% if history_page_obj.has_previous %}<a href="?history_page={{ history_page_obj.previous_page_number }}">{% ui '上一页' 'Prev' %}</a>{% else %}<span class="is-disabled">{% ui '上一页' 'Prev' %}</span>{% endif %}
+    <span class="is-current">{{ history_page_obj.number }} / {{ history_page_obj.paginator.num_pages }}</span>
+    {% if history_page_obj.has_next %}<a href="?history_page={{ history_page_obj.next_page_number }}">{% ui '下一页' 'Next' %}</a>{% else %}<span class="is-disabled">{% ui '下一页' 'Next' %}</span>{% endif %}
+</nav>
+{% endif %}
+<script>
+(function () {
+    const selectAll = document.getElementById("batch-select-all");
+    const checkboxes = document.querySelectorAll(".task-checkbox");
+    const selectedCount = document.getElementById("batch-selected-count");
+    const approveBtn = document.getElementById("batch-approve-btn");
+    if (!selectAll || !checkboxes.length) return;
+
+    function updateState() {
+        const checked = document.querySelectorAll(".task-checkbox:checked");
+        const count = checked.length;
+        selectedCount.textContent = count;
+        approveBtn.disabled = count === 0;
+        selectAll.checked = count === checkboxes.length;
+        selectAll.indeterminate = count > 0 && count < checkboxes.length;
+    }
+
+    selectAll.addEventListener("change", function () {
+        checkboxes.forEach(function (cb) { cb.checked = selectAll.checked; });
+        updateState();
+    });
+    checkboxes.forEach(function (cb) { cb.addEventListener("change", updateState); });
+
+    approveBtn.addEventListener("click", async function () {
+        const ids = Array.from(document.querySelectorAll(".task-checkbox:checked")).map(function (cb) { return cb.value; });
+        if (!ids.length) return;
+        if (!window.confirm("确认批量通过 " + ids.length + " 项审核？将使用默认说明“批量审核通过”。")) return;
+        approveBtn.disabled = true;
+        approveBtn.textContent = "处理中…";
+        try {
+            const formData = new FormData();
+            ids.forEach(function (id) { formData.append("task_ids", id); });
+            const csrf = document.querySelector("[name=csrfmiddlewaretoken]");
+            if (csrf) formData.append("csrfmiddlewaretoken", csrf.value);
+            const resp = await fetch("{% url 'dashboard:review-batch-action' %}", {
+                method: "POST", body: formData, credentials: "same-origin",
+                headers: { "X-Requested-With": "XMLHttpRequest" },
+            });
+            const data = await resp.json();
+            if (data.ok) {
+                alert("批量通过完成：成功 " + data.approved_count + " 项，失败 " + data.failed_count + " 项。");
+                window.location.reload();
+            } else {
+                alert("批量操作失败：" + (data.message || "未知错误"));
+                approveBtn.disabled = false;
+                approveBtn.textContent = "批量通过";
+            }
+        } catch (e) {
+            alert("网络错误，请重试。");
+            approveBtn.disabled = false;
+            approveBtn.textContent = "批量通过";
+        }
+    });
+})();
+</script>
 {% endblock %}

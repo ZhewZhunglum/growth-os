@@ -1,11 +1,12 @@
 {% extends "base.html" %}
 {% load ui_i18n %}
-{% block title %}{% ui 'AI 搜索曝光与结果' 'AI Search Visibility & Results' %} · PUKO{% endblock %}
-{% block page_title %}{% ui 'AI 搜索曝光与结果' 'AI Search Visibility & Results' %}{% endblock %}
+{% block title %}{% ui 'AI 搜索曝光（GEO）与结果' 'AI Search Visibility (GEO) & Results' %} · PUKO{% endblock %}
+{% block page_title %}{% ui 'AI 搜索曝光（GEO）与结果' 'AI Search Visibility (GEO) & Results' %}{% endblock %}
 {% block content %}
-<section class="hero-panel config-hero">
+<a class="back-link" href="{% url 'dashboard:feature-center' %}">← {% ui '返回功能中心' 'Back to feature center' %}</a>
+<section class="hero-panel config-hero" id="geo">
   <div>
-    <p class="eyebrow">{% ui '结果回流' 'Results feedback' %}</p>
+    <p class="eyebrow">{% ui 'AI 搜索曝光（GEO）' 'AI search visibility (GEO)' %}</p>
     <h2>{% ui 'AI 会不会提到 PUKO？' 'Will AI answers mention PUKO?' %}</h2>
     <p>{% ui '用真实问题测试 DeepSeek、ChatGPT、Perplexity 等 AI：它们有没有提到、推荐或引用 PUKO。这里记录的是 AI 搜索曝光，不是普通搜索排名。' 'Test real questions in DeepSeek, ChatGPT, Perplexity, and other AI services: do they mention, recommend, or cite PUKO? This tracks AI search visibility, not ordinary search ranking.' %}</p>
   </div>
@@ -23,6 +24,9 @@
   <span class="section-note">{% ui '先在 AI 里提问，再把结果记到这里' 'Ask the AI first, then record the result here' %}</span>
 </section>
 <section class="detail-panel">
+  {% if has_local_test_geo %}
+  <p class="muted"><strong>{% ui '本地测试说明：' 'Local test notice:' %}</strong> {% ui '标有 [LOCAL TEST ONLY] 的问题只用于熟悉 GEO 录入，不会进入正式学习或需求。' 'Questions marked [LOCAL TEST ONLY] are only for practising GEO entry and never enter formal learning or demand.' %}</p>
+  {% endif %}
   {% if can_record_geo %}
   <form method="post" action="{% url 'feedback:geo-result' %}" class="config-form">
     {% csrf_token %}{{ geo_form.non_field_errors }}
@@ -64,7 +68,7 @@
 </details>
 {% endif %}
 
-<details class="detail-panel">
+<details class="detail-panel" id="results-learning">
   <summary><strong>{% ui '其他结果工具：平台表现与改进建议' 'Other result tools: platform performance and proposals' %}</strong></summary>
   <p class="muted">{% ui '日常只需要使用上面的 AI 搜索曝光。发布后的浏览量、点击量，或要提交人工改进建议时，再打开这里。真实的 0 是有效数据；没有拿到数据不要填 0。' 'For daily work, use AI Search Visibility above. Open this section for post-publication views or clicks, or when submitting a human improvement proposal. A real zero is valid data; do not use zero when data is missing.' %}</p>
   <details><summary><strong>{% ui '记录一条平台表现' 'Record one platform result' %}</strong></summary>

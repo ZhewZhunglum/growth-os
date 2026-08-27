@@ -2,7 +2,7 @@
 
 This runbook is the reproducible path for the frozen V1 Staging candidate. It
 does not authorize a Production launch. A reachable page is not release
-evidence: the immutable revision, PostgreSQL behavior, link-only content flow,
+evidence: the immutable revision, PostgreSQL behavior, versioned content flow,
 negative smoke cases and isolated recovery rehearsal must all pass first.
 
 ## 1. Required boundary
@@ -13,9 +13,11 @@ negative smoke cases and isolated recovery rehearsal must all pass first.
   HTTPS. Django is additionally published on `127.0.0.1:18000` for host-local
   diagnosis and is never exposed by the firewall.
 - Nginx overwrites forwarding headers and rate-limits the login endpoint.
-- V1 accepts no file uploads. Immutable content versions store external URLs;
-  publication proof stores an external URL and/or platform content ID. The
-  runtime persists only database state and requires no content-storage service.
+- V1 accepts no file uploads. New immutable content versions store either an
+  external HTTP(S) URL or complete inline text; they never store uploaded file
+  bytes or arbitrary storage keys. Publication proof stores an external URL
+  and/or platform content ID. The runtime persists only database state and
+  requires no content-storage service.
 - All application deployments use a clean checkout at one exact 40-character
   Git SHA and a separately approved immutable registry digest. The pulled
   repository digest, OCI revision label and `/health/` revision must agree.
@@ -140,12 +142,16 @@ ownership while retaining mode `0400` or `0600`, then rerun the same command.
 Do not change the TLS private-key owner merely to satisfy the application
 container; only Nginx consumes it.
 
-Content records are link-only. A changed deliverable URL must create a new
-immutable `ContentAssetVersion` and pass submission and review again; never edit
-an already submitted version in place. Review and release-gate rows remain bound
+Content records use one of two explicit V2 representations: `EXTERNAL_URL` for
+an absolute HTTP(S) reference, or `INLINE_TEXT` for complete text stored in the
+database. A changed URL or changed inline body must create a new immutable
+`ContentAssetVersion` and pass submission and review again; never edit an
+already submitted version in place. Review and release-gate rows remain bound
 to that exact version, while publication-proof URL/content-ID facts remain
 immutable. Operators must use Staging-safe external references and must not
-place credentials in URLs.
+place credentials in URLs. Historical V1 object-key rows remain readable and
+hash-stable for audit compatibility, but current code may not create new V1
+rows, file uploads, or arbitrary object-key records.
 
 ## 5. DNS, firewall and TLS
 
@@ -283,11 +289,14 @@ data, shared or legacy active human identity, staff/superuser identity, or live
 session. Rotating `django_secret_key` alone is not accepted as identity
 sanitization. After restore, the deploy script repeats the identity and session
 counts and stops with the web service still loopback-only if any forbidden count
-is non-zero. It also rejects every `ContentAssetVersion` that is not an explicit
-link manifest (`text/uri-list`, `metadata.source=external-url`, and an `http://`
-or `https://` object key), so an old file-backed record cannot silently become a
-broken link. External URLs and platform content IDs are database references;
-the deployment does not copy, fetch, hash or otherwise certify remote bytes.
+is non-zero. It also checks every `ContentAssetVersion` by payload schema. V1
+rows are historical compatibility facts and retain their original non-empty
+object key and hashes. V2 `EXTERNAL_URL` rows require a credential-free absolute
+HTTP(S) URL and empty inline body. V2 `INLINE_TEXT` rows require an empty object key, a
+non-blank body, and matching UTF-8 byte count and SHA-256. Any unknown or mixed
+representation fails closed. Current application code cannot create V1 rows,
+file uploads, or arbitrary object keys. External URLs and platform content IDs
+are database references; the deployment does not fetch or certify remote bytes.
 
 For the first sanitized import, keep `STAGING_DEPLOY_MODE=bootstrap` and run:
 
@@ -320,14 +329,15 @@ STAGING_UPGRADE_QUIESCE_CONFIRMATION=<exact-40-character-reviewed-sha> \
 
 Upgrade fails before migration unless the current loopback web is healthy,
 the exact three configured active HUMAN accounts and exact bounded Grants pass
-the locked provisioning dry run, the exact committed Operator PUBLISH Grant is
-present, no staff/superuser exists, and every existing content version passes
-the link-only gate. It invalidates every Django session, then applies the
+the locked provisioning dry run, the three exact committed Owner/Admin/Operator
+PUBLISH Grants are present, Owner-granted and time-bounded, no staff/superuser exists, and every existing content version passes
+the representation gate. It invalidates every Django session, then applies the
 database integrity checks, backs up, migrates once and replaces web. It repeats
-the exact identity/Grant, zero-session, and link-only gates against the new code
-after migration. Bootstrap runs the same link-only gate after restore and
-migration. Existing immutable link and proof history is retained; the deployment
-never fetches external content as a release prerequisite. Any failed pre/post
+the exact identity/Grant, zero-session, and representation gates against the new
+code after migration. Bootstrap runs the same representation gate after restore
+and migration. Existing immutable V1 history, V2 URL/inline content, and proof
+history are retained; the deployment never fetches external content as a release
+prerequisite. Any failed pre/post
 check leaves Nginx stopped and the candidate unexposed.
 
 ## 7. Provision acceptance-test staff while still loopback-only
@@ -401,7 +411,9 @@ creation using the host's approved secure deletion/Secret lifecycle process.
 If dry-run/apply is abandoned or fails, delete all three anyway and issue three
 new values before retrying; never leave them on the host for a later attempt.
 Do not create a Django superuser. Owner, Admin and Operator remain three distinct
-normal Principals; REVIEW and PUBLISH remain separately scoped grants.
+normal Principals; REVIEW remains separately scoped, and each Principal receives
+its own exact account-scoped HIGH-risk PUBLISH Grant. The three PUBLISH Grants
+are granted by Owner, expire after 30 days, and are never inferred from role.
 
 These test Grants expire after 30 days. This V1 command is not a renewal path:
 at expiry, disable the temporary accounts and revoke/expire their Grants, then
@@ -426,9 +438,9 @@ sh scripts/expose-staging-edge.sh <exact-40-character-reviewed-sha> \
 This command requires the exact three config-bound active HUMAN Principals,
 their exact roles, internal usable credentials, no staff/superuser flags, no
 fourth active human, no sessions, successful transactionally locked
-provisioning dry-run verification, and an already-committed exact bounded
-Operator PUBLISH Grant. Existing immutable external-link history is retained
-without fetching remote content. The exposure command also repeats the running digest, loopback
+provisioning dry-run verification, and three already-committed exact bounded,
+Owner-granted Owner/Admin/Operator PUBLISH Grants. Existing immutable V1, external-URL, and inline-text
+history is retained without fetching remote content. The exposure command also repeats the running digest, loopback
 binding, health, certificate, rendered-template, and no-extra-vhost checks
 before binding 80/443. It performs no migration.
 
@@ -445,8 +457,10 @@ It verifies, without printing Secrets or creating external content:
 - application binding at `127.0.0.1:18000`;
 - read-only Secret mounts and absence of plaintext Secret environment entries;
 - explicit Staging mode, password minimum of 12, PostgreSQL engine and version;
-- no pending migration, Django checks, deploy checks, link-only content-version
-  records and Nginx syntax;
+- no pending migration, Django checks, deploy checks, schema-aware external-URL
+  and inline-text content-version records, and Nginx syntax;
+- a rollback-only exact-Grant dry run plus independently committed, bounded,
+  Owner-granted account-scoped HIGH PUBLISH Grants for Owner, Admin and Operator;
 - login throttling and overwritten forwarding headers;
 - trusted HTTPS, exact port-80 canonical redirects (including `Host:
   localhost`), healthy database and exact `/health/` SHA.
@@ -461,9 +475,12 @@ connection tests against Staging PostgreSQL. Preserve the raw output and the
 checkout SHA. A SQLite pass or a PostgreSQL test marked SKIP is not evidence.
 
 The manual smoke test must use different Principals and cover the full path:
-login/RBAC, sealed Product Profile, Task/Contract, exact ContentAssetVersion,
-DoR/DoD, Submission, Admin review, fail-closed Release Gate and Operator manual
-publication proof. Also prove these negative cases:
+login/RBAC, sealed Product Profile, Task/Contract, exact inline-text or
+external-URL ContentAssetVersion,
+DoR/DoD, Submission, Admin review, fail-closed Release Gate and a separately
+authorized staff manual-publication proof. Across bounded acceptance cases,
+prove that Owner, Admin and Operator can each publish only through their own
+exact account-scoped HIGH PUBLISH Grant. Also prove these negative cases:
 
 - a submitter cannot review their own Submission;
 - an Operator without REVIEW cannot review;
@@ -494,9 +511,9 @@ archive delay no more than 15 minutes and an isolated recovery window of at
 least 14 days. A Docker volume or dump retained only on the candidate host is
 not a backup. Monitor backup success, WAL delay, capacity, off-host replication
 and restore failures, with Owner/Admin alerts before the one-hour RPO can be
-exceeded. Database backups cover Growth OS audit records and external-link
-metadata; the remote content behind those links remains outside Growth OS's
-recovery boundary.
+exceeded. Database backups cover Growth OS audit records, inline text, and
+external-link metadata; the remote content behind external links remains
+outside Growth OS's recovery boundary.
 
 Run restoration under a different Compose project name and on a separate host,
 VM, or isolated Docker volume. Never restore over the candidate database. A
@@ -509,7 +526,7 @@ typical isolated rehearsal is:
    isolated database.
 5. Start the exact application image against the restored database.
 6. Run `/health/`, record counts/checksums for acceptance records, and inspect
-   representative content-version and publication-proof link rows.
+   representative inline/external content-version and publication-proof rows.
 7. Record the recovered point and finish time.
 
 The rehearsal passes only if measured data loss is at most one hour and service
@@ -555,7 +572,8 @@ reason, database decision, operator, start/end time and verification evidence.
 Keep the PR unmerged and label the environment `staging-candidate` until all of
 the following exist: the approved `(Git SHA, repository digest)` and matching
 running/health evidence; zero-count pre-edge identity/session evidence;
-link-only content and publication-proof acceptance evidence; PostgreSQL full
+V2 external-URL/inline-text content and publication-proof acceptance evidence;
+legacy V1 compatibility evidence; PostgreSQL full
 and concurrency passes; structured positive/negative smoke evidence;
 certificate renewal evidence; documented retirement of the old stack;
 encrypted off-host PostgreSQL PITR backup and alerting evidence; and an isolated
