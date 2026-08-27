@@ -3,8 +3,32 @@ from __future__ import annotations
 from django import template
 from django.utils.translation import get_language
 
+from core.audit_notes import (
+    audit_note_source as _audit_note_source,
+    audit_note_text as _audit_note_text,
+)
 
 register = template.Library()
+
+
+@register.filter
+def audit_note_text(value: object) -> str:
+    """Hide the storage-only source tag from people reading an audit note."""
+
+    return _audit_note_text(value)
+
+
+@register.filter
+def audit_note_source_label(value: object) -> str:
+    """Return a small, friendly provenance label for source-tagged notes."""
+
+    source = _audit_note_source(value)
+    english = str(get_language() or "zh-hans").lower().startswith("en")
+    if source == "USER_PROVIDED":
+        return "Written by the user" if english else "用户填写"
+    if source == "SYSTEM_DEFAULT":
+        return "System recorded; no note was supplied" if english else "系统自动记录（未填写说明）"
+    return ""
 
 
 TASK_STATE_LABELS = {

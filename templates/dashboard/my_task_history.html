@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% load ui_i18n %}
+{% load ui_i18n dashboard_display %}
 {% block title %}{% ui '我的工作记录' 'My work history' %} · PUKO Growth OS{% endblock %}
 {% block page_title %}{% ui '我的工作记录' 'My work history' %}{% endblock %}
 {% block content %}
@@ -18,7 +18,50 @@
     <span class="section-note">{{ page_obj.paginator.count }} {% ui '项' 'items' %}</span>
 </section>
 
+<nav class="button-row" aria-label="{% ui '工作记录分类' 'Work-history categories' %}">
+    <a class="button {% if category == 'active' %}button-primary{% else %}button-secondary{% endif %}" href="?category=active"{% if category == 'active' %} aria-current="page"{% endif %}>{% ui '进行中' 'Active' %}（{{ counts.active }}）</a>
+    <a class="button {% if category == 'completed' %}button-primary{% else %}button-secondary{% endif %}" href="?category=completed"{% if category == 'completed' %} aria-current="page"{% endif %}>{% ui '已完成' 'Completed' %}（{{ counts.completed }}）</a>
+    <a class="button {% if category == 'cancelled' %}button-primary{% else %}button-secondary{% endif %}" href="?category=cancelled"{% if category == 'cancelled' %} aria-current="page"{% endif %}>{% ui '已取消任务' 'Cancelled tasks' %}（{{ counts.cancelled }}）</a>
+    <a class="button {% if category == 'hidden' %}button-primary{% else %}button-secondary{% endif %}" href="?category=hidden"{% if category == 'hidden' %} aria-current="page"{% endif %}>{% ui '已删除/隐藏的工作轮次' 'Deleted/hidden runs' %}（{{ counts.hidden }}）</a>
+</nav>
+
 <section class="task-list" aria-label="{% ui '我的任务历史' 'My task history' %}">
+    {% if is_hidden_category %}
+    {% for event in page_obj.object_list %}
+    <article class="task-card">
+        <header class="task-card-header">
+            <div>
+                <p class="task-meta">{{ event.product.name }}</p>
+                <h3>{% if event.batch_query %}{{ event.batch_query }}{% else %}{% ui 'Daily Operations 工作轮次' 'Daily Operations run' %}{% endif %}</h3>
+            </div>
+            <span class="task-state">
+                {% if event.disposition == 'ABANDONED' %}{% ui '草稿已删除/隐藏' 'Draft deleted/hidden' %}{% else %}{% ui '工作轮次已隐藏' 'Run hidden' %}{% endif %}
+            </span>
+        </header>
+        <div class="task-section">
+            <span class="task-label">{% ui '这代表什么' 'What this means' %}</span>
+            {% if event.disposition == 'ABANDONED' %}
+            <p>{% ui '这次草稿在建立正式任务前被放弃；它不是“已完成任务”。' 'This draft was abandoned before a formal task was created. It is not a completed task.' %}</p>
+            {% else %}
+            <p>{% ui '这次工作轮次已从日常列表隐藏；如果它曾生成正式任务，任务会保留自己的真实状态。' 'This run was hidden from the daily list. Any formal tasks it created keep their real status.' %}</p>
+            {% endif %}
+            <p class="muted">{% ui '原因' 'Reason' %}: {{ event.reason|audit_note_text }}{% if event.reason|audit_note_source_label %} · {{ event.reason|audit_note_source_label }}{% endif %}</p>
+        </div>
+        <footer class="task-card-footer">
+            <span>{% ui '处理时间' 'Handled' %}: {{ event.created_at }}</span>
+            {% if event.has_batch_runs %}<a class="button button-secondary" href="{% url 'dailyops:batch-detail' event.product.id event.batch_key %}">{% ui '查看只读记录' 'View read-only record' %}</a>{% endif %}
+        </footer>
+    </article>
+    {% empty %}
+    <article class="empty-state task-empty-state">
+        <span class="empty-number">00</span>
+        <div>
+            <h3>{% ui '没有已删除或隐藏的工作轮次' 'No deleted or hidden runs' %}</h3>
+            <p>{% ui '这里专门保存被放弃的草稿和隐藏的工作轮次，不会把它们写成“已完成”。' 'Abandoned drafts and hidden runs appear here; they are never labelled completed.' %}</p>
+        </div>
+    </article>
+    {% endfor %}
+    {% else %}
     {% for task in page_obj.object_list %}
     <article class="task-card">
         <header class="task-card-header">
@@ -38,7 +81,7 @@
         </div>
         <footer class="task-card-footer">
             <span>{% ui '最近更新' 'Last updated' %}: {{ task.updated_at }}</span>
-            <span>{% ui '只读摘要' 'Read-only summary' %}</span>
+            <a class="button button-secondary" href="{% url 'dashboard:task-detail' task.id %}">{% ui '查看只读详情' 'View read-only details' %}</a>
         </footer>
     </article>
     {% empty %}
@@ -50,14 +93,15 @@
         </div>
     </article>
     {% endfor %}
+    {% endif %}
 </section>
 
 {% if page_obj.paginator.num_pages > 1 %}
 <nav class="task-card-footer" aria-label="{% ui '工作记录分页' 'Work-history pages' %}">
     <span>{% ui '第' 'Page' %} {{ page_obj.number }} / {{ page_obj.paginator.num_pages }} {% ui '页' '' %}</span>
     <span>
-        {% if page_obj.has_previous %}<a class="button button-secondary" href="?page={{ page_obj.previous_page_number }}">← {% ui '上一页' 'Previous' %}</a>{% endif %}
-        {% if page_obj.has_next %}<a class="button button-secondary" href="?page={{ page_obj.next_page_number }}">{% ui '下一页' 'Next' %} →</a>{% endif %}
+        {% if page_obj.has_previous %}<a class="button button-secondary" href="?category={{ category }}&amp;page={{ page_obj.previous_page_number }}">← {% ui '上一页' 'Previous' %}</a>{% endif %}
+        {% if page_obj.has_next %}<a class="button button-secondary" href="?category={{ category }}&amp;page={{ page_obj.next_page_number }}">{% ui '下一页' 'Next' %} →</a>{% endif %}
     </span>
 </nav>
 {% endif %}

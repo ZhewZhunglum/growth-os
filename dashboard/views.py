@@ -21,6 +21,7 @@ from contentops.models import (
     ReviewDecision,
     TaskSubmission,
 )
+from core.audit_notes import tag_optional_audit_note
 from dashboard.forms import (
     AssignmentForm,
     CancelTaskForm,
@@ -160,7 +161,7 @@ def _task_management_kind(user: Principal, task: Task) -> str:
     return "abandon"
 
 
-def _task_for_user(user: Principal, task_id) -> Task:
+def _task_for_user(user: Principal, task_id, *, allow_history: bool = False) -> Task:
     task = get_object_or_404(
         Task.objects.select_related(
             "product", "contract_version", "current_assignee_principal", "created_by_principal"
@@ -173,6 +174,16 @@ def _task_for_user(user: Principal, task_id) -> Task:
         return task
     if _can_manage_assignment(user, task):
         return task
+    if allow_history:
+        # A current VIEW grant plus immutable personal participation permits a
+        # read-only history detail.  This deliberately reuses the history
+        # query: product-wide VIEW alone never reveals another employee's task
+        # UUID.  Mutating endpoints must keep allow_history=False so a former
+        # participant can never turn read-only history access into authority.
+        from dashboard.history_views import _history_tasks
+
+        if _history_tasks(user).filter(pk=task.pk).exists():
+            return task
     # The personal workspace is deliberately narrower than a product-wide
     # grant: knowing a task UUID must not make another employee's task visible.
     raise Http404("Task not found.")
@@ -487,6 +498,7 @@ def _action_form(task: Task, user: Principal):
             criteria=task.contract_version.dod_criteria,
             content_versions=_inline_content_versions(task),
             require_inline_primary=_requires_inline_primary(task),
+            task=task,
             **common,
         )
     return "", None
@@ -518,6 +530,18 @@ def _detail_context(
     )
     inline_versions = _inline_content_versions(task)
     latest_inline_version = inline_versions.first()
+    requires_inline_primary = _requires_inline_primary(task)
+    content_ready_for_submission = bool(
+        latest_inline_version
+        and latest_inline_version.representation_kind
+        == ContentAssetVersion.RepresentationKind.INLINE_TEXT
+        and latest_inline_version.inline_content.strip()
+        and (
+            not requires_inline_primary
+            or len(latest_inline_version.inline_content.strip())
+            >= DAILY_OPERATIONS_MIN_INLINE_CHARS
+        )
+    )
     latest_assignment = task.assignments.order_by("-assignment_number").first()
     management_kind = _task_management_kind(user, task)
     may_reassign = bool(
@@ -578,6 +602,8 @@ def _detail_context(
         "action_form": action_form,
         "submission": task.submissions.order_by("-submission_number").first(),
         "latest_inline_version": latest_inline_version,
+        "requires_inline_primary": requires_inline_primary,
+        "content_ready_for_submission": content_ready_for_submission,
         "may_edit_content": may_edit_content,
         "generate_form": generate_form if generate_form is not None else (
             ContentGenerateForm(state_version=task.state_version)
@@ -716,7 +742,7 @@ def task_create(request: HttpRequest) -> HttpResponse:
 
 @login_required
 def task_detail(request: HttpRequest, task_id) -> HttpResponse:
-    task = _task_for_user(request.user, task_id)
+    task = _task_for_user(request.user, task_id, allow_history=True)
     return render(request, "dashboard/task_detail.html", _detail_context(task, request.user))
 
 
@@ -864,7 +890,12 @@ def _replayed_submission_result(
             existing.expected_task_version == form.cleaned_data["expected_state_version"],
             existing.submitted_by_principal_id == user.pk,
             same_delivery,
-            existing.submission_note == form.cleaned_data["submission_note"],
+            existing.submission_note
+            == tag_optional_audit_note(
+                form.cleaned_data["submission_note"],
+                default="Submission sealed without an additional delivery note.",
+                existing_value=existing.submission_note,
+            ),
             actual_criteria == _criterion_results(form),
         )
     )
@@ -965,6 +996,7 @@ def _deliver_and_submit(task: Task, user: Principal, grant, form: DeliveryDoDFor
             if (
                 version.content_asset.task_id != task.pk
                 or version.representation_kind != ContentAssetVersion.RepresentationKind.INLINE_TEXT
+                or not version.inline_content.strip()
                 or (
                     requires_inline_primary
                     and len(version.inline_content.strip())
@@ -1205,6 +1237,7 @@ def task_action(request: HttpRequest, task_id, action: str) -> HttpResponse:
                 criteria=task.contract_version.dod_criteria,
                 content_versions=_inline_content_versions(task),
                 require_inline_primary=_requires_inline_primary(task),
+                task=task,
                 state_version=task.state_version,
             )
             if not form.is_valid():

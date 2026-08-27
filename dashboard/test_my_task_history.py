@@ -6,6 +6,8 @@ from django.urls import reverse
 from django.utils import timezone
 
 from accounts.models import PermissionGrant, Principal
+from dailyops.models import DailyBatchDispositionEvent
+from intelligence.models import canonical_sha256
 from products.models import Product, ProductProfileVersion
 from workflow.models import ActingRole, Task, TaskAssignment, TaskContractVersion
 
@@ -43,6 +45,11 @@ class MyTaskHistoryTests(TestCase):
             self.owner,
             self.product,
             PermissionGrant.Action.ASSIGN_TASK,
+        )
+        self.cancel_grant = self._grant(
+            self.owner,
+            self.product,
+            PermissionGrant.Action.CANCEL_TASK,
         )
 
     def _make_product(self, code):
@@ -167,7 +174,7 @@ class MyTaskHistoryTests(TestCase):
         self.assertContains(response, "Past assignment")
         self.assertNotContains(response, "Another account only")
         self.assertNotContains(response, "No current view permission")
-        self.assertNotContains(
+        self.assertContains(
             response,
             reverse("dashboard:task-detail", args=[created_and_assigned.pk]),
         )
@@ -180,6 +187,87 @@ class MyTaskHistoryTests(TestCase):
             [label["zh"] for label in created_task.participation_labels],
             ["创建", "执行"],
         )
+
+    def test_history_categories_do_not_call_cancelled_or_hidden_work_completed(self):
+        active = self._task("Still active", creator=self.user)
+        completed = self._task("Actually completed", creator=self.user)
+        cancelled = self._task("Cancelled before completion", creator=self.user)
+        Task.objects.filter(pk=completed.pk).update(current_state=Task.State.DONE)
+        Task.objects.filter(pk=cancelled.pk).update(current_state=Task.State.CANCELLED)
+        # A Daily draft can be abandoned before it ever compiles a formal
+        # Task.  Its personal history must still be discoverable from the
+        # immutable disposition event alone.
+        abandoned_product, _, _ = self._make_product("ABANDONED-NO-TASK")
+        abandoned_cancel_grant = self._grant(
+            self.owner,
+            abandoned_product,
+            PermissionGrant.Action.CANCEL_TASK,
+        )
+        self._grant(self.owner, abandoned_product, PermissionGrant.Action.VIEW)
+        self.assertFalse(Task.objects.filter(product=abandoned_product).exists())
+        hidden_batch = uuid.uuid4()
+        disposition_payload = {
+            "batch_key": str(hidden_batch),
+            "product_id": str(abandoned_product.pk),
+            "disposition": DailyBatchDispositionEvent.Disposition.ABANDONED,
+            "reason": "Wrong draft; start again.",
+        }
+        DailyBatchDispositionEvent.objects.create(
+            batch_key=hidden_batch,
+            product=abandoned_product,
+            disposition=DailyBatchDispositionEvent.Disposition.ABANDONED,
+            reason="Wrong draft; start again.",
+            principal=self.owner,
+            acting_role=ActingRole.OWNER,
+            permission_grant=abandoned_cancel_grant,
+            command_id=uuid.uuid4(),
+            payload_hash=canonical_sha256(disposition_payload),
+        )
+        self.client.force_login(self.user)
+
+        active_response = self.client.get(reverse("dashboard:my-task-history"))
+        self.assertContains(active_response, active.title)
+        self.assertNotContains(active_response, completed.title)
+        self.assertNotContains(active_response, cancelled.title)
+
+        completed_response = self.client.get(
+            f"{reverse('dashboard:my-task-history')}?category=completed"
+        )
+        self.assertContains(completed_response, completed.title)
+        self.assertNotContains(completed_response, cancelled.title)
+
+        cancelled_response = self.client.get(
+            f"{reverse('dashboard:my-task-history')}?category=cancelled"
+        )
+        self.assertContains(cancelled_response, cancelled.title)
+        self.assertNotContains(cancelled_response, completed.title)
+
+        self.client.force_login(self.owner)
+        hidden_response = self.client.get(
+            f"{reverse('dashboard:my-task-history')}?category=hidden"
+        )
+        self.assertContains(hidden_response, "草稿已删除/隐藏")
+        self.assertContains(hidden_response, "它不是“已完成任务”")
+        self.assertNotContains(hidden_response, completed.title)
+
+    def test_participant_can_open_read_only_detail_but_view_grant_alone_cannot(self):
+        task = self._task("History detail access", creator=self.user)
+        self._grant(self.other, self.product, PermissionGrant.Action.VIEW)
+        detail_url = reverse("dashboard:task-detail", args=[task.pk])
+
+        self.client.force_login(self.other)
+        denied = self.client.get(detail_url)
+        self.assertEqual(denied.status_code, 404)
+
+        self.client.force_login(self.user)
+        allowed = self.client.get(detail_url)
+        self.assertEqual(allowed.status_code, 200)
+        self.assertContains(allowed, task.title)
+
+        Task.objects.filter(pk=task.pk).update(current_state=Task.State.DONE)
+        terminal = self.client.get(detail_url)
+        self.assertEqual(terminal.status_code, 200)
+        self.assertContains(terminal, "只能查看历史")
 
     def test_expired_view_grant_hides_the_summary(self):
         product, profile, contract = self._make_product("EXPIRED")

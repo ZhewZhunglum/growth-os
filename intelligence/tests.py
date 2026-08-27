@@ -6,6 +6,7 @@ from decimal import Decimal
 
 from django.core.exceptions import PermissionDenied, ValidationError
 from django.db import IntegrityError, transaction
+from django.db.models.query import QuerySet
 from django.test import TestCase
 from django.utils import timezone
 
@@ -573,6 +574,31 @@ class IntelligenceFoundationTests(TestCase):
         self.assertEqual(first.event.pk, replay.event.pk)
         self.assertEqual(first.event.permission_grant_id, self.edit_grant.pk)
         self.assertEqual(first.aggregate.state_version, 1)
+
+        # Commands stored before audit-source tags existed must remain exact,
+        # conflict-free replays after the convention is introduced.
+        legacy_reason = "Evidence and product fit are ready for human triage."
+        QuerySet(model=first.event.__class__, using="default").filter(pk=first.event.pk).update(
+            reason=legacy_reason,
+            payload_hash=canonical_sha256(
+                {
+                    "aggregate_id": str(self.opportunity.pk),
+                    "to_state": ProductOpportunity.State.TRIAGED,
+                    "expected_version": 0,
+                    "reason": legacy_reason,
+                }
+            ),
+        )
+        legacy_replay = transition_opportunity(
+            opportunity_id=self.opportunity.pk,
+            to_state=ProductOpportunity.State.TRIAGED,
+            expected_version=0,
+            command_id=command_id,
+            reason=legacy_reason,
+            principal=self.owner,
+            acting_role=Principal.Role.OWNER,
+        )
+        self.assertFalse(legacy_replay.created)
 
         with self.assertRaises(CommandReplayConflict):
             transition_opportunity(

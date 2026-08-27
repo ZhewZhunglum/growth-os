@@ -7,7 +7,7 @@ from decimal import Decimal
 from typing import Iterable, Mapping
 
 from django.core.exceptions import PermissionDenied, ValidationError
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.db.models import Q
 from django.utils import timezone
 
@@ -75,6 +75,7 @@ from dailyops.evidence_services import (
     invalidate_evidence,
 )
 from dailyops.runtime import DailyOperationsRuntime, DailyOperationsRuntimeConfig, build_daily_operations_runtime
+from dailyops.platforms import require_execution_platform
 from dailyops.schemas import DAILY_ANALYSIS_SCHEMA, deterministic_analysis
 
 
@@ -1125,7 +1126,7 @@ def proposal_matches_evidence(
     )
 
 
-def _analysis_request(*, batch_key: uuid.UUID, product: Product, evidence) -> AIRequest:
+def _analysis_request(*, batch_key: uuid.UUID, product: Product, query: str, evidence) -> AIRequest:
     if len(evidence) > MAX_ANALYSIS_EVIDENCE:
         raise ValidationError(
             f"Daily analysis accepts at most {MAX_ANALYSIS_EVIDENCE} exact evidence items; narrow the batch first."
@@ -1156,6 +1157,7 @@ def _analysis_request(*, batch_key: uuid.UUID, product: Product, evidence) -> AI
                 role="user",
                 content=(
                     f"Product: {product.name} ({product.market_code}/{product.language_code})\n"
+                    f"Research question: {query}\n"
                     f"Batch: {batch_key}\nEvidence: {compact_evidence}"
                 ),
             ),
@@ -1234,7 +1236,12 @@ def propose_daily_analysis(
             )
         )
     ).ai_provider
-    request = _analysis_request(batch_key=batch_key, product=product, evidence=evidence)
+    request = _analysis_request(
+        batch_key=batch_key,
+        product=product,
+        query=query,
+        evidence=evidence,
+    )
     result = provider.generate(request)
     output = dict(result.output)
     output.update(
@@ -1473,6 +1480,7 @@ def create_channel_plan(
     acting_role: str,
     channel_account=None,
 ) -> ChannelPlan:
+    platform = require_execution_platform(platform)
     if initiative.current_state not in {Initiative.State.APPROVED, Initiative.State.ACTIVE}:
         raise ValidationError("Channel planning requires an approved Initiative.")
     # Runtime environment and capability are system-owned facts.  Discard the
@@ -1531,20 +1539,49 @@ def create_channel_plan(
         "capability_state_id": str(capability.pk),
         "resolved_capability_code": capability.capability_code,
     }
-    return ChannelPlan.objects.create(
+    plan_key = f"{initiative.initiative_key}-{platform.value.lower()}"
+    if ChannelPlan.objects.filter(
         initiative=initiative,
-        channel_account=channel_account,
-        plan_key=f"{initiative.initiative_key}-{platform.value.lower()}",
         platform_code=platform.value,
-        plan_date=plan_date,
-        goal=goal,
-        content_requirements=resolved_requirements,
-        creation_command_id=command_id,
-        creation_payload_hash=payload_hash,
-        created_by_principal=principal,
-        created_under_grant=grant,
-        updated_by_principal=principal,
-    )
+    ).exists():
+        raise ValidationError(
+            "同一轮工作每个平台只能安排一次（已取消的安排也会保留历史）；"
+            "如需重做，请新开一轮 Daily Operations。"
+        )
+    try:
+        # Keep the insert in its own savepoint.  Concurrent requests may both
+        # pass the friendly pre-check, but the database unique constraints are
+        # authoritative and only one insert may win.
+        with transaction.atomic():
+            return ChannelPlan.objects.create(
+                initiative=initiative,
+                channel_account=channel_account,
+                plan_key=plan_key,
+                platform_code=platform.value,
+                plan_date=plan_date,
+                goal=goal,
+                content_requirements=resolved_requirements,
+                creation_command_id=command_id,
+                creation_payload_hash=payload_hash,
+                created_by_principal=principal,
+                created_under_grant=grant,
+                updated_by_principal=principal,
+            )
+    except IntegrityError as error:
+        replay = ChannelPlan.objects.filter(creation_command_id=command_id).first()
+        if replay is not None:
+            if replay.creation_payload_hash != payload_hash:
+                raise ValidationError("ChannelPlan command was replayed with different input.") from error
+            return replay
+        if ChannelPlan.objects.filter(
+            initiative=initiative,
+            platform_code=platform.value,
+        ).exists():
+            raise ValidationError(
+                "同一轮工作每个平台只能安排一次（已取消的安排也会保留历史）；"
+                "如需重做，请新开一轮 Daily Operations。"
+            ) from error
+        raise
 
 
 def _resolve_current_plan_runtime(
@@ -1642,6 +1679,7 @@ def compile_channel_plan_task(
     plan = ChannelPlan.objects.select_for_update().select_related(
         "initiative__product", "channel_account"
     ).get(pk=channel_plan.pk)
+    require_execution_platform(plan.platform_code)
     if plan.current_state not in {ChannelPlan.State.READY, ChannelPlan.State.ACTIVE}:
         raise ValidationError("ChannelPlan must be READY before Task Compiler can run.")
     product = plan.initiative.product

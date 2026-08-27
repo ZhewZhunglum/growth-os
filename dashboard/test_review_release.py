@@ -445,6 +445,29 @@ class ReviewReleaseUISliceTests(TestCase):
         self.client.force_login(self.outsider)
         self.assertNotContains(self.client.get(reverse("dashboard:review-queue")), self.task.title)
 
+    def test_normal_review_note_is_optional_and_uses_friendly_system_audit_source(self):
+        self.client.force_login(self.reviewer)
+        self.task.refresh_from_db()
+
+        response = self.client.post(
+            reverse("dashboard:review-action", args=[self.task.pk]),
+            {
+                "command_id": uuid.uuid4(),
+                "expected_state_version": self.task.state_version,
+                "decision": ReviewDecision.Decision.APPROVED,
+                "rationale": "",
+            },
+        )
+
+        self.assertRedirects(response, reverse("dashboard:review-queue"))
+        decision = ReviewDecision.objects.get(submission__task=self.task)
+        self.assertTrue(decision.rationale.startswith("[SYSTEM_DEFAULT] "))
+        history = self.client.get(
+            reverse("dashboard:review-history-detail", args=[decision.pk])
+        )
+        self.assertContains(history, "系统自动记录（未填写说明）")
+        self.assertNotContains(history, "[SYSTEM_DEFAULT]")
+
     def test_owner_self_submission_is_actionable_and_only_allows_audited_final_approval(self):
         # Close the default Operator submission first so the Owner inbox has
         # exactly one review item: the Owner-authored submission below.
@@ -479,6 +502,19 @@ class ReviewReleaseUISliceTests(TestCase):
         self.assertContains(detail_response, 'value="APPROVED"')
         self.assertNotContains(detail_response, 'value="CHANGES_REQUESTED"')
         self.assertNotContains(detail_response, 'value="REJECTED"')
+
+        blank_reason = self.client.post(
+            reverse("dashboard:review-action", args=[owner_task.pk]),
+            {
+                "command_id": uuid.uuid4(),
+                "expected_state_version": owner_task.state_version,
+                "decision": ReviewDecision.Decision.APPROVED,
+                "rationale": "   ",
+            },
+        )
+        self.assertEqual(blank_reason.status_code, 400)
+        self.assertContains(blank_reason, "Owner 自批原因（必填）", status_code=400)
+        self.assertFalse(ReviewDecision.objects.filter(submission__task=owner_task).exists())
 
         approved = self._review_post(decision=ReviewDecision.Decision.APPROVED)
         self.assertRedirects(approved, reverse("dashboard:review-queue"))

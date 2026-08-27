@@ -7,6 +7,7 @@ from typing import TypeVar
 from django.core.exceptions import ValidationError
 from django.db import transaction
 
+from core.audit_notes import tag_optional_audit_note
 from accounts.authorization import require_authorization
 from accounts.models import PermissionGrant, Principal
 from intelligence.exceptions import CommandReplayConflict, IllegalStateTransition, StateVersionConflict
@@ -275,6 +276,16 @@ def _transition(
 ) -> TransitionResult:
     if to_state not in aggregate_model.State.values:
         raise IllegalStateTransition(f"Unknown target state: {to_state}.")
+    existing_reason = (
+        event_model.objects.filter(command_id=command_id)
+        .values_list("reason", flat=True)
+        .first()
+    )
+    reason = tag_optional_audit_note(
+        reason,
+        default="未填写额外说明；由系统记录本次状态决定。",
+        existing_value=existing_reason,
+    )
     payload_hash = canonical_sha256(
         _transition_payload(
             aggregate_id=aggregate_id,

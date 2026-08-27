@@ -368,6 +368,23 @@ class ContentOpsInvariantTests(TestCase):
             canonical_sha256({**expected_payload, "version_number": version.version_number}),
         )
 
+    def test_inline_text_version_rejects_blank_content(self):
+        asset = self._asset()
+
+        with self.assertRaisesMessage(ValidationError, "cannot be blank"):
+            ContentAssetVersion.create_next(
+                content_asset=asset,
+                representation_kind=ContentAssetVersion.RepresentationKind.INLINE_TEXT,
+                inline_content="   ",
+                mime_type="text/plain; charset=utf-8",
+                metadata={"source": "blank-negative-test"},
+                command_id=uuid7(),
+                actor_principal=self.operator,
+                acting_role=ActingRole.OPERATOR,
+                permission_grant=self.edit_grant,
+                recorded_by_principal=self.recorder,
+            )
+
     def test_legacy_v1_object_key_keeps_its_original_payload_and_manifest_hashes(self):
         asset = self._asset()
         command_id = uuid7()

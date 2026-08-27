@@ -68,6 +68,16 @@ class HumanSpec:
     fallback_password_env: str | None = None
 
 
+@dataclass(frozen=True)
+class LocalExecutionAccountSpec:
+    platform_code: str
+    account_code: str
+    external_account_ref: str
+    display_name: str
+    identity_reference: str
+    legacy_display_name: str | None = None
+
+
 # These are bootstrap templates, not runtime role shortcuts.  Every capability
 # is materialized as an explicit, scoped PermissionGrant; authorization still
 # validates the Principal's persisted acting role and resolves the Grant.
@@ -106,6 +116,37 @@ DAILY_COLLECTION_PLATFORMS = (
     "GOOGLE_SEARCH",
     "GOOGLE_SEARCH_CONSOLE",
     "GOOGLE_ANALYTICS_4",
+)
+LOCAL_EXECUTION_ACCOUNT_SPECS = (
+    LocalExecutionAccountSpec(
+        "TIKTOK",
+        "puko-us",
+        "local:puko-us",
+        "[LOCAL TEST ONLY] PUKO TikTok",
+        "local:manual-publisher:puko-us",
+        legacy_display_name="PUKO US Local Dogfood",
+    ),
+    LocalExecutionAccountSpec(
+        "PINTEREST",
+        "puko-local-pinterest",
+        "local-test:pinterest:puko",
+        "[LOCAL TEST ONLY] PUKO Pinterest",
+        "local-test:manual-publisher:puko-local-pinterest",
+    ),
+    LocalExecutionAccountSpec(
+        "QUORA",
+        "puko-local-quora",
+        "local-test:quora:puko",
+        "[LOCAL TEST ONLY] PUKO Quora",
+        "local-test:manual-publisher:puko-local-quora",
+    ),
+    LocalExecutionAccountSpec(
+        "SHOPIFY",
+        "puko-local-shopify",
+        "local-test:shopify:puko",
+        "[LOCAL TEST ONLY] PUKO Shopify / Blog",
+        "local-test:manual-publisher:puko-local-shopify",
+    ),
 )
 LOCAL_GEO_PANEL_KEY = "local-test-puko-geo"
 LOCAL_GEO_QUESTION = (
@@ -508,24 +549,6 @@ class Command(BaseCommand):
         return contract
 
     def _ensure_release_context(self, owner: Principal):
-        channel, created = ChannelAccount.objects.get_or_create(
-            account_code="puko-us",
-            defaults={
-                "platform_code": "TIKTOK",
-                "external_account_ref": "local:puko-us",
-                "display_name": "PUKO US Local Dogfood",
-                "status": ChannelAccount.Status.ACTIVE,
-                "created_by_principal": owner,
-                "updated_by_principal": owner,
-            },
-        )
-        if not created and (
-            channel.platform_code != "TIKTOK"
-            or channel.external_account_ref != "local:puko-us"
-            or channel.status != ChannelAccount.Status.ACTIVE
-        ):
-            raise CommandError("Existing puko-us ChannelAccount conflicts with the local Dogfood seed.")
-
         environment, created = RuntimeEnvironment.objects.get_or_create(
             environment_code="local-dogfood",
             defaults={
@@ -544,48 +567,90 @@ class Command(BaseCommand):
         ):
             raise CommandError("Existing local-dogfood RuntimeEnvironment conflicts with the seed.")
 
-        binding = AccountEnvironmentBinding.objects.filter(
-            channel_account=channel,
-            runtime_environment=environment,
-            binding_version=1,
-        ).first()
-        if binding is None:
-            binding = AccountEnvironmentBinding.objects.create(
+        contexts = []
+        for spec in LOCAL_EXECUTION_ACCOUNT_SPECS:
+            channel, created = ChannelAccount.objects.get_or_create(
+                account_code=spec.account_code,
+                defaults={
+                    "platform_code": spec.platform_code,
+                    "external_account_ref": spec.external_account_ref,
+                    "display_name": spec.display_name,
+                    "status": ChannelAccount.Status.ACTIVE,
+                    "created_by_principal": owner,
+                    "updated_by_principal": owner,
+                },
+            )
+            if not created and (
+                channel.platform_code != spec.platform_code
+                or channel.external_account_ref != spec.external_account_ref
+                or channel.status != ChannelAccount.Status.ACTIVE
+            ):
+                raise CommandError(
+                    f"Existing {spec.account_code} ChannelAccount conflicts with the local Dogfood seed."
+                )
+            if not created and spec.legacy_display_name and channel.display_name == spec.legacy_display_name:
+                channel.display_name = spec.display_name
+                channel.updated_by_principal = owner
+                channel.save(update_fields=["display_name", "updated_by_principal", "updated_at"])
+            elif not created and channel.display_name != spec.display_name:
+                raise CommandError(
+                    f"Existing {spec.account_code} display name does not carry the LOCAL TEST label."
+                )
+
+            binding = AccountEnvironmentBinding.objects.filter(
                 channel_account=channel,
                 runtime_environment=environment,
                 binding_version=1,
-                identity_reference="local:manual-publisher:puko-us",
-                created_by_principal=owner,
-                recorded_by_principal=owner,
-            )
-        elif (
-            binding.status != AccountEnvironmentBinding.Status.ACTIVE
-            or binding.identity_reference != "local:manual-publisher:puko-us"
-        ):
-            raise CommandError("Existing local Dogfood account/environment binding conflicts with the seed.")
-        if not binding.is_current_at():
-            raise CommandError("Local Dogfood account/environment binding is not the current binding.")
+            ).first()
+            if binding is None:
+                binding = AccountEnvironmentBinding.objects.create(
+                    channel_account=channel,
+                    runtime_environment=environment,
+                    binding_version=1,
+                    identity_reference=spec.identity_reference,
+                    created_by_principal=owner,
+                    recorded_by_principal=owner,
+                )
+            elif (
+                binding.status != AccountEnvironmentBinding.Status.ACTIVE
+                or binding.identity_reference != spec.identity_reference
+            ):
+                raise CommandError(
+                    f"Existing {spec.account_code} account/environment binding conflicts with the seed."
+                )
+            if not binding.is_current_at():
+                raise CommandError(
+                    f"Local Dogfood binding for {spec.account_code} is not current."
+                )
 
-        capability = CapabilityState.objects.filter(
-            account_environment_binding=binding,
-            capability_code=CapabilityState.MANUAL_PUBLISH,
-            state_version=1,
-        ).first()
-        if capability is None:
-            capability = CapabilityState.objects.create(
+            capability = CapabilityState.objects.filter(
                 account_environment_binding=binding,
                 capability_code=CapabilityState.MANUAL_PUBLISH,
                 state_version=1,
-                state=CapabilityState.State.OPEN,
-                reason="Local Dogfood manual publishing only.",
-                created_by_principal=owner,
-                recorded_by_principal=owner,
-            )
-        elif capability.state != CapabilityState.State.OPEN:
-            raise CommandError("Existing local Dogfood manual-publish CapabilityState is not OPEN.")
-        if not capability.is_current_open_at():
-            raise CommandError("Local Dogfood manual-publish CapabilityState is not current and OPEN.")
-        return channel, environment, binding, capability
+            ).first()
+            if capability is None:
+                capability = CapabilityState.objects.create(
+                    account_environment_binding=binding,
+                    capability_code=CapabilityState.MANUAL_PUBLISH,
+                    state_version=1,
+                    state=CapabilityState.State.OPEN,
+                    reason=(
+                        "[LOCAL TEST ONLY] Manual publishing fixture; "
+                        "no live platform account is connected."
+                    ),
+                    created_by_principal=owner,
+                    recorded_by_principal=owner,
+                )
+            elif capability.state != CapabilityState.State.OPEN:
+                raise CommandError(
+                    f"Existing {spec.account_code} manual-publish CapabilityState is not OPEN."
+                )
+            if not capability.is_current_open_at():
+                raise CommandError(
+                    f"Local Dogfood capability for {spec.account_code} is not current and OPEN."
+                )
+            contexts.append((channel, binding, capability))
+        return tuple(contexts), environment
 
     def _ensure_local_geo_demo(
         self,
@@ -768,7 +833,8 @@ class Command(BaseCommand):
             )
 
         contract = self._ensure_contract(profile, policy_version, owner)
-        channel, environment, binding, capability = self._ensure_release_context(owner)
+        release_contexts, environment = self._ensure_release_context(owner)
+        channels = tuple(context[0] for context in release_contexts)
 
         # Only the three canonical staff identities receive role-template
         # grants. Legacy reviewer/publisher identities remain narrow
@@ -880,17 +946,19 @@ class Command(BaseCommand):
             for key in ("owner", "admin", "operator"):
                 principal = principals.get(key)
                 if principal is not None:
-                    self._ensure_grant(
-                        principal=principal, action=PermissionGrant.Action.PUBLISH, owner=owner,
-                        scope_kind=PermissionGrant.ScopeKind.ACCOUNT, product=product,
-                        platform_code=channel.platform_code, account_ref=channel.account_code,
-                    )
+                    for channel in channels:
+                        self._ensure_grant(
+                            principal=principal, action=PermissionGrant.Action.PUBLISH, owner=owner,
+                            scope_kind=PermissionGrant.ScopeKind.ACCOUNT, product=product,
+                            platform_code=channel.platform_code, account_ref=channel.account_code,
+                        )
         if publisher is not None:
-            self._ensure_grant(
-                principal=publisher, action=PermissionGrant.Action.PUBLISH, owner=owner,
-                scope_kind=PermissionGrant.ScopeKind.ACCOUNT, product=product,
-                platform_code=channel.platform_code, account_ref=channel.account_code,
-            )
+            for channel in channels:
+                self._ensure_grant(
+                    principal=publisher, action=PermissionGrant.Action.PUBLISH, owner=owner,
+                    scope_kind=PermissionGrant.ScopeKind.ACCOUNT, product=product,
+                    platform_code=channel.platform_code, account_ref=channel.account_code,
+                )
         if rule_evaluator:
             self._ensure_grant(
                 principal=rule_evaluator, action=PermissionGrant.Action.REVIEW, owner=owner,
@@ -904,8 +972,9 @@ class Command(BaseCommand):
                 f"Dogfood base ready: {product.product_code}, seed profile v{profile.version_number}, "
                 f"current profile v{current_profile.version_number}, "
                 f"policy v{policy_version.version_number}, contract v{contract.version_number}, "
-                f"account {channel.account_code}, environment {environment.environment_code}, "
-                f"binding v{binding.binding_version}, capability {capability.state}; principals: {participant_names}. "
+                f"local-test execution accounts {', '.join(channel.account_code for channel in channels)}, "
+                f"environment {environment.environment_code}, bindings/capabilities {len(release_contexts)}; "
+                f"principals: {participant_names}. "
                 "Staff roles: Owner, Operations Admin, Operator. Reviewer and Publisher are scoped capabilities. "
                 "No Task was created."
             )

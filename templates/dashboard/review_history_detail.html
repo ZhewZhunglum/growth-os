@@ -36,7 +36,8 @@
     <article class="detail-panel read-only-panel">
         <p class="eyebrow">{% ui '不可变人工结论' 'Immutable human decision' %}</p><h3>{% ui_review_decision review.decision %}</h3>
         <span class="task-label">{% ui '审核说明' 'Review notes' %}</span>
-        <p class="review-rationale">{% if review.rationale %}{{ review.rationale|linebreaksbr }}{% else %}{% ui '未填写审核说明' 'No review notes' %}{% endif %}</p>
+        <p class="review-rationale">{{ review.rationale|audit_note_text|linebreaksbr }}</p>
+        {% with source_label=review.rationale|audit_note_source_label %}{% if source_label %}<small class="muted">{{ source_label }}</small>{% endif %}{% endwith %}
         <p class="read-only-note">{% ui '该结论、提交批次和精确链接版本仅供查看，不能在本页修改或重新提交。' 'The decision, submission, and exact link version are read only and cannot be changed or resubmitted here.' %}</p>
     </article>
 </section>

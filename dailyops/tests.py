@@ -5,6 +5,8 @@ from datetime import timedelta
 from unittest.mock import patch
 
 from django.core.exceptions import ValidationError
+from django.db import IntegrityError, transaction
+from django.db.models.query import QuerySet
 from django.test import Client, TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
@@ -12,8 +14,14 @@ from django.utils import timezone
 from accounts.models import PermissionGrant, Principal
 from accounts.services import revoke_permission_grant
 from contentops.models import ContentAssetVersion
+from core.audit_notes import SYSTEM_DEFAULT_TAG
 from dailyops.models import DailyBatchDispositionEvent
-from dailyops.services import PLATFORMS, correct_manual_evidence, ensure_default_sources
+from dailyops.services import (
+    PLATFORMS,
+    correct_manual_evidence,
+    create_channel_plan,
+    ensure_default_sources,
+)
 from integrations.connectors.types import Platform
 from intelligence.models import (
     ChannelPlan,
@@ -28,7 +36,9 @@ from intelligence.models import (
     SignalAssessment,
     SourceRegistry,
     TaskCompilationContext,
+    canonical_sha256,
 )
+from intelligence.services import transition_channel_plan
 from products.models import (
     ClaimMatrixVersion,
     EvidenceLibraryVersion,
@@ -75,7 +85,7 @@ class DailyOperationsUITests(TestCase):
             PermissionGrant.Action.CREATE_TASK,
             PermissionGrant.Action.CANCEL_TASK,
         ):
-            PermissionGrant.objects.create(
+            grant = PermissionGrant.objects.create(
                 principal=self.owner,
                 scope_kind=PermissionGrant.ScopeKind.PRODUCT,
                 product=self.product,
@@ -84,6 +94,8 @@ class DailyOperationsUITests(TestCase):
                 valid_until=now + timedelta(days=1),
                 granted_by_principal=self.owner,
             )
+            if action == PermissionGrant.Action.EDIT:
+                self.edit_grant = grant
         PermissionGrant.objects.create(
             principal=self.owner,
             scope_kind=PermissionGrant.ScopeKind.GLOBAL,
@@ -376,6 +388,131 @@ class DailyOperationsUITests(TestCase):
         )
         self.assertNotIn("environment_code", plan.content_requirements)
         self.assertNotIn("capability_code", plan.content_requirements)
+
+    def test_analytical_platform_cannot_be_used_for_execution_even_via_service(self):
+        _, initiative = self._approved_initiative()
+        for platform in (
+            Platform.GOOGLE_SEARCH,
+            Platform.GOOGLE_SEARCH_CONSOLE,
+            Platform.GOOGLE_ANALYTICS_4,
+        ):
+            with self.subTest(platform=platform.value):
+                analysis_account = ChannelAccount.objects.create(
+                    platform_code=platform.value,
+                    account_code=f"daily-ui-{platform.value.lower()}-analysis-only",
+                    external_account_ref=f"{platform.value.lower()}-analysis-only",
+                    display_name=f"{platform.value} analysis only",
+                    created_by_principal=self.owner,
+                    updated_by_principal=self.owner,
+                )
+
+                with self.assertRaisesMessage(ValidationError, "只用于分析数据"):
+                    create_channel_plan(
+                        initiative=initiative,
+                        platform=platform,
+                        command_id=uuid.uuid4(),
+                        plan_date=timezone.localdate(),
+                        goal={"title": "This must not become execution work"},
+                        content_requirements={"task_description": "Analysis is not a publish target."},
+                        principal=self.owner,
+                        acting_role=self.owner.role,
+                        channel_account=analysis_account,
+                    )
+
+                with self.assertRaises(IntegrityError):
+                    # Import scripts and other low-level writers cannot bypass
+                    # the execution/analysis split by skipping service checks.
+                    with transaction.atomic():
+                        ChannelPlan.objects.bulk_create(
+                            [
+                                ChannelPlan(
+                                    initiative=initiative,
+                                    channel_account=analysis_account,
+                                    plan_key=f"analysis-plan-{platform.value.lower()}",
+                                    platform_code=platform.value,
+                                    plan_date=timezone.localdate(),
+                                    goal={"title": "invalid analysis execution plan"},
+                                    content_requirements={"task_description": "must fail"},
+                                    creation_command_id=uuid.uuid4(),
+                                    creation_payload_hash="a" * 64,
+                                    created_by_principal=self.owner,
+                                    created_under_grant=self.edit_grant,
+                                    updated_by_principal=self.owner,
+                                )
+                            ]
+                        )
+
+        self.assertFalse(ChannelPlan.objects.filter(initiative=initiative).exists())
+
+    def test_existing_platform_is_hidden_and_duplicate_is_friendly_and_db_safe(self):
+        batch_key, initiative = self._approved_initiative()
+        first = self.client.post(
+            reverse("dailyops:plan-create", args=[initiative.pk]),
+            self._plan_data(),
+            follow=True,
+        )
+        self.assertContains(first, "已建立 TIKTOK 平台任务安排")
+
+        detail = self.client.get(
+            reverse("dailyops:batch-detail", args=[self.product.pk, batch_key])
+        )
+        self.assertFalse(detail.context["plan_form"].has_platform_choices)
+        self.assertContains(detail, "本轮所有已配置的执行平台都已经安排过了")
+
+        first_plan = ChannelPlan.objects.get(initiative=initiative)
+        with self.assertRaises(IntegrityError):
+            # A model/import path using a different plan_key must not bypass
+            # the one-platform-per-Initiative invariant.
+            with transaction.atomic():
+                duplicate_import = ChannelPlan(
+                    initiative=initiative,
+                    channel_account=first_plan.channel_account,
+                    plan_key=f"{first_plan.plan_key}-different-import-key",
+                    platform_code=first_plan.platform_code,
+                    plan_date=first_plan.plan_date,
+                    goal={"title": "duplicate import"},
+                    content_requirements=first_plan.content_requirements,
+                    creation_command_id=uuid.uuid4(),
+                    creation_payload_hash="f" * 64,
+                    created_by_principal=self.owner,
+                    created_under_grant=first_plan.created_under_grant,
+                    updated_by_principal=self.owner,
+                )
+                # bulk_create intentionally bypasses Model.save/full_clean so
+                # this assertion proves the database constraint itself.
+                ChannelPlan.objects.bulk_create([duplicate_import])
+
+        duplicate = self.client.post(
+            reverse("dailyops:plan-create", args=[initiative.pk]),
+            self._plan_data(command_id=str(uuid.uuid4())),
+            follow=True,
+        )
+        self.assertContains(duplicate, "本轮已经安排过")
+        self.assertEqual(ChannelPlan.objects.filter(initiative=initiative).count(), 1)
+
+        cancelled = transition_channel_plan(
+            channel_plan_id=first_plan.pk,
+            to_state=ChannelPlan.State.CANCELLED,
+            expected_version=first_plan.state_version,
+            command_id=uuid.uuid4(),
+            reason="Cancel while retaining the exact planning history.",
+            principal=self.owner,
+            acting_role=self.owner.role,
+        ).aggregate
+        self.assertEqual(cancelled.current_state, ChannelPlan.State.CANCELLED)
+        cancelled_detail = self.client.get(
+            reverse("dailyops:batch-detail", args=[self.product.pk, batch_key])
+        )
+        self.assertFalse(cancelled_detail.context["plan_form"].has_platform_choices)
+        self.assertContains(cancelled_detail, "已取消的安排也保留历史")
+
+        after_cancel = self.client.post(
+            reverse("dailyops:plan-create", args=[initiative.pk]),
+            self._plan_data(command_id=str(uuid.uuid4())),
+            follow=True,
+        )
+        self.assertContains(after_cancel, "本轮已经安排过")
+        self.assertEqual(ChannelPlan.objects.filter(initiative=initiative).count(), 1)
 
     def test_view_only_batch_detail_keeps_history_visible_without_write_controls(self):
         batch_key, initiative = self._approved_initiative()
@@ -897,7 +1034,10 @@ class DailyOperationsUITests(TestCase):
             original_snapshot,
         )
         invalidation = EvidenceInvalidationEvent.objects.get(evidence_item=original)
-        self.assertEqual(invalidation.reason, "The original link was the wrong version.")
+        self.assertEqual(
+            invalidation.reason,
+            "[USER_PROVIDED] The original link was the wrong version.",
+        )
         replacement = ExternalEvidenceItem.objects.get(
             collection_run__batch_key=batch_key,
             invalidation_event__isnull=True,
@@ -1756,6 +1896,68 @@ class DailyOperationsUITests(TestCase):
         self.assertEqual(denied.status_code, 403)
         self.assertFalse(DailyBatchDispositionEvent.objects.filter(batch_key=batch_key).exists())
 
+    def test_blank_ordinary_notes_store_an_explicit_system_default(self):
+        batch_key, initiative = self._approved_initiative()
+
+        transitioned = self.client.post(
+            reverse("dailyops:initiative-transition", args=[initiative.pk]),
+            {
+                "command_id": str(uuid.uuid4()),
+                "expected_version": initiative.state_version,
+                "to_state": Initiative.State.ACTIVE,
+                "reason": "",
+            },
+        )
+        self.assertEqual(transitioned.status_code, 302)
+        transition_event = InitiativeStateEvent.objects.get(
+            initiative=initiative,
+            to_state=Initiative.State.ACTIVE,
+        )
+        self.assertTrue(transition_event.reason.startswith(SYSTEM_DEFAULT_TAG))
+
+        disposed = self.client.post(
+            reverse("dailyops:batch-dispose", args=[self.product.pk, batch_key]),
+            {
+                "command_id": str(uuid.uuid4()),
+                "reason": "",
+                "confirm": "on",
+            },
+        )
+        self.assertEqual(disposed.status_code, 302)
+        disposition = DailyBatchDispositionEvent.objects.get(batch_key=batch_key)
+        self.assertTrue(disposition.reason.startswith(SYSTEM_DEFAULT_TAG))
+        self.assertEqual(disposition.reason_source, "SYSTEM_DEFAULT")
+
+    def test_legacy_untagged_batch_disposition_command_replays_without_conflict(self):
+        batch_key, _, _ = self._start()
+        command_id = uuid.uuid4()
+        url = reverse("dailyops:batch-dispose", args=[self.product.pk, batch_key])
+        legacy_reason = "Legacy untagged reason."
+        payload = {
+            "command_id": str(command_id),
+            "reason": legacy_reason,
+            "confirm": "on",
+        }
+        first = self.client.post(url, payload)
+        self.assertEqual(first.status_code, 302)
+        event = DailyBatchDispositionEvent.objects.get(command_id=command_id)
+        QuerySet(model=DailyBatchDispositionEvent, using="default").filter(pk=event.pk).update(
+            reason=legacy_reason,
+            payload_hash=canonical_sha256(
+                {
+                    "batch_key": str(batch_key),
+                    "product_id": str(self.product.pk),
+                    "disposition": event.disposition,
+                    "reason": legacy_reason,
+                }
+            ),
+        )
+
+        replay = self.client.post(url, payload)
+
+        self.assertEqual(replay.status_code, 302)
+        self.assertEqual(DailyBatchDispositionEvent.objects.filter(command_id=command_id).count(), 1)
+
     def test_view_only_product_has_no_recommendation_or_start_action(self):
         batch_key, proposal = self._pending_proposal()
         self.client.post(
@@ -1790,10 +1992,15 @@ class DailyOperationsUITests(TestCase):
             {"command_id": str(uuid.uuid4())},
         )
         opportunity = ProductOpportunity.objects.get(opportunity_key=f"daily-{batch_key.hex}")
+        # Old immutable facts keep their historical title; the UI uses the
+        # actual collection query so legacy fixed text is not duplicated.
+        self.assertEqual(opportunity.title, "Daily Operations dry run")
         suggested = self.client.get(reverse("dailyops:home"))
-        self.assertContains(suggested, opportunity.title)
-        self.assertContains(suggested, "已确认的外部需求")
-        self.assertContains(suggested, "按这个建议开始研究")
+        # The same batch is already present under Recent work.  It must not be
+        # rendered a second time as a seemingly new recommendation.
+        self.assertEqual(suggested.context["data_recommendations"], ())
+        self.assertContains(suggested, "afternoon focus")
+        self.assertContains(suggested, "afternoon focus", count=1)
 
         evidence = ExternalEvidenceItem.objects.get(collection_run__batch_key=batch_key)
         blocked = self.client.post(
@@ -1813,11 +2020,11 @@ class DailyOperationsUITests(TestCase):
             EvidenceInvalidationEvent.objects.filter(evidence_item=evidence).exists()
         )
         unchanged = self.client.get(reverse("dailyops:home"))
-        self.assertContains(unchanged, opportunity.title)
+        self.assertContains(unchanged, "afternoon focus")
 
         self.client.force_login(self.outsider)
         outsider_home = self.client.get(reverse("dailyops:home"))
-        self.assertNotContains(outsider_home, opportunity.title)
+        self.assertNotContains(outsider_home, "afternoon focus")
 
     def test_post_requires_csrf(self):
         csrf_client = Client(enforce_csrf_checks=True)

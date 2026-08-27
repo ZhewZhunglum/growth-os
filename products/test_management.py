@@ -143,10 +143,10 @@ class BootstrapDogfoodTests(TestCase):
             "contracts": 1,
             "policy_links": 1,
             "grants": 19,
-            "accounts": 1,
+            "accounts": 4,
             "environments": 1,
-            "bindings": 1,
-            "capabilities": 1,
+            "bindings": 4,
+            "capabilities": 4,
         })
         second_counts = {
             "principals": Principal.objects.count(),
@@ -186,7 +186,13 @@ class BootstrapDogfoodTests(TestCase):
                 PermissionGrant.Action.REVIEW,
             },
         )
-        self.assertEqual(CapabilityState.objects.get().state, CapabilityState.State.OPEN)
+        self.assertEqual(CapabilityState.objects.count(), 4)
+        self.assertTrue(
+            all(
+                capability.state == CapabilityState.State.OPEN
+                for capability in CapabilityState.objects.all()
+            )
+        )
         self.assertEqual(Task.objects.count(), 0)
         self.assertFalse(Principal.objects.filter(username__in=["admin", "operator", "reviewer", "publisher"]).exists())
         self.assertIn("No Task was created", self.stdout.getvalue())
@@ -254,7 +260,7 @@ class BootstrapDogfoodTests(TestCase):
         self.assertEqual(admin.role, Principal.Role.OPERATIONS_ADMIN)
         self.assertEqual(evaluator.principal_type, Principal.PrincipalType.SERVICE_ACCOUNT)
         self.assertEqual(Principal.objects.count(), 4)
-        self.assertEqual(PermissionGrant.objects.count(), 54)
+        self.assertEqual(PermissionGrant.objects.count(), 63)
         self.assertFalse(Principal.objects.filter(username__in=["reviewer", "publisher"]).exists())
         self.assertTrue(PermissionGrant.objects.filter(
             principal=operator, action=PermissionGrant.Action.EDIT,
@@ -332,7 +338,7 @@ class BootstrapDogfoodTests(TestCase):
             call_command("bootstrap_dogfood", full_demo=True, stdout=self.stdout)
 
         self.assertEqual(Principal.objects.count(), 4)
-        self.assertEqual(PermissionGrant.objects.count(), 54)
+        self.assertEqual(PermissionGrant.objects.count(), 63)
 
     def test_full_demo_accepts_legacy_reviewer_password_env_for_new_admin(self):
         self._owner()
@@ -369,7 +375,7 @@ class BootstrapDogfoodTests(TestCase):
         self.assertEqual(reviewer.role, Principal.Role.OPERATIONS_ADMIN)
         self.assertEqual(publisher.role, Principal.Role.OPERATOR)
         self.assertEqual(Principal.objects.count(), 5)
-        self.assertEqual(PermissionGrant.objects.count(), 35)
+        self.assertEqual(PermissionGrant.objects.count(), 38)
         self.assertTrue(PermissionGrant.objects.filter(
             principal=reviewer,
             action=PermissionGrant.Action.REVIEW,

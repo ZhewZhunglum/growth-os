@@ -16,7 +16,7 @@
   <header class="daily-run-heading">
     <div>
       <p class="eyebrow">{{ product.name }}</p>
-      <h2>{{ query|default:"—" }}</h2>
+      <h2>{{ batch_started_at|date:"Y-m-d" }} · {{ query|default:"—" }}</h2>
     </div>
     <span class="status-pill"><span></span>{% ui '人工确认模式' 'Human confirmation mode' %}</span>
   </header>
@@ -28,7 +28,7 @@
         {% if batch_disposition.disposition == 'ARCHIVED' %}{% ui '这次工作已从最近工作隐藏（任务保留）' 'This run is hidden from Recent work (tasks remain)' %}{% else %}{% ui '这次草稿已从最近工作隐藏' 'This draft is hidden from Recent work' %}{% endif %}
       </strong>
       <p>{% ui '本页仅供查看历史；采集、证据、项目、计划、任务和审计记录均未删除，也不能从这里继续修改。' 'This page is read-only history. Collection, evidence, project, plan, task, and audit facts remain and cannot be changed here.' %}</p>
-      <small>{{ batch_disposition.reason }}</small>
+      <small>{{ batch_disposition.reason_display }}</small>
     </div>
   </aside>
   {% endif %}
@@ -201,7 +201,7 @@
         <form class="config-form daily-decision-form" method="post" action="{% url 'dailyops:opportunity-transition' opportunity.id %}">
           {% csrf_token %}<input type="hidden" name="command_id" value="{{ command_id }}"><input type="hidden" name="expected_version" value="{{ opportunity.state_version }}">
           <label><span>{% ui '你的决定' 'Your decision' %}</span><select name="to_state">{% if opportunity.current_state == 'PROPOSED' %}<option value="TRIAGED">{% ui '完成初步判断' 'Complete initial review' %}</option>{% else %}<option value="APPROVED">{% ui '确认值得做' 'Confirm it is worth doing' %}</option>{% endif %}<option value="REJECTED">{% ui '不做这个方向' 'Do not pursue' %}</option></select></label>
-          <label><span>{% ui '一句话说明原因' 'Reason in one sentence' %}</span><textarea name="reason" rows="2" required></textarea></label>
+          <label><span>{% ui '补充说明（可不填）' 'Note (optional)' %}</span><textarea name="reason" rows="2"></textarea></label>
           <button class="button button-primary" type="submit">{% ui '保存决定' 'Save decision' %}</button>
         </form>
         {% else %}<p class="read-only-note">{% ui '等待有编辑权限的同事确认方向。' 'Waiting for a teammate with edit access to confirm the direction.' %}</p>{% endif %}
@@ -230,7 +230,7 @@
         {% if initiative.current_state == 'PROPOSED' or initiative.current_state == 'APPROVED' %}{% if can_edit_batch %}
         <form class="config-form daily-decision-form" method="post" action="{% url 'dailyops:initiative-transition' initiative.id %}">
           {% csrf_token %}<input type="hidden" name="command_id" value="{{ command_id }}"><input type="hidden" name="expected_version" value="{{ initiative.state_version }}"><input type="hidden" name="to_state" value="{% if initiative.current_state == 'PROPOSED' %}APPROVED{% else %}ACTIVE{% endif %}">
-          <label><span>{% ui '一句话说明原因' 'Reason in one sentence' %}</span><textarea name="reason" rows="2" required></textarea></label>
+          <label><span>{% ui '补充说明（可不填）' 'Note (optional)' %}</span><textarea name="reason" rows="2"></textarea></label>
           <button class="button button-primary" type="submit">{% if initiative.current_state == 'PROPOSED' %}{% ui '批准这个项目' 'Approve initiative' %}{% else %}{% ui '开始安排任务' 'Start planning work' %}{% endif %}</button>
         </form>
         {% else %}<p class="read-only-note">{% ui '等待有编辑权限的同事批准或启动项目。' 'Waiting for a teammate with edit access to approve or start the initiative.' %}</p>{% endif %}
@@ -249,8 +249,8 @@
     </summary>
     <div class="daily-stage-body">
     {% if initiative.current_state == 'APPROVED' or initiative.current_state == 'ACTIVE' %}
-      {% if can_edit_batch %}<article class="daily-plan-builder">
-        <h3>{% ui '安排平台任务' 'Plan platform work' %}</h3>
+      {% if can_edit_batch %}{% if plan_form.has_platform_choices %}<details class="daily-plan-builder"{% if not plans %} open{% endif %}>
+        <summary>{% if plans %}{% ui '继续安排另一个执行平台' 'Plan another execution platform' %}{% else %}{% ui '安排平台任务' 'Plan platform work' %}{% endif %}</summary>
         <form class="config-form" method="post" action="{% url 'dailyops:plan-create' initiative.id %}">
           {% csrf_token %}{{ plan_form.command_id }}{{ plan_form.non_field_errors }}
           <div class="daily-form-grid">
@@ -263,13 +263,15 @@
           <p class="daily-inline-help">{% ui '运行环境和发布能力由系统根据所选账号自动核对，你不需要填写代码。' 'The system checks the runtime environment and publishing capability for the selected account; no code is required.' %}</p>
           <button class="button button-primary" type="submit">{% ui '安排平台任务' 'Create channel plan' %}</button>
         </form>
-      </article>{% endif %}
+      </details>{% else %}<p class="daily-inline-help">{% if plan_form.no_platform_reason == 'EXHAUSTED' %}{% ui '本轮所有已配置的执行平台都已经安排过了（已取消的安排也保留历史）。如需重做某个平台，请新开一轮 Daily Operations。' 'All configured execution platforms have already been used in this run (cancelled plans remain in history). Start a new Daily Operations run to redo a platform.' %}{% else %}{% ui '当前账号没有可用的执行平台账号。请先到“功能中心”检查 TikTok、Pinterest、Quora 或 Shopify/博客的本地账号与权限；Google Search、GSC 和 GA4 只做数据分析，不能安排发布任务。' 'No usable execution account is available to this user. Check the local TikTok, Pinterest, Quora, or Shopify/blog account and permission in Feature Center. Google Search, GSC, and GA4 are analysis-only.' %}{% endif %}</p>{% endif %}{% endif %}
 
       <div class="daily-plan-list">
       {% for plan in plans %}
         <article class="daily-plan-card{% if not plan.compiled_context %} daily-plan-needs-work{% endif %}">
           <header><div><p class="task-meta">{{ plan.channel_account.display_name }}</p><h3>{{ plan.goal.title }}</h3></div><span class="task-state">{% ui_daily_state plan.current_state %}</span></header>
-          {% if plan.compiled_context %}
+          {% if not plan.is_execution_platform %}
+          <p class="read-only-note">{% ui '这是旧版本留下的分析平台计划，仅供查看。Google Search、GSC 和 GA4 不会生成发布任务；请在新一轮 Daily Operations 中选择执行平台。' 'This is a read-only analysis-platform plan from an older version. Google Search, GSC, and GA4 cannot create publishing work; choose an execution platform in a new Daily Operations run.' %}</p>
+          {% elif plan.compiled_context %}
           <div class="daily-task-ready"><span>{% ui '执行任务已生成' 'Execution task created' %}</span><a class="button button-primary" href="{% url 'dashboard:task-detail' plan.compiled_context.task.id %}">{% ui '查看执行任务' 'View execution task' %}</a></div>
           {% else %}{% if can_edit_batch %}
           <form method="post" action="{% url 'dailyops:plan-confirm-and-compile' plan.id %}">{% csrf_token %}<input type="hidden" name="command_id" value="{{ plan.owner_flow_command_id }}"><input type="hidden" name="task_id" value="{{ plan.owner_flow_task_id }}"><button class="button button-primary" type="submit">{% ui '确认平台安排并生成执行任务' 'Confirm platform plan and create task' %}</button></form>
@@ -278,7 +280,7 @@
           {% if plan.current_state == 'DRAFT' or plan.current_state == 'READY' %}
           <form class="config-form daily-decision-form" method="post" action="{% url 'dailyops:plan-transition' plan.id %}">
             {% csrf_token %}<input type="hidden" name="command_id" value="{{ command_id }}"><input type="hidden" name="expected_version" value="{{ plan.state_version }}"><input type="hidden" name="to_state" value="{% if plan.current_state == 'DRAFT' %}READY{% else %}ACTIVE{% endif %}">
-            <label><span>{% ui '一句话说明原因' 'Reason in one sentence' %}</span><textarea name="reason" rows="2" required></textarea></label>
+            <label><span>{% ui '补充说明（可不填）' 'Note (optional)' %}</span><textarea name="reason" rows="2"></textarea></label>
             <button class="button button-primary" type="submit">{% if plan.current_state == 'DRAFT' %}{% ui '确认计划可以执行' 'Mark plan ready' %}{% else %}{% ui '启动这个计划' 'Activate plan' %}{% endif %}</button>
           </form>
           {% endif %}

@@ -20,7 +20,7 @@
       <label><span>{% ui '平台' 'Platform' %}</span>{{ form.platform }}{{ form.platform.errors }}</label>
       <label><span>{% ui '标题（可不填）' 'Title (optional)' %}</span>{{ form.title }}{{ form.title.errors }}</label>
       <label><span>{% ui '补充说明（可不填）' 'Notes (optional)' %}</span>{{ form.content_text }}{{ form.content_text.errors }}</label>
-      <label><span>{% ui '为什么要更正' 'Why this correction is needed' %}</span>{{ form.reason }}{{ form.reason.errors }}</label>
+      <label><span>{% ui '更正说明（可不填）' 'Correction note (optional)' %}</span>{{ form.reason }}{{ form.reason.errors }}</label>
       <div class="form-actions">
         <a class="button button-secondary" href="{% url 'dailyops:batch-detail' product.id batch_key %}">{% ui '不修改，返回' 'Cancel and return' %}</a>
         <button class="button button-primary" type="submit">{% ui '保留旧记录并保存更正' 'Retain old record and save correction' %}</button>

@@ -8,6 +8,7 @@ from django.db import transaction
 
 from accounts.authorization import require_authorization
 from accounts.models import PermissionGrant, Principal
+from core.audit_notes import tag_optional_audit_note
 from dailyops.disposition import batch_disposition, lock_daily_batch_runs
 from intelligence.exceptions import CommandReplayConflict
 from intelligence.models import (
@@ -79,9 +80,16 @@ def invalidate_evidence(
 ) -> EvidenceInvalidationResult:
     """Remove evidence from future decisions without rewriting history."""
 
-    normalized_reason = reason.strip()
-    if not normalized_reason:
-        raise ValidationError("请简单说明为什么移除这条来源。")
+    replay = (
+        EvidenceInvalidationEvent.objects.filter(command_id=command_id)
+        .select_related("evidence_item__collection_run")
+        .first()
+    )
+    normalized_reason = tag_optional_audit_note(
+        reason,
+        default="未填写额外说明；由系统记录本次线索移除。",
+        existing_value=replay.reason if replay is not None else None,
+    )
     expected_hash = _payload_hash(
         evidence_id=evidence_id,
         product_id=product.pk,
@@ -93,11 +101,6 @@ def invalidate_evidence(
         action=PermissionGrant.Action.EDIT,
         scope_kind=PermissionGrant.ScopeKind.PRODUCT,
         product=product,
-    )
-    replay = (
-        EvidenceInvalidationEvent.objects.filter(command_id=command_id)
-        .select_related("evidence_item__collection_run")
-        .first()
     )
     if replay is not None:
         if replay.payload_hash != expected_hash:

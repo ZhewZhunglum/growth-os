@@ -55,6 +55,7 @@ from dailyops.disposition import batch_disposition, dispose_daily_batch, lock_da
 from dailyops.evidence_services import ensure_batch_evidence_editable, invalidate_evidence
 from dailyops.models import DailyBatchDispositionEvent
 from dailyops.deployment import build_web_daily_operations_runtime
+from dailyops.platforms import EXECUTION_PLATFORM_VALUES
 from dailyops.services import (
     PLATFORMS,
     accept_daily_analysis,
@@ -252,7 +253,7 @@ def _can_dispose_batch(user: Principal, product: Product) -> bool:
     )
 
 
-def _data_recommendations(*, products) -> tuple[dict, ...]:
+def _data_recommendations(*, products, exclude_batch_keys=()) -> tuple[dict, ...]:
     """Return only current, externally-sourced opportunities in visible Products."""
 
     product_ids = tuple(products.values_list("pk", flat=True))
@@ -296,6 +297,7 @@ def _data_recommendations(*, products) -> tuple[dict, ...]:
             "batch_key", flat=True
         )
     )
+    excluded_keys = set(exclude_batch_keys)
     recommendations = []
     for opportunity in opportunities:
         batch_key = None
@@ -303,7 +305,7 @@ def _data_recommendations(*, products) -> tuple[dict, ...]:
             batch_key = _opportunity_batch_key(opportunity)
         except (ValidationError, ValueError):
             pass
-        if batch_key in disposed_keys:
+        if batch_key in disposed_keys or batch_key in excluded_keys:
             continue
         recommendations.append(
             {
@@ -362,7 +364,12 @@ def home(request: HttpRequest) -> HttpResponse:
         {
             "form": form,
             "recent_batches": recent.values(),
-            "data_recommendations": _data_recommendations(products=editable_products),
+            # A batch already listed under Recent work must not be repeated as
+            # another apparently new recommendation on the same screen.
+            "data_recommendations": _data_recommendations(
+                products=editable_products,
+                exclude_batch_keys=recent.keys(),
+            ),
             "can_start_batch": editable_products.exists(),
             "configured_source_count": SourceRegistry.objects.filter(
                 status=SourceRegistry.Status.ACTIVE,
@@ -492,6 +499,11 @@ def batch_detail(request: HttpRequest, product_id, batch_key) -> HttpResponse:
         plan.compiled_context = plan.compilation_contexts.select_related("task").order_by("created_at").first()
         plan.owner_flow_command_id = uuid.uuid4()
         plan.owner_flow_task_id = uuid.uuid4()
+        plan.is_execution_platform = plan.platform_code in EXECUTION_PLATFORM_VALUES
+    # A cancelled plan remains immutable history.  Reusing that platform in
+    # the same Initiative would either overwrite meaning or create two
+    # competing histories, so every existing plan reserves its platform.
+    planned_platforms = {plan.platform_code for plan in plans}
     if not evidence:
         current_step = 2
     elif proposal is None or opportunity is None:
@@ -510,6 +522,7 @@ def batch_detail(request: HttpRequest, product_id, batch_key) -> HttpResponse:
     accounts = _collectible_accounts(request.user, product)
     plan_form = ChannelPlanForm(
         accounts=accounts,
+        excluded_platforms=planned_platforms,
         language_code=request.LANGUAGE_CODE,
         initial={
             "command_id": uuid.uuid4(),
@@ -521,6 +534,7 @@ def batch_detail(request: HttpRequest, product_id, batch_key) -> HttpResponse:
         "product": product,
         "batch_key": batch_key,
         "query": runs[0].query_spec.get("query", ""),
+        "batch_started_at": min(run.created_at for run in runs),
         "platform_cards": cards,
         "evidence": evidence,
         "proposal": proposal,
@@ -969,7 +983,7 @@ def evidence_invalidate(request: HttpRequest, product_id, batch_key, evidence_id
             product=product,
             batch_key=batch_key,
             command_id=command.cleaned_data["command_id"],
-            reason=request.POST.get("reason", "录入错误，不再用于后续分析。"),
+            reason=request.POST.get("reason", ""),
             principal=request.user,
             acting_role=request.user.role,
         )
@@ -1211,9 +1225,11 @@ def plan_create(request: HttpRequest, initiative_id) -> HttpResponse:
     _require_edit(request.user, product)
     _require_active_batch(batch_key=_opportunity_batch_key(initiative.opportunity), product=product)
     accounts = _collectible_accounts(request.user, product)
+    planned_platforms = initiative.channel_plans.values_list("platform_code", flat=True)
     form = ChannelPlanForm(
         request.POST,
         accounts=accounts,
+        excluded_platforms=planned_platforms,
         language_code=request.LANGUAGE_CODE,
     )
     try:

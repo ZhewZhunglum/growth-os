@@ -170,6 +170,31 @@ class DailyCollectionServiceTests(TestCase):
             granted_by_principal=self.owner,
         )
 
+    def test_offline_proposal_title_uses_the_batch_question(self):
+        batch_key = self._batch()
+        ingest_manual_link(
+            batch_key=batch_key,
+            product=self.product,
+            platform=Platform.TIKTOK,
+            operation_key=uuid.uuid4(),
+            external_url="https://www.tiktok.com/@puko/video/query-title",
+            external_content_id="query-title",
+            title="An evidence title that must not replace the question",
+            content_text="A provenance-linked offline test item.",
+            collected_at=timezone.now(),
+            principal=self.owner,
+            acting_role=self.owner.role,
+        )
+
+        proposal = propose_daily_analysis(
+            batch_key=batch_key,
+            product=self.product,
+            principal=self.owner,
+            acting_role=self.owner.role,
+        )
+
+        self.assertEqual(proposal.value["topic_label"], "afternoon focus")
+
     def _grant_batch_cancellation(self) -> PermissionGrant:
         now = timezone.now()
         return PermissionGrant.objects.create(

@@ -14,6 +14,7 @@ from django.db import models, transaction
 from django.db.models import Q
 from django.utils import timezone
 
+from core.audit_notes import tag_optional_audit_note
 from core.models import UUIDv7Model
 from workflow.services import guard_review, guard_submission
 
@@ -704,6 +705,16 @@ class TaskSubmission(AppendOnlyFact):
         permission_grant,
         recorded_by_principal,
     ) -> TaskSubmission:
+        existing_note = (
+            cls.objects.filter(command_id=command_id)
+            .values_list("submission_note", flat=True)
+            .first()
+        )
+        submission_note = tag_optional_audit_note(
+            submission_note,
+            default="Submission sealed without an additional delivery note.",
+            existing_value=existing_note,
+        )
         if triggering_review is not None:
             if supersedes_submission is None:
                 supersedes_submission = triggering_review.submission
@@ -1090,11 +1101,27 @@ class ReviewDecision(AppendOnlyFact):
         recorded_by_principal,
         owner_edit_grant=None,
     ) -> ReviewDecision:
-        rationale = str(rationale or "").strip()
-        if not rationale:
+        is_owner_self_approval = cls.owner_self_approval_allowed(
+            submission=submission,
+            decision=decision,
+            reviewer_principal=reviewer_principal,
+            acting_role=acting_role,
+        )
+        raw_rationale = str(rationale or "").strip()
+        if is_owner_self_approval and not raw_rationale:
             raise ValidationError(
-                {"rationale": "A non-empty review or approval reason is required."}
+                {"rationale": "Owner final approval requires a non-empty audit reason."}
             )
+        existing_rationale = (
+            cls.objects.filter(command_id=command_id)
+            .values_list("rationale", flat=True)
+            .first()
+        )
+        rationale = tag_optional_audit_note(
+            raw_rationale,
+            default="Review decision recorded without an additional note.",
+            existing_value=existing_rationale,
+        )
         criteria_results = criteria_results or {}
         provisional = cls(
             submission=submission,
@@ -1110,12 +1137,6 @@ class ReviewDecision(AppendOnlyFact):
             owner_edit_grant=owner_edit_grant,
             recorded_by_principal=recorded_by_principal,
             decided_at=timezone.now(),
-        )
-        is_owner_self_approval = cls.owner_self_approval_allowed(
-            submission=submission,
-            decision=decision,
-            reviewer_principal=reviewer_principal,
-            acting_role=acting_role,
         )
         if (
             reviewer_principal.pk == submission.submitted_by_principal_id

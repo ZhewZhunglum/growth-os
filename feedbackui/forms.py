@@ -74,7 +74,15 @@ def geo_item_choice_label(item: GEOProbePanelItem, *, english: bool = False) -> 
         question = f"{question[:69]}…"
     order = f"Question {item.item_number}" if english else f"问题 {item.item_number}"
     product_name = getattr(getattr(getattr(item, "panel", None), "product", None), "name", "")
-    return " · ".join(part for part in (product_name, order, question) if part)
+    panel_key = str(getattr(getattr(item, "panel", None), "panel_key", ""))
+    intent = str(getattr(item, "intent", ""))
+    is_test_seed = panel_key == "local-test-puko-geo" or intent.upper().startswith("LOCAL_")
+    source = (
+        ("Local test · system preset" if english else "本地测试题 · 系统预设")
+        if is_test_seed
+        else ("Formal question" if english else "正式问题")
+    )
+    return " · ".join(part for part in (source, product_name, order, question) if part)
 
 
 def _validate_operation_key(value: str, *, english: bool = False) -> str:
