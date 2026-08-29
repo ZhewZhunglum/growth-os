@@ -1,20 +1,108 @@
 {% extends "base.html" %}
 {% load ui_i18n %}
-{% block title %}{% ui '账号与运行环境' 'Accounts & runtime environments' %} · PUKO{% endblock %}
-{% block page_title %}{% ui '账号与运行环境' 'Accounts & runtime environments' %}{% endblock %}
+{% block title %}{% ui '渠道与数据连接' 'Channels and data connections' %} · PUKO{% endblock %}
+{% block page_title %}{% ui '渠道与数据连接' 'Channels and data connections' %}{% endblock %}
 {% block content %}
-<a class="back-link" href="{% url 'dashboard:configuration-home' %}">← {% ui '返回配置中心' 'Back to configuration' %}</a>
-<section class="hero-panel config-hero"><div><p class="eyebrow">{% ui '发布前的真实上下文' 'Exact context before publishing' %}</p><h2>{% ui '账号、环境、绑定和能力都按版本记录' 'Version every account, environment, binding, and capability' %}</h2><p>{% ui '不保存登录密码或 API 密钥。绑定和能力发生变化时追加新版本，旧快照永远保留。' 'Passwords and API keys are never stored here. Binding and capability changes append a new version while old snapshots remain.' %}</p></div></section>
-<div class="config-grid">
-  <section class="detail-panel"><p class="eyebrow">{% ui '账号' 'Account' %}</p><h3>{% ui '登记渠道账号' 'Register channel account' %}</h3><form method="post" action="{% url 'dashboard:runtime-configuration-action' 'account' %}" class="config-form">{% csrf_token %}{{ forms.account.as_p }}<button class="button button-primary">{% ui '登记账号' 'Register account' %}</button></form></section>
-  <section class="detail-panel"><p class="eyebrow">{% ui '环境' 'Environment' %}</p><h3>{% ui '登记运行环境' 'Register runtime environment' %}</h3><form method="post" action="{% url 'dashboard:runtime-configuration-action' 'environment' %}" class="config-form">{% csrf_token %}{{ forms.environment.as_p }}<button class="button button-primary">{% ui '登记环境' 'Register environment' %}</button></form></section>
-  <section class="detail-panel"><p class="eyebrow">{% ui '绑定版本' 'Binding version' %}</p><h3>{% ui '追加账号与环境绑定' 'Append account/environment binding' %}</h3><form method="post" action="{% url 'dashboard:runtime-configuration-action' 'binding' %}" class="config-form">{% csrf_token %}{{ forms.binding.as_p }}<button class="button button-primary">{% ui '追加绑定版本' 'Append binding version' %}</button></form></section>
-  <section class="detail-panel action-panel"><p class="eyebrow">{% ui '能力版本' 'Capability version' %}</p><h3>{% ui '追加可用/关闭/未知状态' 'Append enabled, disabled, or unknown state' %}</h3><form method="post" action="{% url 'dashboard:runtime-configuration-action' 'capability' %}" class="config-form">{% csrf_token %}{{ forms.capability.as_p }}<button class="button button-primary">{% ui '追加能力版本' 'Append capability version' %}</button></form></section>
-</div>
-<div class="config-grid config-history">
-  <section class="detail-panel"><h3>{% ui '渠道账号' 'Channel accounts' %}</h3>{% for account in accounts %}<p><strong>{{ account.display_name }}</strong><br><small>{{ account.platform_code }} · {{ account.account_code }} · {{ account.status }}</small></p>{% empty %}<p class="muted">{% ui '尚无账号。' 'No accounts yet.' %}</p>{% endfor %}</section>
-  <section class="detail-panel"><h3>{% ui '运行环境' 'Runtime environments' %}</h3>{% for environment in environments %}<p><strong>{{ environment.environment_code }}</strong><br><small>{{ environment.environment_type }} · {{ environment.status }}</small></p>{% empty %}<p class="muted">{% ui '尚无环境。' 'No environments yet.' %}</p>{% endfor %}</section>
-  <section class="detail-panel"><h3>{% ui '绑定历史' 'Binding history' %}</h3>{% for binding in bindings %}<p><strong>{{ binding.channel_account.account_code }} → {{ binding.runtime_environment.environment_code }}</strong><br><small>v{{ binding.binding_version }} · {{ binding.identity_reference }}</small></p>{% empty %}<p class="muted">{% ui '尚无绑定。' 'No bindings yet.' %}</p>{% endfor %}</section>
-  <section class="detail-panel"><h3>{% ui '能力历史' 'Capability history' %}</h3>{% for capability in capabilities %}<p><strong>{{ capability.capability_code }} · {{ capability.state }}</strong><br><small>{{ capability.account_environment_binding.channel_account.account_code }} · v{{ capability.state_version }} · {{ capability.reason }}</small></p>{% empty %}<p class="muted">{% ui '尚无能力记录。' 'No capability records yet.' %}</p>{% endfor %}</section>
-</div>
+<a class="back-link" href="{% url 'dashboard:configuration-home' %}">← {% ui '返回设置' 'Back to settings' %}</a>
+
+<section class="hero-panel config-hero connection-hero">
+  <div>
+    <p class="eyebrow">{% ui '先看状态，再决定是否处理' 'See status first, then decide whether to act' %}</p>
+    <h2>{% ui '哪些平台现在可以使用？' 'Which channels are ready now?' %}</h2>
+    <p>{% ui '绿色表示可以继续安排任务；黄色表示需要管理员处理。这里不会保存密码或 API 密钥，也不会自动替你发布。' 'Green means work can be planned; amber means an administrator needs to act. Passwords and API keys are not stored here, and the system never publishes for you automatically.' %}</p>
+  </div>
+  <div class="connection-score" aria-label="{% ui '可执行平台就绪数量' 'Ready execution channels' %}">
+    <strong>{{ ready_execution_count }}/{{ execution_count }}</strong>
+    <span>{% ui '可执行平台已准备' 'execution channels ready' %}</span>
+  </div>
+</section>
+
+<nav class="settings-section-nav" aria-label="{% ui '设置页面分区' 'Settings sections' %}">
+  <a href="#execution-channels">{% ui '可执行平台' 'Execution channels' %}<strong>{{ execution_count }}</strong></a>
+  <a href="#analysis-sources">{% ui '分析数据源' 'Analysis sources' %}<strong>{{ analytical_platforms|length }}</strong></a>
+  <a href="#usage-contexts">{% ui '使用场景' 'Usage contexts' %}<strong>{{ environment_summaries|length }}</strong></a>
+</nav>
+
+<section id="execution-channels" class="connection-section">
+  <header class="section-heading">
+    <div>
+      <p class="eyebrow">{% ui '发布任务去向' 'Publishing destinations' %}</p>
+      <h2>{% ui '可执行平台' 'Execution channels' %}</h2>
+      <p class="section-description">{% ui '这四个平台可以创建执行任务；系统只安排和检查，真正发布仍由人工完成。' 'These four channels can create execution work. The system plans and checks; a person still performs the actual release.' %}</p>
+    </div>
+  </header>
+  <div class="connection-grid">
+    {% for platform in execution_platforms %}
+    <article id="{{ platform.anchor }}" class="connection-card connection-state-{{ platform.state|lower }}{% if focus_platform == platform.platform.value %} is-focused{% endif %}">
+      <header class="connection-card-heading">
+        <span class="connection-logo" aria-hidden="true">{{ platform.monogram }}</span>
+        <div><h3>{% ui platform.name_zh platform.name_en %}</h3><p>{% ui platform.purpose_zh platform.purpose_en %}</p></div>
+        <span class="connection-status">{% ui platform.state_zh platform.state_en %}</span>
+      </header>
+      <div class="connection-account-list">
+        {% for account in platform.accounts %}
+        <section class="connection-account-row">
+          <div class="connection-account-title"><strong>{{ account.account.display_name }}</strong><span class="connection-account-state connection-account-state-{{ account.state|lower }}">{% ui account.state_zh account.state_en %}</span></div>
+          {% if account.environment_zh %}<small>{% ui '使用场景：' 'Usage context: ' %}{% ui account.environment_zh account.environment_en %}</small>{% endif %}
+          {% if account.conflicting_contexts_zh %}<small class="connection-conflicts">{% ui '当前冲突：' 'Current conflict: ' %}{% ui account.conflicting_contexts_zh account.conflicting_contexts_en %}</small>{% endif %}
+          <p>{% ui account.detail_zh account.detail_en %}</p>
+          {% if account.repair_step == 'binding' %}<a class="connection-repair-link" href="{% url 'dashboard:runtime-configuration-advanced' %}?account={{ account.account.pk }}#advanced-binding">{% if account.state == 'NEEDS_ATTENTION' %}{% ui '选择唯一使用场景' 'Choose one usage context' %}{% else %}{% ui '设置使用场景' 'Set usage context' %}{% endif %} →</a>{% elif account.repair_step == 'capability' %}<a class="connection-repair-link" href="{% url 'dashboard:runtime-configuration-advanced' %}?account={{ account.account.pk }}&amp;binding={{ account.repair_binding_id }}&amp;step=capability#advanced-capability">{% ui '检查人工发布状态' 'Check manual-publishing availability' %} →</a>{% endif %}
+        </section>
+        {% empty %}
+        <div class="connection-empty"><strong>{% ui '尚未准备账号' 'No account prepared' %}</strong><p>{% ui '这个平台目前不能出现在 Daily Operations 的执行平台列表中。' 'This channel cannot yet appear in the Daily Operations execution list.' %}</p></div>
+        {% endfor %}
+      </div>
+    </article>
+    {% endfor %}
+  </div>
+</section>
+
+<section id="analysis-sources" class="connection-section">
+  <header class="section-heading">
+    <div>
+      <p class="eyebrow">{% ui '只读分析' 'Read-only analysis' %}</p>
+      <h2>{% ui '分析数据源' 'Analysis sources' %}</h2>
+      <p class="section-description">{% ui 'Google 搜索、GSC 和 GA4 只提供分析线索，永远不会成为发布任务平台。' 'Google Search, GSC, and GA4 provide analytical signals only and never become publishing destinations.' %}</p>
+    </div>
+  </header>
+  <div class="connection-grid connection-grid-compact">
+    {% for platform in analytical_platforms %}
+    <article id="{{ platform.anchor }}" class="connection-card connection-state-{{ platform.state|lower }}{% if focus_platform == platform.platform.value %} is-focused{% endif %}">
+      <header class="connection-card-heading">
+        <span class="connection-logo connection-logo-analysis" aria-hidden="true">{{ platform.monogram }}</span>
+        <div><h3>{% ui platform.name_zh platform.name_en %}</h3><p>{% ui platform.purpose_zh platform.purpose_en %}</p></div>
+        <span class="connection-status">{% ui platform.state_zh platform.state_en %}</span>
+      </header>
+      <div class="connection-account-list">
+        {% for account in platform.accounts %}
+        <section class="connection-account-row"><div class="connection-account-title"><strong>{{ account.account.display_name }}</strong><span class="connection-account-state">{% ui account.state_zh account.state_en %}</span></div><p>{% ui account.detail_zh account.detail_en %}</p></section>
+        {% empty %}<div class="connection-empty"><strong>{% ui '尚未登记数据账号' 'No data account registered' %}</strong><p>{% ui '采集步骤仍可明确显示“无数据、不可用或尚未配置”。' 'The collection step can still distinguish no data, unavailable, and not configured.' %}</p></div>{% endfor %}
+      </div>
+    </article>
+    {% endfor %}
+  </div>
+</section>
+
+<section id="usage-contexts" class="connection-section">
+  <header class="section-heading">
+    <div>
+      <p class="eyebrow">{% ui '安全边界' 'Safety boundary' %}</p>
+      <h2>{% ui '使用场景' 'Usage contexts' %}</h2>
+      <p class="section-description">{% ui '本地练习、测试和正式环境分开显示；日常人员不需要填写环境代码。' 'Local practice, test, and production are shown separately; daily users never need to enter environment codes.' %}</p>
+    </div>
+  </header>
+  <div class="environment-list">
+    {% for item in environment_summaries %}
+    <article class="environment-card">
+      <div><h3>{% ui item.label_zh item.label_en %}</h3><p>{% ui item.detail_zh item.detail_en %}</p></div>
+      <span class="connection-account-state connection-account-state-{{ item.state|lower }}">{% ui item.state_zh item.state_en %}</span>
+    </article>
+    {% empty %}<article class="empty-state"><span class="empty-number">0</span><div><h3>{% ui '尚未设置使用场景' 'No usage context set up' %}</h3><p>{% ui '在高级设置中添加后，平台卡片才会显示是否可用。' 'Add one in Advanced settings before channel cards can show readiness.' %}</p></div></article>{% endfor %}
+  </div>
+</section>
+
+<aside class="advanced-settings-entry">
+  <div><p class="eyebrow">{% ui '仅限管理员' 'Administrators only' %}</p><h2>{% ui '高级设置与审计' 'Advanced settings and audit' %}</h2><p>{% ui '只有新增账号、改变使用场景或处理连接异常时才需要进入。这里会显示内部代码、绑定和不可改写的版本历史。' 'Open this only to add an account, change a usage context, or resolve a connection issue. It contains internal codes, bindings, and immutable version history.' %}</p></div>
+  <a class="button button-secondary" href="{% url 'dashboard:runtime-configuration-advanced' %}">{% ui '打开高级设置' 'Open Advanced settings' %}</a>
+</aside>
 {% endblock %}

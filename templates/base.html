@@ -15,6 +15,7 @@
     {% url 'dashboard:review-queue' as review_queue_url %}
     {% url 'dashboard:release-queue' as release_queue_url %}
     {% url 'dashboard:feature-center' as feature_center_url %}
+    {% url 'dashboard:configuration-home' as configuration_home_url %}
     {% url 'dashboard:change-my-password' as change_password_url %}
     {% url 'dashboard:my-task-history' as task_history_url %}
     {% url 'dashboard:guide' as guide_url %}
@@ -35,9 +36,12 @@
                 {% if global_action_center.can_open_publish or global_action_center.can_open_complete %}
                 <a class="nav-item{% if request.resolver_match.url_name == 'release-queue' or request.resolver_match.url_name == 'release-detail' %} is-active{% endif %}" href="{{ release_queue_url|default:'#' }}">{% ui '发布' 'Publish' %}</a>
                 {% endif %}
-                <a class="nav-item{% if request.resolver_match.url_name == 'feature-center' or request.resolver_match.namespace == 'dailyops' or request.resolver_match.namespace == 'governanceui' or request.resolver_match.url_name == 'team-members' or request.resolver_match.url_name == 'team-member-detail' or request.resolver_match.url_name == 'configuration-home' or request.resolver_match.url_name == 'product-configuration' or request.resolver_match.url_name == 'runtime-configuration' or request.resolver_match.url_name == 'guide' %} is-active{% endif %}" href="{{ feature_center_url|default:'#' }}">{% ui '功能中心' 'Feature center' %}</a>
+                <a class="nav-item{% if request.resolver_match.url_name == 'feature-center' or request.resolver_match.namespace == 'dailyops' or request.resolver_match.namespace == 'governanceui' or request.resolver_match.url_name == 'guide' %} is-active{% endif %}" href="{{ feature_center_url|default:'#' }}">{% ui '功能中心' 'Feature center' %}</a>
                 {% if global_feature_center.can_open_geo %}
                 <a class="nav-item{% if request.resolver_match.namespace == 'feedback' %} is-active{% endif %}" href="{{ feedback_home_url|default:'#' }}#geo">{% ui 'AI 搜索曝光（GEO）' 'AI search visibility (GEO)' %}</a>
+                {% endif %}
+                {% if global_feature_center.can_open_settings %}
+                <a class="nav-item{% if request.resolver_match.url_name == 'configuration-home' or request.resolver_match.url_name == 'product-configuration' or request.resolver_match.url_name == 'product-configuration-action' or request.resolver_match.url_name == 'runtime-configuration' or request.resolver_match.url_name == 'runtime-configuration-advanced' or request.resolver_match.url_name == 'runtime-configuration-action' or request.resolver_match.url_name == 'team-members' or request.resolver_match.url_name == 'team-member-detail' %} is-active{% endif %}" href="{{ configuration_home_url|default:'#' }}">{% ui '设置' 'Settings' %}</a>
                 {% endif %}
             </nav>
             {% if user.is_authenticated %}

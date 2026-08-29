@@ -115,7 +115,8 @@ class FeatureCenterTests(TestCase):
         with_management = self.client.get(feature_url)
         self.assertContains(with_management, "问题与规则治理")
         self.assertContains(with_management, "员工与权限")
-        self.assertContains(with_management, "产品、账号与运行设置")
+        self.assertContains(with_management, "设置")
+        self.assertContains(with_management, "管理产品资料、渠道账号和使用环境")
 
     def test_geo_and_feature_center_labels_switch_to_english(self):
         self.grant(

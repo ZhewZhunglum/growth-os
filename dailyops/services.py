@@ -65,6 +65,7 @@ from intelligence.services import (
 )
 from products.models import Product
 from releasegate.models import AccountEnvironmentBinding, CapabilityState
+from releasegate.runtime import resolve_manual_publish_context
 from workflow.models import Task, TaskContractVersion
 
 from dailyops.disposition import lock_daily_batch_runs
@@ -1595,37 +1596,7 @@ def _resolve_current_plan_runtime(
     incomplete setup and multiple matches are ambiguous, so both fail closed.
     """
 
-    at = at or timezone.now()
-    bindings = (
-        AccountEnvironmentBinding.objects.select_related("runtime_environment")
-        .filter(
-            channel_account_id=channel_account.pk,
-            status=AccountEnvironmentBinding.Status.ACTIVE,
-            valid_from__lte=at,
-            runtime_environment__status="ACTIVE",
-        )
-        .filter(Q(valid_until__isnull=True) | Q(valid_until__gt=at))
-        .order_by("runtime_environment__environment_code", "-binding_version", "id")
-    )
-    current_bindings = [binding for binding in bindings if binding.is_current_at(at)]
-    if not current_bindings:
-        raise ValidationError("这个账号当前没有可用的运行环境，请先完成账号与环境配置。")
-    if len(current_bindings) > 1:
-        raise ValidationError("这个账号同时连接了多个运行环境，系统不能安全猜选；请先只保留一个当前绑定。")
-    binding = current_bindings[0]
-    capability = (
-        CapabilityState.objects.filter(
-            account_environment_binding=binding,
-            capability_code=CapabilityState.MANUAL_PUBLISH,
-        )
-        .order_by("-state_version")
-        .first()
-    )
-    if capability is None:
-        raise ValidationError("这个账号当前没有人工发布能力配置，请先完成运行配置。")
-    if not capability.is_current_open_at(at):
-        raise ValidationError("这个账号当前不能人工发布，请先检查账号能力状态。")
-    return binding, capability
+    return resolve_manual_publish_context(channel_account, at=at)
 
 
 def _current_capability_for_plan(plan: ChannelPlan) -> CapabilityState:

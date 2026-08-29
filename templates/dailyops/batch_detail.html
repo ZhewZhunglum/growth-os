@@ -263,7 +263,28 @@
           <p class="daily-inline-help">{% ui '运行环境和发布能力由系统根据所选账号自动核对，你不需要填写代码。' 'The system checks the runtime environment and publishing capability for the selected account; no code is required.' %}</p>
           <button class="button button-primary" type="submit">{% ui '安排平台任务' 'Create channel plan' %}</button>
         </form>
-      </details>{% else %}<p class="daily-inline-help">{% if plan_form.no_platform_reason == 'EXHAUSTED' %}{% ui '本轮所有已配置的执行平台都已经安排过了（已取消的安排也保留历史）。如需重做某个平台，请新开一轮 Daily Operations。' 'All configured execution platforms have already been used in this run (cancelled plans remain in history). Start a new Daily Operations run to redo a platform.' %}{% else %}{% ui '当前账号没有可用的执行平台账号。请先到“功能中心”检查 TikTok、Pinterest、Quora 或 Shopify/博客的本地账号与权限；Google Search、GSC 和 GA4 只做数据分析，不能安排发布任务。' 'No usable execution account is available to this user. Check the local TikTok, Pinterest, Quora, or Shopify/blog account and permission in Feature Center. Google Search, GSC, and GA4 are analysis-only.' %}{% endif %}</p>{% endif %}{% endif %}
+        {% if runtime_setup_platforms %}
+        <aside class="daily-setup-notice">
+          <div><strong>{% ui '其他平台暂未显示' 'Some channels are not shown yet' %}</strong><p>{% ui '只有账号、使用场景和人工发布状态都准备好的平台才会出现在上方列表。' 'Only channels with a ready account, usage context, and manual-publishing status appear above.' %}</p></div>
+          {% if can_manage_runtime_configuration %}
+          {% url 'dashboard:runtime-configuration' as runtime_settings_url %}
+          <div class="daily-setup-links">{% for item in runtime_setup_platforms %}<a href="{{ runtime_settings_url }}?platform={{ item.value }}#{{ item.anchor }}">{% ui '检查' 'Check' %} {% ui item.label_zh item.label_en %}</a>{% endfor %}</div>
+          {% else %}<small>{% ui '请联系 Owner 或运营管理员检查渠道设置。' 'Ask the Owner or Operations Admin to check channel settings.' %}</small>{% endif %}
+        </aside>
+        {% endif %}
+      </details>{% else %}
+        {% if plan_form.no_platform_reason == 'EXHAUSTED' %}
+        <p class="daily-inline-help">{% ui '本轮所有已配置的执行平台都已经安排过了（已取消的安排也保留历史）。如需重做某个平台，请新开一轮 Daily Operations。' 'All configured execution platforms have already been used in this run (cancelled plans remain in history). Start a new Daily Operations run to redo a platform.' %}</p>
+        {% else %}
+        <aside class="daily-setup-notice daily-setup-blocked">
+          <div><strong>{% ui '还没有可用的执行平台' 'No execution channel is ready yet' %}</strong><p>{% ui 'TikTok、Pinterest、Quora 和 Shopify/博客需要同时具备可用账号、一个明确的使用场景和已确认的人工发布状态。Google Search、GSC 和 GA4 只做数据分析。' 'TikTok, Pinterest, Quora, and Shopify/blog each need an available account, one exact usage context, and confirmed manual-publishing availability. Google Search, GSC, and GA4 are analysis-only.' %}</p></div>
+          {% if can_manage_runtime_configuration %}
+          {% url 'dashboard:runtime-configuration' as runtime_settings_url %}
+          <div class="daily-setup-links">{% for item in runtime_setup_platforms %}<a class="button button-secondary" href="{{ runtime_settings_url }}?platform={{ item.value }}#{{ item.anchor }}">{% ui '检查' 'Check' %} {% ui item.label_zh item.label_en %}</a>{% endfor %}</div>
+          {% else %}<small>{% ui '请联系 Owner 或运营管理员检查渠道账号和权限。' 'Ask the Owner or Operations Admin to check channel accounts and access.' %}</small>{% endif %}
+        </aside>
+        {% endif %}
+      {% endif %}{% endif %}
 
       <div class="daily-plan-list">
       {% for plan in plans %}

@@ -21,6 +21,7 @@ from dashboard.config_views import (
     product_configuration,
     product_configuration_action,
     runtime_configuration,
+    runtime_configuration_advanced,
     runtime_configuration_action,
 )
 from dashboard.team_views import (
@@ -67,6 +68,11 @@ urlpatterns = [
         name="product-configuration-action",
     ),
     path("configuration/runtime/", runtime_configuration, name="runtime-configuration"),
+    path(
+        "configuration/runtime/advanced/",
+        runtime_configuration_advanced,
+        name="runtime-configuration-advanced",
+    ),
     path(
         "configuration/runtime/<str:action>/",
         runtime_configuration_action,

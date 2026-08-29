@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% load ui_i18n %}
+{% block title %}{% ui '高级设置与审计' 'Advanced settings and audit' %} · PUKO{% endblock %}
+{% block page_title %}{% ui '高级设置与审计' 'Advanced settings and audit' %}{% endblock %}
+{% block content %}
+<a class="back-link" href="{% url 'dashboard:runtime-configuration' %}">← {% ui '返回渠道状态' 'Back to channel status' %}</a>
+
+<section class="hero-panel config-hero advanced-hero">
+  <div>
+    <p class="eyebrow">{% ui '管理员工具' 'Administrator tools' %}</p>
+    <h2>{% ui '只有配置发生变化时才需要这里' 'Use this only when configuration changes' %}</h2>
+    <p>{% ui '系统不保存密码或 API 密钥。账号与使用场景的变化会追加新记录，旧版本保留用于审计，不会被静默改写。' 'The system never stores passwords or API keys. Account and usage-context changes append new records; earlier versions remain immutable for audit.' %}</p>
+  </div>
+</section>
+
+<aside class="advanced-warning" role="note">
+  <strong>{% ui '日常测试通常不需要修改以下内容。' 'Daily testing normally does not require changing anything below.' %}</strong>
+  <p>{% ui '如果只是想确认平台能不能用，请返回“渠道与数据连接”查看状态卡片。' 'If you only want to know whether a channel is usable, return to Channels and data connections and read its status card.' %}</p>
+</aside>
+
+<div class="advanced-tool-list">
+  <details id="advanced-account" class="advanced-tool"{% if open_action == 'account' %} open{% endif %}>
+    <summary><span><small>{% ui '第 1 步' 'Step 1' %}</small><strong>{% ui '添加平台账号' 'Add a platform account' %}</strong></span><span aria-hidden="true">＋</span></summary>
+    <div class="advanced-tool-body"><p>{% ui '只保存平台、账号名称和外部账号 ID；新账号会以“使用中”状态创建。不要填写登录密码或密钥。' 'Store only the platform, account name, and external account ID; new accounts start Active. Never enter a login password or key.' %}</p><form method="post" action="{% url 'dashboard:runtime-configuration-action' 'account' %}" class="config-form">{% csrf_token %}{{ forms.account.as_p }}<button class="button button-primary">{% ui '添加账号' 'Add account' %}</button></form></div>
+  </details>
+
+  <details id="advanced-environment" class="advanced-tool"{% if open_action == 'environment' %} open{% endif %}>
+    <summary><span><small>{% ui '第 2 步' 'Step 2' %}</small><strong>{% ui '添加使用场景' 'Add a usage context' %}</strong></span><span aria-hidden="true">＋</span></summary>
+    <div class="advanced-tool-body"><p>{% ui '本地练习和测试使用测试环境；只有真实业务才使用正式环境。新场景会以“使用中”状态创建。' 'Use a test environment for local practice and testing; use Production only for real work. New contexts start Active.' %}</p><form method="post" action="{% url 'dashboard:runtime-configuration-action' 'environment' %}" class="config-form">{% csrf_token %}{{ forms.environment.as_p }}<button class="button button-primary">{% ui '添加使用场景' 'Add usage context' %}</button></form></div>
+  </details>
+
+  <details id="advanced-binding" class="advanced-tool"{% if open_action == 'binding' %} open{% endif %}>
+    <summary><span><small>{% ui '第 3 步' 'Step 3' %}</small><strong>{% ui '设置账号的当前使用场景' 'Set the account’s current usage context' %}</strong></span><span aria-hidden="true">＋</span></summary>
+    <div class="advanced-tool-body">
+      {% if focus_account %}<aside class="advanced-context-focus"><strong>{% ui '正在处理：' 'Working on: ' %}{{ focus_account.display_name }}</strong><span>{% ui focus_platform_zh focus_platform_en %}</span>{% if focus_contexts %}<p>{% ui '当前连接：' 'Current connections: ' %}{% for context in focus_contexts %}{% ui context.display_zh context.display_en %}{% if not forloop.last %} · {% endif %}{% endfor %}</p>{% endif %}</aside>{% endif %}
+      <p>{% ui '选择后，系统会为其他当前或预定连接追加“已撤销”版本，不会修改或删除历史。若创建了新的目标连接，请继续第 4 步重新确认人工发布状态。' 'The system appends a Revoked version to other current or scheduled connections without changing or deleting history. If a new target connection is created, continue to Step 4 and confirm manual-publishing availability again.' %}</p>
+      <form method="post" action="{% url 'dashboard:runtime-configuration-action' 'binding' %}" class="config-form">{% csrf_token %}{{ forms.binding.as_p }}<button class="button button-primary">{% ui '设为当前并结束其他连接' 'Make current and end other connections' %}</button></form>
+    </div>
+  </details>
+
+  <details id="advanced-capability" class="advanced-tool"{% if open_action == 'capability' %} open{% endif %}>
+    <summary><span><small>{% ui '第 4 步' 'Step 4' %}</small><strong>{% ui '确认人工发布是否可用' 'Confirm manual-publishing availability' %}</strong></span><span aria-hidden="true">＋</span></summary>
+    <div class="advanced-tool-body"><p>{% ui '“可以使用”只表示系统允许安排人工发布任务，不代表平台已自动连接，也不会自动发布。' '“Available” only permits planning manual-publishing work. It does not mean the platform is automatically connected, and it never publishes automatically.' %}</p><form method="post" action="{% url 'dashboard:runtime-configuration-action' 'capability' %}" class="config-form">{% csrf_token %}{{ forms.capability.as_p }}<button class="button button-primary">{% ui '保存新的可用状态' 'Save new availability state' %}</button></form></div>
+  </details>
+</div>
+
+<details class="advanced-audit">
+  <summary><span><small>{% ui '只读' 'Read only' %}</small><strong>{% ui '查看内部记录与版本历史' 'View internal records and version history' %}</strong></span><span aria-hidden="true">⌄</span></summary>
+  <div class="config-grid config-history">
+    <section class="detail-panel"><h3>{% ui '渠道账号记录' 'Channel account records' %}</h3>{% for account in accounts %}<p><strong>{{ account.display_name }}</strong><br><small>{{ account.platform_code }} · {{ account.account_code }} · {{ account.status }}</small></p>{% empty %}<p class="muted">{% ui '尚无账号。' 'No accounts yet.' %}</p>{% endfor %}</section>
+    <section class="detail-panel"><h3>{% ui '使用场景记录' 'Usage-context records' %}</h3>{% for environment in environments %}<p><strong>{{ environment.environment_code }}</strong><br><small>{{ environment.environment_type }} · {{ environment.status }}</small></p>{% empty %}<p class="muted">{% ui '尚无使用场景。' 'No usage contexts yet.' %}</p>{% endfor %}</section>
+    <section class="detail-panel"><h3>{% ui '连接版本历史' 'Connection version history' %}</h3>{% for row in binding_history %}<p class="audit-entry"><span class="audit-state audit-state-{{ row.state }}">{% ui row.label_zh row.label_en %}</span><strong>{{ row.binding.channel_account.account_code }} → {{ row.binding.runtime_environment.environment_code }}</strong><br><small>v{{ row.binding.binding_version }} · {{ row.binding.status }} · {{ row.binding.identity_reference }}</small></p>{% empty %}<p class="muted">{% ui '尚无连接记录。' 'No connection records yet.' %}</p>{% endfor %}</section>
+    <section class="detail-panel"><h3>{% ui '可用状态历史' 'Availability history' %}</h3>{% for row in capability_history %}<p class="audit-entry"><span class="audit-state audit-state-{{ row.state }}">{% ui row.label_zh row.label_en %}</span><strong>{{ row.capability.capability_code }} · {{ row.capability.state }}</strong><br><small>{{ row.capability.account_environment_binding.channel_account.account_code }} → {{ row.capability.account_environment_binding.runtime_environment.environment_code }} · v{{ row.capability.state_version }} · {{ row.capability.reason }}</small></p>{% empty %}<p class="muted">{% ui '尚无可用状态记录。' 'No availability records yet.' %}</p>{% endfor %}</section>
+  </div>
+</details>
+{% endblock %}

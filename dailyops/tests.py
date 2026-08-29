@@ -623,6 +623,11 @@ class DailyOperationsUITests(TestCase):
             follow=True,
         )
         self.assertContains(response, "同时连接了多个运行环境")
+        self.assertContains(response, "还没有可用的执行平台")
+        self.assertContains(
+            response,
+            f'{reverse("dashboard:runtime-configuration")}?platform=TIKTOK#platform-tiktok',
+        )
         self.assertFalse(ChannelPlan.objects.filter(initiative=initiative).exists())
 
     def test_channel_plan_fails_closed_when_current_capability_is_closed(self):
@@ -644,7 +649,59 @@ class DailyOperationsUITests(TestCase):
             follow=True,
         )
         self.assertContains(response, "当前不能人工发布")
+        self.assertContains(response, "还没有可用的执行平台")
+        self.assertContains(
+            response,
+            f'{reverse("dashboard:runtime-configuration")}?platform=TIKTOK#platform-tiktok',
+        )
         self.assertFalse(ChannelPlan.objects.filter(initiative=initiative).exists())
+
+    def test_runtime_setup_recovery_link_is_permission_aware(self):
+        batch_key, _ = self._approved_initiative()
+        CapabilityState.objects.create(
+            account_environment_binding=self.binding,
+            capability_code=CapabilityState.MANUAL_PUBLISH,
+            state_version=2,
+            state=CapabilityState.State.CLOSED,
+            effective_from=timezone.now() - timedelta(minutes=1),
+            reason="Not ready for an operator recovery-link test.",
+            supersedes=self.capability,
+            created_by_principal=self.owner,
+            recorded_by_principal=self.owner,
+        )
+        now = timezone.now()
+        for action in (PermissionGrant.Action.VIEW, PermissionGrant.Action.EDIT):
+            PermissionGrant.objects.create(
+                principal=self.outsider,
+                scope_kind=PermissionGrant.ScopeKind.PRODUCT,
+                product=self.product,
+                action=action,
+                valid_from=now - timedelta(minutes=1),
+                valid_until=now + timedelta(days=1),
+                granted_by_principal=self.owner,
+            )
+        for action in (PermissionGrant.Action.COLLECT_READ_ONLY, PermissionGrant.Action.MANAGE_ACCOUNT):
+            PermissionGrant.objects.create(
+                principal=self.outsider,
+                scope_kind=PermissionGrant.ScopeKind.GLOBAL,
+                action=action,
+                risk_level=(
+                    PermissionGrant.RiskLevel.HIGH
+                    if action == PermissionGrant.Action.MANAGE_ACCOUNT
+                    else PermissionGrant.RiskLevel.LOW
+                ),
+                valid_from=now - timedelta(minutes=1),
+                valid_until=now + timedelta(days=1),
+                granted_by_principal=self.owner,
+            )
+
+        self.client.force_login(self.outsider)
+        response = self.client.get(
+            reverse("dailyops:batch-detail", args=[self.product.pk, batch_key])
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "请联系 Owner 或运营管理员")
+        self.assertNotContains(response, reverse("dashboard:runtime-configuration"))
 
     def test_channel_plan_rejects_cross_platform_account_without_all_label(self):
         _, initiative = self._approved_initiative()

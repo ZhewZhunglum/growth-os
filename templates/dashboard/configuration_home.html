@@ -1,23 +1,74 @@
 {% extends "base.html" %}
 {% load ui_i18n %}
-{% block title %}{% ui '产品与运行配置' 'Product & runtime setup' %} · PUKO{% endblock %}
-{% block page_title %}{% ui '产品与运行配置' 'Product & runtime setup' %}{% endblock %}
+{% block title %}{% ui '设置' 'Settings' %} · PUKO{% endblock %}
+{% block page_title %}{% ui '设置' 'Settings' %}{% endblock %}
 {% block content %}
-<a class="back-link" href="{% url 'dashboard:feature-center' %}">← {% ui '返回功能中心' 'Back to feature center' %}</a>
-<section class="hero-panel config-hero">
-  <div><p class="eyebrow">{% ui 'Daily Operations 基础资料' 'Daily Operations foundation' %}</p><h2>{% ui '把真实产品、规则和账号准备好' 'Prepare real products, rules, and accounts' %}</h2>
-  <p>{% ui '这里只保存封存版本、平台账号编号和外部链接，不接收图片、视频、密码或 API 密钥。' 'This area stores sealed versions, platform account identifiers, and external links—not images, videos, passwords, or API keys.' %}</p></div>
-  {% if can_manage_runtime %}<a class="button button-primary" href="{% url 'dashboard:runtime-configuration' %}">{% ui '配置账号与环境' 'Configure accounts & environments' %}</a>{% endif %}
+<a class="back-link" href="{% url 'dashboard:home' %}">← {% ui '返回首页' 'Back to home' %}</a>
+
+<section class="hero-panel config-hero settings-hero">
+  <div>
+    <p class="eyebrow">{% ui '系统设置' 'System settings' %}</p>
+    <h2>{% ui '先选择你要管理的内容' 'Choose what you want to manage' %}</h2>
+    <p>{% ui '日常工作不需要理解绑定、版本或内部代码。先从渠道账号、产品资料或团队权限进入；技术记录只放在高级设置中。' 'Daily work does not require understanding bindings, versions, or internal codes. Start with channel accounts, product profiles, or team access; technical records stay in Advanced settings.' %}</p>
+  </div>
 </section>
-<section class="section-heading config-heading"><div><p class="eyebrow">{% ui '产品' 'Products' %}</p><h2>{% ui '我能配置的产品' 'Products I can configure' %}</h2></div></section>
-<div class="product-list">
-{% for product in products %}
-  <article class="product-card">
-    <span class="product-icon">{{ product.name|slice:":1" }}</span>
-    <div class="product-copy"><div class="product-title"><h3>{{ product.name }}</h3><span>{{ product.product_code }}</span></div>
-      <p>{{ product.market_code }} · {{ product.language_code }} · {% ui '当前档案' 'Current profile' %}：{% if product.current_profile_version %}v{{ product.current_profile_version.version_number }}{% else %}{% ui '尚未设置' 'Not set' %}{% endif %}</p></div>
-    <a class="button button-primary" href="{% url 'dashboard:product-configuration' product.id %}">{% ui '打开配置' 'Open setup' %}</a>
-  </article>
-{% empty %}<article class="empty-state"><span class="empty-number">0</span><div><h3>{% ui '没有可配置的产品' 'No configurable products' %}</h3><p>{% ui '需要该产品当前有效的“编辑”权限。' 'An active Edit permission for the product is required.' %}</p></div></article>{% endfor %}
-</div>
+
+<section class="settings-overview" aria-labelledby="settings-common-heading">
+  <header class="section-heading config-heading">
+    <div><p class="eyebrow">{% ui '常用设置' 'Common settings' %}</p><h2 id="settings-common-heading">{% ui '你想管理什么？' 'What do you want to manage?' %}</h2></div>
+  </header>
+  <div class="settings-overview-grid">
+    {% if can_manage_runtime %}
+    <article class="settings-entry-card settings-entry-primary">
+      <span class="settings-entry-icon" aria-hidden="true">↗</span>
+      <div>
+        <h3>{% ui '渠道与数据连接' 'Channels and data connections' %}</h3>
+        <p>{% ui '查看 TikTok、Pinterest、Quora、Shopify 和三个分析来源现在是否可用。' 'See whether TikTok, Pinterest, Quora, Shopify, and the three analysis sources are ready.' %}</p>
+        <small>{% ui '可执行平台：' 'Execution channels ready: ' %}{{ runtime_overview.ready_execution_count }}/{{ runtime_overview.execution_count }} · {% ui '使用场景：' 'Usage contexts: ' %}{{ runtime_overview.environment_count }}</small>
+      </div>
+      <a class="button button-primary" href="{% url 'dashboard:runtime-configuration' %}">{% ui '查看渠道状态' 'View channel status' %}</a>
+    </article>
+    {% endif %}
+
+    {% if products %}
+    <article class="settings-entry-card">
+      <span class="settings-entry-icon" aria-hidden="true">P</span>
+      <div>
+        <h3>{% ui '产品资料' 'Product profiles' %}</h3>
+        <p>{% ui '管理产品事实、允许的说法、外部证据和当前启用版本。' 'Manage product facts, permitted wording, external evidence, and the active version.' %}</p>
+        <small>{% ui '我能管理的产品：' 'Products I can manage: ' %}{{ products|length }}</small>
+      </div>
+      <a class="button button-secondary" href="#products">{% ui '查看产品' 'View products' %}</a>
+    </article>
+    {% endif %}
+
+    {% if can_manage_runtime %}
+    <article class="settings-entry-card">
+      <span class="settings-entry-icon" aria-hidden="true">◎</span>
+      <div>
+        <h3>{% ui '团队与权限' 'Team and access' %}</h3>
+        <p>{% ui '查看员工账号，以及每个人当前能查看、编辑、审核或发布什么。' 'View staff accounts and what each person can currently view, edit, review, or publish.' %}</p>
+        <small>{% ui '只有当前有效权限会生效' 'Only live permissions take effect' %}</small>
+      </div>
+      <a class="button button-secondary" href="{% url 'dashboard:team-members' %}">{% ui '管理团队' 'Manage team' %}</a>
+    </article>
+    {% endif %}
+  </div>
+</section>
+
+<section id="products" class="settings-products">
+  <header class="section-heading config-heading">
+    <div><p class="eyebrow">{% ui '产品资料' 'Product profiles' %}</p><h2>{% ui '我能管理的产品' 'Products I can manage' %}</h2></div>
+  </header>
+  <div class="product-list">
+  {% for product in products %}
+    <article class="product-card">
+      <span class="product-icon">{{ product.name|slice:":1" }}</span>
+      <div class="product-copy"><div class="product-title"><h3>{{ product.name }}</h3><span>{{ product.product_code }}</span></div>
+        <p>{{ product.market_code }} · {{ product.language_code }} · {% ui '当前资料：' 'Current profile: ' %}{% if product.current_profile_version %}v{{ product.current_profile_version.version_number }}{% else %}{% ui '尚未设置' 'Not set' %}{% endif %}</p></div>
+      <a class="button button-secondary" href="{% url 'dashboard:product-configuration' product.id %}">{% ui '管理产品资料' 'Manage product profile' %}</a>
+    </article>
+  {% empty %}<article class="empty-state"><span class="empty-number">0</span><div><h3>{% ui '没有可管理的产品' 'No manageable products' %}</h3><p>{% ui '需要该产品当前有效的编辑权限。' 'An active Edit permission for the product is required.' %}</p></div></article>{% endfor %}
+  </div>
+</section>
 {% endblock %}

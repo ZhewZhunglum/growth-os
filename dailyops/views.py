@@ -39,6 +39,7 @@ from intelligence.services import (
 )
 from products.models import Product
 from releasegate.models import ChannelAccount
+from releasegate.runtime import inspect_manual_publish_context
 
 from dailyops.forms import (
     BatchDispositionForm,
@@ -50,12 +51,13 @@ from dailyops.forms import (
     EvidenceCorrectionForm,
     ManualEvidenceForm,
     TransitionForm,
+    platform_label,
 )
 from dailyops.disposition import batch_disposition, dispose_daily_batch, lock_daily_batch_runs
 from dailyops.evidence_services import ensure_batch_evidence_editable, invalidate_evidence
 from dailyops.models import DailyBatchDispositionEvent
 from dailyops.deployment import build_web_daily_operations_runtime
-from dailyops.platforms import EXECUTION_PLATFORM_VALUES
+from dailyops.platforms import EXECUTION_PLATFORMS, EXECUTION_PLATFORM_VALUES
 from dailyops.services import (
     PLATFORMS,
     accept_daily_analysis,
@@ -168,6 +170,59 @@ def _collectible_accounts(user: Principal, product: Product):
     return ChannelAccount.objects.filter(pk__in=account_ids).order_by(
         "platform_code", "display_name", "account_code"
     )
+
+
+def _can_manage_runtime_configuration(user: Principal) -> bool:
+    if user.role == Principal.Role.OPERATOR:
+        return False
+    decision = resolve_authorization(
+        principal=user,
+        acting_role=user.role,
+        action=PermissionGrant.Action.MANAGE_ACCOUNT,
+        scope_kind=PermissionGrant.ScopeKind.GLOBAL,
+    )
+    return bool(
+        decision.allowed
+        and decision.grant is not None
+        and decision.grant.scope_kind == PermissionGrant.ScopeKind.GLOBAL
+    )
+
+
+def _runnable_plan_accounts(accounts, *, planned_platforms=()):
+    """Project only truly runnable accounts into the normal planning form.
+
+    The service layer still performs the same exact check at write time.  This
+    projection prevents a user from first seeing a platform as usable and only
+    discovering a broken environment/capability after submitting the form.
+    """
+
+    account_list = list(accounts)
+    ready_ids = [
+        account.pk
+        for account in account_list
+        if account.platform_code in EXECUTION_PLATFORM_VALUES
+        and inspect_manual_publish_context(account).ready
+    ]
+    ready_accounts = ChannelAccount.objects.filter(pk__in=ready_ids).order_by(
+        "platform_code", "display_name", "account_code"
+    )
+    planned_values = {str(value) for value in planned_platforms}
+    setup_platforms = []
+    for platform in EXECUTION_PLATFORMS:
+        if platform.value in planned_values:
+            continue
+        platform_accounts = [account for account in account_list if account.platform_code == platform.value]
+        if any(account.pk in ready_ids for account in platform_accounts):
+            continue
+        setup_platforms.append(
+            {
+                "value": platform.value,
+                "label_zh": platform_label(platform, english=False),
+                "label_en": platform_label(platform, english=True),
+                "anchor": f"platform-{platform.value.lower().replace('_', '-')}",
+            }
+        )
+    return ready_accounts, tuple(setup_platforms)
 
 
 def _platform(value: str) -> Platform:
@@ -520,8 +575,12 @@ def batch_detail(request: HttpRequest, product_id, batch_key) -> HttpResponse:
     else:
         current_step = 7
     accounts = _collectible_accounts(request.user, product)
+    runnable_accounts, runtime_setup_platforms = _runnable_plan_accounts(
+        accounts,
+        planned_platforms=planned_platforms,
+    )
     plan_form = ChannelPlanForm(
-        accounts=accounts,
+        accounts=runnable_accounts,
         excluded_platforms=planned_platforms,
         language_code=request.LANGUAGE_CODE,
         initial={
@@ -543,6 +602,8 @@ def batch_detail(request: HttpRequest, product_id, batch_key) -> HttpResponse:
         "initiative": initiative,
         "plans": plans,
         "plan_form": plan_form,
+        "runtime_setup_platforms": runtime_setup_platforms,
+        "can_manage_runtime_configuration": _can_manage_runtime_configuration(request.user),
         "manual_form": ManualEvidenceForm(
             initial={"command_id": uuid.uuid4()},
             language_code=request.LANGUAGE_CODE,

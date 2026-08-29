@@ -77,3 +77,39 @@ class PermissionAwareNavigationTests(TestCase):
         self.assertContains(with_publish, f'href="{release_url}"')
         self.assertContains(with_publish, "功能中心")
         self.assertNotContains(with_publish, "更多")
+
+    def test_settings_is_a_direct_permission_aware_navigation_entry(self):
+        settings_url = reverse("dashboard:configuration-home")
+
+        without_settings_grant = self.client.get(reverse("dashboard:home"))
+        self.assertNotContains(without_settings_grant, f'href="{settings_url}">设置</a>')
+
+        self.grant(
+            action=PermissionGrant.Action.EDIT,
+            scope_kind=PermissionGrant.ScopeKind.PRODUCT,
+            product=self.product,
+        )
+        with_product_settings = self.client.get(reverse("dashboard:home"))
+        self.assertContains(with_product_settings, f'href="{settings_url}">设置</a>')
+
+        settings_page = self.client.get(settings_url)
+        self.assertContains(settings_page, 'class="nav-item is-active" href="/configuration/">设置</a>')
+
+        operator = Principal.objects.create_user(
+            username="navigation-operator",
+            password="LocalPassword123!",
+            role=Principal.Role.OPERATOR,
+        )
+        PermissionGrant.objects.create(
+            principal=operator,
+            scope_kind=PermissionGrant.ScopeKind.GLOBAL,
+            action=PermissionGrant.Action.MANAGE_ACCOUNT,
+            effect=PermissionGrant.Effect.ALLOW,
+            risk_level=PermissionGrant.RiskLevel.HIGH,
+            valid_from=timezone.now() - timedelta(minutes=1),
+            valid_until=timezone.now() + timedelta(days=1),
+            granted_by_principal=self.user,
+        )
+        self.client.force_login(operator)
+        operator_home = self.client.get(reverse("dashboard:home"))
+        self.assertNotContains(operator_home, f'href="{settings_url}">设置</a>')

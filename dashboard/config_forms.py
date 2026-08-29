@@ -6,6 +6,7 @@ from django import forms
 from django.db.models import Exists, OuterRef, Q
 from django.utils import timezone
 
+from dailyops.forms import channel_account_label, platform_label
 from integrations.connectors.types import Platform
 
 from products.models import (
@@ -19,6 +20,31 @@ from products.models import (
     ProductProfileVersion,
 )
 from releasegate.models import AccountEnvironmentBinding, CapabilityState, ChannelAccount, RuntimeEnvironment
+
+
+def _is_english(language_code: str | None) -> bool:
+    return str(language_code or "").lower().startswith("en")
+
+
+def _runtime_environment_choice_label(
+    environment: RuntimeEnvironment,
+    *,
+    english: bool,
+) -> str:
+    if environment.environment_type == RuntimeEnvironment.EnvironmentType.PRODUCTION:
+        friendly_name = "Production" if english else "正式环境"
+    elif environment.environment_code == "local-dogfood" or environment.environment_code.startswith("local-"):
+        friendly_name = "Local practice" if english else "本地练习"
+    else:
+        friendly_name = "Test environment" if english else "测试环境"
+    return f"{friendly_name} · {environment.environment_code}"
+
+
+def _binding_choice_label(binding: AccountEnvironmentBinding, *, english: bool) -> str:
+    account = channel_account_label(binding.channel_account, english=english)
+    environment = _runtime_environment_choice_label(binding.runtime_environment, english=english)
+    version = f"version {binding.binding_version}" if english else f"版本 {binding.binding_version}"
+    return f"{account} → {environment} · {version}"
 
 
 class JSONField(forms.CharField):
@@ -141,17 +167,56 @@ class ChannelAccountForm(forms.ModelForm):
             (Platform.GOOGLE_ANALYTICS_4.value, "Google Analytics 4"),
         ],
     )
+    status = forms.ChoiceField(
+        label="使用状态",
+        choices=[(ChannelAccount.Status.ACTIVE, "使用中")],
+        initial=ChannelAccount.Status.ACTIVE,
+        widget=forms.HiddenInput(),
+    )
 
     class Meta:
         model = ChannelAccount
         fields = ["platform_code", "account_code", "external_account_ref", "display_name", "status"]
         labels = {
-            "platform_code": "平台代码", "account_code": "内部账号代码",
-            "external_account_ref": "平台账号 ID", "display_name": "显示名称", "status": "状态",
+            "platform_code": "平台", "account_code": "内部账号名称",
+            "external_account_ref": "平台账号 ID", "display_name": "页面显示名称", "status": "使用状态",
         }
+
+    def __init__(self, *args, language_code: str | None = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        if str(language_code or "").lower().startswith("en"):
+            labels = {
+                "platform_code": "Platform",
+                "account_code": "Internal account name",
+                "external_account_ref": "Platform account ID",
+                "display_name": "Display name",
+                "status": "Usage status",
+            }
+            for name, label in labels.items():
+                self.fields[name].label = label
+            self.fields["platform_code"].choices = [
+                (platform.value, platform_label(platform, english=True)) for platform in Platform
+            ]
+            self.fields["status"].choices = [
+                (ChannelAccount.Status.ACTIVE, "Active"),
+            ]
 
 
 class RuntimeEnvironmentForm(forms.ModelForm):
+    environment_type = forms.ChoiceField(
+        label="使用场景",
+        choices=[
+            (RuntimeEnvironment.EnvironmentType.STAGING, "测试环境"),
+            (RuntimeEnvironment.EnvironmentType.PRODUCTION, "正式环境"),
+        ],
+    )
+    status = forms.ChoiceField(
+        label="使用状态",
+        choices=[(RuntimeEnvironment.Status.ACTIVE, "使用中")],
+        initial=RuntimeEnvironment.Status.ACTIVE,
+        widget=forms.HiddenInput(),
+    )
+
     class Meta:
         model = RuntimeEnvironment
         fields = [
@@ -159,35 +224,128 @@ class RuntimeEnvironmentForm(forms.ModelForm):
             "database_namespace", "object_storage_namespace", "status",
         ]
         labels = {
-            "environment_code": "环境代码", "environment_type": "环境类型",
+            "environment_code": "使用场景名称", "environment_type": "使用场景",
             "identity_namespace": "身份空间（只填名称）", "database_namespace": "数据库空间（只填名称）",
-            "object_storage_namespace": "链接存储说明（V1 可填 DISABLED）", "status": "状态",
+            "object_storage_namespace": "链接存储说明（V1 可填 DISABLED）", "status": "使用状态",
         }
+
+    def __init__(self, *args, language_code: str | None = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        if str(language_code or "").lower().startswith("en"):
+            labels = {
+                "environment_code": "Usage-context name",
+                "environment_type": "Usage context",
+                "identity_namespace": "Identity namespace (name only)",
+                "database_namespace": "Database namespace (name only)",
+                "object_storage_namespace": "Link-storage note (DISABLED is allowed)",
+                "status": "Usage status",
+            }
+            for name, label in labels.items():
+                self.fields[name].label = label
+            self.fields["environment_type"].choices = [
+                (RuntimeEnvironment.EnvironmentType.STAGING, "Test environment"),
+                (RuntimeEnvironment.EnvironmentType.PRODUCTION, "Production"),
+            ]
+            self.fields["status"].choices = [
+                (RuntimeEnvironment.Status.ACTIVE, "Active"),
+            ]
 
 
 class BindingForm(forms.Form):
     channel_account = forms.ModelChoiceField(label="渠道账号", queryset=ChannelAccount.objects.none())
-    runtime_environment = forms.ModelChoiceField(label="运行环境", queryset=RuntimeEnvironment.objects.none())
-    identity_reference = forms.CharField(label="身份引用名称（不能填密码或密钥）", max_length=255)
+    runtime_environment = forms.ModelChoiceField(label="使用场景", queryset=RuntimeEnvironment.objects.none())
+    identity_reference = forms.CharField(
+        label="连接标识名称（新连接必填；保留已有连接可留空）",
+        help_text="只填写内部引用名称，不能填写密码或密钥。",
+        max_length=255,
+        required=False,
+    )
+    confirm_replace = forms.BooleanField(
+        label="我确认：这个账号只保留所选使用场景；其他当前或预定连接会追加为“已撤销”记录。",
+    )
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, language_code: str | None = None, **kwargs):
         super().__init__(*args, **kwargs)
+        self.language_code = language_code
+        english = _is_english(language_code)
         self.fields["channel_account"].queryset = ChannelAccount.objects.filter(
-            status=ChannelAccount.Status.ACTIVE
+            status=ChannelAccount.Status.ACTIVE,
+            platform_code__in=[platform.value for platform in Platform],
         ).order_by("platform_code", "account_code")
         self.fields["runtime_environment"].queryset = RuntimeEnvironment.objects.filter(
             status=RuntimeEnvironment.Status.ACTIVE
         ).order_by("environment_code")
+        self.fields["channel_account"].label_from_instance = (
+            lambda account: channel_account_label(account, english=english)
+        )
+        self.fields["runtime_environment"].label_from_instance = (
+            lambda environment: _runtime_environment_choice_label(environment, english=english)
+        )
+        if english:
+            self.fields["channel_account"].label = "Channel account"
+            self.fields["runtime_environment"].label = "Usage context"
+            self.fields["identity_reference"].label = (
+                "Connection reference name (required for a new connection; blank keeps an existing one)"
+            )
+            self.fields["identity_reference"].help_text = (
+                "Enter only an internal reference name, never a password or key."
+            )
+            self.fields["confirm_replace"].label = (
+                "I confirm that this account will keep only the selected usage context; "
+                "other current or scheduled connections will receive a Revoked record."
+            )
+
+    def clean(self):
+        cleaned = super().clean()
+        account = cleaned.get("channel_account")
+        environment = cleaned.get("runtime_environment")
+        reference = str(cleaned.get("identity_reference") or "").strip()
+        if account is None or environment is None or reference:
+            return cleaned
+
+        now = timezone.now()
+        latest = AccountEnvironmentBinding.objects.filter(
+            channel_account=account,
+            runtime_environment=environment,
+        ).order_by("-binding_version", "-created_at", "-id").first()
+        target_is_current = bool(
+            latest
+            and latest.status == AccountEnvironmentBinding.Status.ACTIVE
+            and latest.valid_from <= now
+            and (latest.valid_until is None or latest.valid_until > now)
+        )
+        if not target_is_current:
+            self.add_error(
+                "identity_reference",
+                (
+                    "A connection reference name is required for a new or reactivated connection."
+                    if _is_english(self.language_code)
+                    else "新增或重新启用连接时，必须填写连接标识名称。"
+                ),
+            )
+        return cleaned
 
 
 class CapabilityForm(forms.Form):
-    binding = forms.ModelChoiceField(label="账号与环境绑定", queryset=AccountEnvironmentBinding.objects.none())
-    capability_code = forms.CharField(label="能力代码", max_length=64, initial=CapabilityState.MANUAL_PUBLISH)
-    state = forms.ChoiceField(label="当前能力", choices=CapabilityState.State.choices)
-    reason = forms.CharField(label="原因", required=False, widget=forms.Textarea(attrs={"rows": 2}))
+    binding = forms.ModelChoiceField(label="账号与使用场景", queryset=AccountEnvironmentBinding.objects.none())
+    capability_code = forms.ChoiceField(
+        label="功能",
+        choices=[(CapabilityState.MANUAL_PUBLISH, "人工发布")],
+        initial=CapabilityState.MANUAL_PUBLISH,
+    )
+    state = forms.ChoiceField(
+        label="当前是否可用",
+        choices=[
+            (CapabilityState.State.OPEN, "可以使用"),
+            (CapabilityState.State.CLOSED, "已关闭"),
+            (CapabilityState.State.UNKNOWN, "尚未检查"),
+        ],
+    )
+    reason = forms.CharField(label="说明（可不填）", required=False, widget=forms.Textarea(attrs={"rows": 2}))
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, language_code: str | None = None, **kwargs):
         super().__init__(*args, **kwargs)
+        english = _is_english(language_code)
         now = timezone.now()
         newer = AccountEnvironmentBinding.objects.filter(
             channel_account_id=OuterRef("channel_account_id"),
@@ -201,7 +359,24 @@ class CapabilityForm(forms.Form):
             status=AccountEnvironmentBinding.Status.ACTIVE,
             valid_from__lte=now,
             channel_account__status=ChannelAccount.Status.ACTIVE,
+            channel_account__platform_code__in=[platform.value for platform in Platform],
             runtime_environment__status=RuntimeEnvironment.Status.ACTIVE,
         ).filter(Q(valid_until__isnull=True) | Q(valid_until__gt=now)).order_by(
             "channel_account__account_code", "runtime_environment__environment_code"
         )
+        self.fields["binding"].label_from_instance = (
+            lambda binding: _binding_choice_label(binding, english=english)
+        )
+        if english:
+            self.fields["binding"].label = "Account and usage context"
+            self.fields["capability_code"].label = "Function"
+            self.fields["capability_code"].choices = [
+                (CapabilityState.MANUAL_PUBLISH, "Manual publishing")
+            ]
+            self.fields["state"].label = "Current availability"
+            self.fields["state"].choices = [
+                (CapabilityState.State.OPEN, "Available"),
+                (CapabilityState.State.CLOSED, "Disabled"),
+                (CapabilityState.State.UNKNOWN, "Not checked"),
+            ]
+            self.fields["reason"].label = "Note (optional)"
