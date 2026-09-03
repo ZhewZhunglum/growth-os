@@ -9,7 +9,7 @@
     {% if is_link_delivery %}<article><span class="task-label">{% ui '交付链接' 'Delivery link' %}</span><p>{{ asset_version.object_key }}</p><a class="button" href="{{ asset_version.object_key }}" target="_blank" rel="noopener noreferrer">{% ui '打开这份交付内容' 'Open delivery' %}</a></article>{% elif is_inline_delivery %}<article><span class="task-label">{% ui '系统内完整内容' 'Complete content in Growth OS' %}</span><p>{% ui '审核的是下方精确封存的正文，不是可变化的外部页面。' 'Review the exact sealed text below, not a changeable external page.' %}</p></article>{% else %}<article><span class="task-label">{% ui '旧版交付' 'Legacy delivery' %}</span><p>{% ui 'V1 已停止支持该旧文件交付。' 'V1 no longer supports this legacy file delivery.' %}</p></article>{% endif %}
     <article><span class="task-label">{% ui '版本清单类型' 'Manifest type' %}</span><p>{{ asset_version.mime_type }}</p></article>
     <article><span class="task-label">{% ui '内容 SHA-256' 'Content SHA-256' %}</span><p>{{ asset_version.content_sha256|truncatechars:22 }}</p></article>
-    <article><span class="task-label">{% ui '提交说明' 'Submission note' %}</span><p>{% if submission.submission_note %}{{ submission.submission_note }}{% else %}{% ui '未填写' 'Not provided' %}{% endif %}</p></article>
+    <article><span class="task-label">{% ui '提交说明' 'Submission note' %}</span><p>{% if submission.submission_note %}{{ submission.submission_note|audit_note_text }}{% else %}{% ui '未填写（旧记录）' 'Not provided (legacy record)' %}{% endif %}</p>{% with source_label=submission.submission_note|audit_note_source_label %}{% if source_label %}<small class="muted">{{ source_label }}</small>{% endif %}{% endwith %}</article>
 </section>
 {% if is_inline_delivery %}
 <section class="detail-panel spaced-panel">

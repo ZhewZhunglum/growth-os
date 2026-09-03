@@ -405,11 +405,27 @@ class ControlledTaskUiTests(TestCase):
         event = self.task.state_events.get(to_state=Task.State.CANCELLED)
         self.assertEqual(event.from_state, Task.State.DRAFT)
         self.assertEqual(event.permission_grant_id, self.owner_cancel_grant.pk)
-        self.assertEqual(event.reason, "Wrong product context selected during dogfood.")
+        self.assertEqual(
+            event.reason,
+            "[USER_PROVIDED] Wrong product context selected during dogfood.",
+        )
 
         today = self.client.get(reverse("dashboard:home"))
         self.assertNotIn(self.task.pk, {task.pk for task in today.context["tasks"]})
         self.assertNotContains(today, self.task.title)
+
+    def test_blank_draft_cancel_reason_is_audited_as_system_default(self):
+        self.client.force_login(self.owner)
+
+        response = self.client.post(
+            reverse("dashboard:task-action", args=[self.task.pk, "cancel"]),
+            self._command_data(self.task, reason="", confirm="on"),
+        )
+
+        self.assertRedirects(response, reverse("dashboard:home"))
+        event = self.task.state_events.get(to_state=Task.State.CANCELLED)
+        self.assertTrue(event.reason.startswith("[SYSTEM_DEFAULT] "))
+        self.assertIn("without an additional explanation", event.reason)
 
     def test_unassigned_operator_creator_with_cancel_grant_sees_and_uses_draft_removal(self):
         creator_task = self._new_task(self.outsider)
@@ -462,7 +478,10 @@ class ControlledTaskUiTests(TestCase):
         event = self.task.state_events.get(to_state=Task.State.CANCELLED)
         self.assertEqual(event.from_state, Task.State.READY)
         self.assertEqual(event.permission_grant_id, self.owner_cancel_grant.pk)
-        self.assertEqual(event.reason, "This ready task is no longer needed.")
+        self.assertEqual(
+            event.reason,
+            "[USER_PROVIDED] This ready task is no longer needed.",
+        )
 
     def test_operator_can_abandon_own_unreviewed_submission_directly_to_cancelled(self):
         operator_cancel = self._grant(self.operator, PermissionGrant.Action.CANCEL_TASK)
@@ -681,6 +700,36 @@ class ControlledTaskUiTests(TestCase):
         self.assertNotContains(response, "/actions/gate/")
         self.assertNotContains(response, "/actions/publish/")
 
+    def test_blank_delivery_and_withdrawal_notes_are_source_tagged_system_defaults(self):
+        self._assign_and_start()
+        response = self.client.post(
+            reverse("dashboard:task-action", args=[self.task.pk, "deliver"]),
+            self._command_data(
+                self.task,
+                external_url="https://example.com/optional-note-delivery",
+                submission_note="",
+                criterion__plain_language=TaskCheckRun.Result.PASS,
+            ),
+        )
+        self.assertEqual(response.status_code, 302)
+        submission = TaskSubmission.objects.get(task=self.task)
+        self.assertTrue(submission.submission_note.startswith("[SYSTEM_DEFAULT] "))
+
+        self.task.refresh_from_db()
+        withdrawn = self.client.post(
+            reverse("dashboard:task-action", args=[self.task.pk, "withdraw"]),
+            self._command_data(self.task, reason="", confirm="on"),
+        )
+
+        self.assertRedirects(
+            withdrawn,
+            reverse("dashboard:task-detail", args=[self.task.pk]),
+        )
+        event = self.task.state_events.get(
+            event_type=TaskStateEvent.EventType.SUBMISSION_WITHDRAWN
+        )
+        self.assertTrue(event.reason.startswith("[SYSTEM_DEFAULT] "))
+
     def test_delivery_domain_failure_rolls_back_all_database_facts(self):
         self._assign_and_start()
         with patch(
@@ -714,6 +763,8 @@ class ControlledTaskUiTests(TestCase):
         detail = self.client.get(reverse("dashboard:task-detail", args=[self.task.pk]))
         self.assertNotContains(detail, 'type="file"')
         self.assertNotContains(detail, "multipart/form-data")
+        self.assertNotContains(detail, "内容制作流程")
+        self.assertNotContains(detail, "需先保存完整正文")
         response = self.client.post(
             reverse("dashboard:task-action", args=[self.task.pk, "deliver"]),
             self._command_data(
@@ -913,6 +964,47 @@ class ControlledTaskUiTests(TestCase):
         self.assertEqual(self.task.current_assignee_principal_id, second_operator.pk)
         self.assertEqual(self.task.assignments.count(), 2)
 
+    def test_history_only_participant_can_read_detail_but_cannot_post_task_actions(self):
+        """A former assignee's history access is read-only at the endpoint boundary."""
+
+        self._grant_edit(self.outsider)
+        self._grant(self.outsider, PermissionGrant.Action.VIEW)
+        self._pass_dor()
+
+        assigned = self.client.post(
+            reverse("dashboard:task-action", args=[self.task.pk, "assign"]),
+            self._command_data(self.task, assignee=str(self.outsider.pk)),
+        )
+        self.assertEqual(assigned.status_code, 302)
+        self.task.refresh_from_db()
+        first_assignment = self.task.assignments.get()
+
+        reassigned = self.client.post(
+            reverse("dashboard:task-action", args=[self.task.pk, "reassign"]),
+            self._command_data(
+                self.task,
+                assignee=str(self.operator.pk),
+                expected_current_assignment_id=str(first_assignment.pk),
+            ),
+        )
+        self.assertEqual(reassigned.status_code, 302)
+        self.task.refresh_from_db()
+        state_version = self.task.state_version
+
+        self.client.force_login(self.outsider)
+        detail = self.client.get(reverse("dashboard:task-detail", args=[self.task.pk]))
+        self.assertEqual(detail.status_code, 200)
+
+        mutation = self.client.post(
+            reverse("dashboard:task-action", args=[self.task.pk, "start"]),
+            self._command_data(self.task),
+        )
+        self.assertEqual(mutation.status_code, 404)
+        self.task.refresh_from_db()
+        self.assertEqual(self.task.state_version, state_version)
+        self.assertEqual(self.task.current_assignee_principal_id, self.operator.pk)
+        self.assertEqual(self.task.assignments.count(), 2)
+
     def test_under_review_task_explains_independent_reviewer_and_cannot_be_reassigned(self):
         replacement = Principal.objects.create_user(
             username="late-replacement",
@@ -1028,6 +1120,112 @@ class ControlledTaskUiTests(TestCase):
         self.assertEqual(submission.primary_asset_version_id, version.pk)
         self.assertEqual(version.content_asset.versions.count(), 1)
         validate_manifest.assert_called_once_with(asset_version=version, lock=True)
+
+    def test_latest_inline_version_is_preselected_and_steps_are_explicit(self):
+        self._assign_and_start()
+        version = self._inline_content_version(body="Hook\n\nBody\n\nCTA")
+
+        detail = self.client.get(reverse("dashboard:task-detail", args=[self.task.pk]))
+
+        self.assertEqual(detail.status_code, 200)
+        self.assertEqual(
+            detail.context["action_form"].fields["content_version"].initial,
+            version,
+        )
+        self.assertContains(detail, "1. 生成或编辑正文")
+        self.assertContains(detail, "2. 保存内容版本")
+        self.assertContains(detail, "3. 检查并送审")
+        self.assertContains(detail, "完整内容已保存")
+        self.assertContains(detail, "封存这份内容并送审")
+
+    def test_delivery_rejects_content_version_from_another_task_without_partial_facts(self):
+        self._assign_and_start()
+        self._inline_content_version(body="Valid content for the current task")
+        other_task = self._new_task(self.owner)
+        other_asset = ContentAsset.create_idempotent(
+            task=other_task,
+            asset_key="publishable-content",
+            title="Other task content",
+            asset_kind=ContentAsset.AssetKind.COPY,
+            command_id=uuid.uuid4(),
+            actor_principal=self.operator,
+            acting_role=self.operator.role,
+            permission_grant=self.operator_grant,
+            recorded_by_principal=self.operator,
+        )
+        other_version = ContentAssetVersion.create_next(
+            content_asset=other_asset,
+            representation_kind=ContentAssetVersion.RepresentationKind.INLINE_TEXT,
+            inline_content="Complete content belonging to the other task",
+            mime_type="text/plain; charset=utf-8",
+            metadata={"source": "test"},
+            command_id=uuid.uuid4(),
+            actor_principal=self.operator,
+            acting_role=self.operator.role,
+            permission_grant=self.operator_grant,
+            recorded_by_principal=self.operator,
+        )
+
+        response = self.client.post(
+            reverse("dashboard:task-action", args=[self.task.pk, "deliver"]),
+            self._command_data(
+                self.task,
+                delivery_mode="SYSTEM_CONTENT",
+                content_version=str(other_version.pk),
+                submission_note="",
+                criterion__plain_language=TaskCheckRun.Result.PASS,
+            ),
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(TaskSubmission.objects.filter(task=self.task).exists())
+        self.assertFalse(self.task.check_runs.filter(check_kind=TaskCheckRun.Kind.DOD).exists())
+
+    def test_delivery_rejects_external_url_version_as_system_content(self):
+        self._assign_and_start()
+        self._inline_content_version(body="Valid current inline content")
+        asset = ContentAsset.create_idempotent(
+            task=self.task,
+            asset_key="legacy-external-content",
+            title="Legacy external content",
+            asset_kind=ContentAsset.AssetKind.COPY,
+            command_id=uuid.uuid4(),
+            actor_principal=self.operator,
+            acting_role=self.operator.role,
+            permission_grant=self.operator_grant,
+            recorded_by_principal=self.operator,
+        )
+        external_url = "https://example.com/changeable-copy"
+        external_bytes = external_url.encode("utf-8")
+        external_version = ContentAssetVersion.create_next(
+            content_asset=asset,
+            representation_kind=ContentAssetVersion.RepresentationKind.EXTERNAL_URL,
+            object_key=external_url,
+            mime_type="text/uri-list",
+            byte_size=len(external_bytes),
+            content_sha256=hashlib.sha256(external_bytes).hexdigest(),
+            metadata={"source": "test"},
+            command_id=uuid.uuid4(),
+            actor_principal=self.operator,
+            acting_role=self.operator.role,
+            permission_grant=self.operator_grant,
+            recorded_by_principal=self.operator,
+        )
+
+        response = self.client.post(
+            reverse("dashboard:task-action", args=[self.task.pk, "deliver"]),
+            self._command_data(
+                self.task,
+                delivery_mode="SYSTEM_CONTENT",
+                content_version=str(external_version.pk),
+                submission_note="",
+                criterion__plain_language=TaskCheckRun.Result.PASS,
+            ),
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(TaskSubmission.objects.filter(task=self.task).exists())
+        self.assertFalse(self.task.check_runs.filter(check_kind=TaskCheckRun.Kind.DOD).exists())
 
     @patch(
         "dashboard.views.validate_inline_content_evidence_manifest",

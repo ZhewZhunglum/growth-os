@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+from urllib.parse import urlencode
+
 from django.contrib import messages
 from django.contrib.auth.decorators import login_required
 from django.core.exceptions import PermissionDenied, ValidationError
 from django.http import HttpRequest, HttpResponse
 from django.shortcuts import get_object_or_404, redirect, render
+from django.urls import reverse
+from django.utils import timezone
 from django.views.decorators.http import require_POST
 
 from accounts.models import PermissionGrant
+from dailyops.forms import platform_label
 from dashboard.config_forms import (
     BindingForm,
     CapabilityForm,
@@ -22,7 +27,6 @@ from dashboard.config_forms import (
 )
 from dashboard.config_services import (
     add_profile_evidence_link,
-    create_binding_version,
     create_capability_version,
     create_channel_account,
     create_claim_matrix,
@@ -33,12 +37,25 @@ from dashboard.config_services import (
     require_product_configuration,
     require_runtime_configuration,
     seal_and_activate_profile,
+    set_current_account_environment,
 )
+from dashboard.runtime_summary import (
+    build_environment_summaries,
+    build_platform_summaries,
+    current_account_environments,
+    platform_anchor,
+)
+from integrations.connectors.types import Platform
 from products.models import Product, ProductProfileVersion
 from releasegate.models import AccountEnvironmentBinding, CapabilityState, ChannelAccount, RuntimeEnvironment
+from releasegate.runtime import inspect_manual_publish_context
 
 
 FORBIDDEN_INPUT_MARKERS = ("secret", "password", "api_key", "apikey", "access_key", "private_key", "upload")
+
+
+def _ui_text(language_code: str, zh: str, en: str) -> str:
+    return en if str(language_code or "").lower().startswith("en") else zh
 
 
 def _reject_secret_or_file_input(request: HttpRequest) -> None:
@@ -76,10 +93,31 @@ def configuration_home(request: HttpRequest) -> HttpResponse:
         require_runtime_configuration(request.user)
     except PermissionDenied:
         can_manage_runtime = False
+    runtime_overview = None
+    if can_manage_runtime:
+        platform_summaries = build_platform_summaries()
+        runtime_overview = {
+            "ready_execution_count": sum(
+                summary.ready for summary in platform_summaries if summary.kind == "EXECUTION"
+            ),
+            "execution_count": sum(summary.kind == "EXECUTION" for summary in platform_summaries),
+            "registered_analysis_count": sum(
+                summary.state == "REGISTERED"
+                for summary in platform_summaries
+                if summary.kind == "ANALYTICAL"
+            ),
+            "environment_count": RuntimeEnvironment.objects.filter(
+                status=RuntimeEnvironment.Status.ACTIVE
+            ).count(),
+        }
     return render(
         request,
         "dashboard/configuration_home.html",
-        {"products": products, "can_manage_runtime": can_manage_runtime},
+        {
+            "products": products,
+            "can_manage_runtime": can_manage_runtime,
+            "runtime_overview": runtime_overview,
+        },
     )
 
 
@@ -178,32 +216,187 @@ def product_configuration_action(request: HttpRequest, product_id, action: str) 
     return redirect("dashboard:product-configuration", product_id=product.pk)
 
 
-def _runtime_context(*, bound_form=None, bound_action="") -> dict:
+def _active_account(account_id) -> ChannelAccount | None:
+    if not account_id:
+        return None
+    try:
+        return ChannelAccount.objects.filter(
+            pk=account_id,
+            status=ChannelAccount.Status.ACTIVE,
+        ).first()
+    except (ValidationError, ValueError):
+        return None
+
+
+def _binding_history_rows(bindings, *, at) -> tuple[dict, ...]:
+    seen_pairs = set()
+    rows = []
+    for binding in bindings:
+        pair = (binding.channel_account_id, binding.runtime_environment_id)
+        is_latest = pair not in seen_pairs
+        seen_pairs.add(pair)
+        is_current = bool(
+            is_latest
+            and binding.status == AccountEnvironmentBinding.Status.ACTIVE
+            and binding.valid_from <= at
+            and (binding.valid_until is None or binding.valid_until > at)
+            and binding.channel_account.status == ChannelAccount.Status.ACTIVE
+            and binding.runtime_environment.status == RuntimeEnvironment.Status.ACTIVE
+        )
+        if is_current:
+            label_zh, label_en, state = "当前连接", "Current connection", "current"
+        elif is_latest:
+            label_zh, label_en, state = "最新记录（非当前连接）", "Latest record (not current)", "latest"
+        else:
+            label_zh, label_en, state = "历史版本", "Historical version", "history"
+        rows.append(
+            {
+                "binding": binding,
+                "label_zh": label_zh,
+                "label_en": label_en,
+                "state": state,
+                "is_current": is_current,
+            }
+        )
+    return tuple(rows)
+
+
+def _capability_history_rows(capabilities, *, current_binding_ids) -> tuple[dict, ...]:
+    seen_pairs = set()
+    rows = []
+    for capability in capabilities:
+        pair = (capability.account_environment_binding_id, capability.capability_code)
+        is_latest = pair not in seen_pairs
+        seen_pairs.add(pair)
+        if is_latest and capability.account_environment_binding_id in current_binding_ids:
+            label_zh, label_en, state = "当前连接的最新记录", "Latest record for current connection", "current"
+        elif is_latest:
+            label_zh, label_en, state = "历史连接的最新记录", "Latest record for historical connection", "latest"
+        else:
+            label_zh, label_en, state = "历史版本", "Historical version", "history"
+        rows.append(
+            {
+                "capability": capability,
+                "label_zh": label_zh,
+                "label_en": label_en,
+                "state": state,
+            }
+        )
+    return tuple(rows)
+
+
+def _runtime_advanced_context(
+    *,
+    language_code="",
+    bound_form=None,
+    bound_action="",
+    initial_account_id="",
+    initial_binding_id="",
+    open_action="",
+) -> dict:
+    focus_account = _active_account(initial_account_id)
+    binding_initial = {"channel_account": focus_account.pk} if focus_account else None
+    capability_initial = {"binding": initial_binding_id} if initial_binding_id else None
     forms = {
-        "account": ChannelAccountForm(),
-        "environment": RuntimeEnvironmentForm(initial={"object_storage_namespace": "DISABLED_LINK_ONLY"}),
-        "binding": BindingForm(),
-        "capability": CapabilityForm(),
+        "account": ChannelAccountForm(language_code=language_code),
+        "environment": RuntimeEnvironmentForm(
+            initial={"object_storage_namespace": "DISABLED_LINK_ONLY"},
+            language_code=language_code,
+        ),
+        "binding": BindingForm(initial=binding_initial, language_code=language_code),
+        "capability": CapabilityForm(initial=capability_initial, language_code=language_code),
     }
     if bound_form is not None and bound_action in forms:
         forms[bound_action] = bound_form
+    bindings = list(
+        AccountEnvironmentBinding.objects.select_related(
+            "channel_account", "runtime_environment"
+        ).order_by(
+            "channel_account__account_code",
+            "runtime_environment__environment_code",
+            "-binding_version",
+            "-created_at",
+            "-id",
+        )
+    )
+    capabilities = list(
+        CapabilityState.objects.select_related(
+            "account_environment_binding__channel_account",
+            "account_environment_binding__runtime_environment",
+        ).order_by(
+            "account_environment_binding_id",
+            "capability_code",
+            "-state_version",
+            "-created_at",
+            "-id",
+        )
+    )
+    at = timezone.now()
+    binding_history = _binding_history_rows(bindings, at=at)
+    current_binding_ids = {
+        row["binding"].pk for row in binding_history if row["is_current"]
+    }
     return {
         "forms": forms,
+        "open_action": open_action or bound_action,
+        "focus_account": focus_account,
+        "focus_platform_zh": platform_label(focus_account.platform_code) if focus_account else "",
+        "focus_platform_en": platform_label(focus_account.platform_code, english=True) if focus_account else "",
+        "focus_contexts": current_account_environments(focus_account, at=at) if focus_account else (),
         "accounts": ChannelAccount.objects.order_by("platform_code", "account_code"),
         "environments": RuntimeEnvironment.objects.order_by("environment_code"),
-        "bindings": AccountEnvironmentBinding.objects.select_related(
-            "channel_account", "runtime_environment"
-        ).order_by("channel_account__account_code", "runtime_environment__environment_code", "-binding_version"),
-        "capabilities": CapabilityState.objects.select_related(
-            "account_environment_binding__channel_account", "account_environment_binding__runtime_environment"
-        ).order_by("account_environment_binding_id", "capability_code", "-state_version"),
+        "binding_history": binding_history,
+        "capability_history": _capability_history_rows(
+            capabilities,
+            current_binding_ids=current_binding_ids,
+        ),
+    }
+
+
+def _runtime_summary_context(*, focus_platform="") -> dict:
+    summaries = build_platform_summaries()
+    execution = tuple(summary for summary in summaries if summary.kind == "EXECUTION")
+    analytical = tuple(summary for summary in summaries if summary.kind == "ANALYTICAL")
+    environments = build_environment_summaries()
+    return {
+        "execution_platforms": execution,
+        "analytical_platforms": analytical,
+        "environment_summaries": environments,
+        "ready_execution_count": sum(summary.ready for summary in execution),
+        "execution_count": len(execution),
+        "registered_analysis_count": sum(summary.state == "REGISTERED" for summary in analytical),
+        "focus_platform": focus_platform,
     }
 
 
 @login_required
 def runtime_configuration(request: HttpRequest) -> HttpResponse:
     require_runtime_configuration(request.user)
-    return render(request, "dashboard/runtime_configuration.html", _runtime_context())
+    focus_platform = str(request.GET.get("platform") or "").upper()
+    return render(
+        request,
+        "dashboard/runtime_configuration.html",
+        _runtime_summary_context(focus_platform=focus_platform),
+    )
+
+
+@login_required
+def runtime_configuration_advanced(request: HttpRequest) -> HttpResponse:
+    require_runtime_configuration(request.user)
+    account_id = request.GET.get("account", "")
+    initial_binding_id = request.GET.get("binding", "")
+    requested_step = request.GET.get("step", "")
+    open_action = "capability" if requested_step == "capability" else ("binding" if account_id else "")
+    return render(
+        request,
+        "dashboard/runtime_configuration_advanced.html",
+        _runtime_advanced_context(
+            language_code=request.LANGUAGE_CODE,
+            initial_account_id=account_id,
+            initial_binding_id=initial_binding_id,
+            open_action=open_action,
+        ),
+    )
 
 
 @login_required
@@ -219,36 +412,112 @@ def runtime_configuration_action(request: HttpRequest, action: str) -> HttpRespo
     form_class = forms.get(action)
     if form_class is None:
         raise PermissionDenied("未知运行配置动作。")
-    form = form_class(request.POST)
+    form = form_class(request.POST, language_code=request.LANGUAGE_CODE)
     try:
         _reject_secret_or_file_input(request)
         if not form.is_valid():
             return render(
                 request,
-                "dashboard/runtime_configuration.html",
-                _runtime_context(bound_form=form, bound_action=action),
+                "dashboard/runtime_configuration_advanced.html",
+                _runtime_advanced_context(
+                    language_code=request.LANGUAGE_CODE,
+                    bound_form=form,
+                    bound_action=action,
+                    initial_account_id=request.POST.get("channel_account", "") if action == "binding" else "",
+                    initial_binding_id=request.POST.get("binding", "") if action == "capability" else "",
+                ),
                 status=400,
             )
         data = dict(form.cleaned_data)
         if action == "account":
             create_channel_account(actor=request.user, **data)
-            message = "渠道账号已登记（系统没有保存密码或密钥）。"
+            message = _ui_text(
+                request.LANGUAGE_CODE,
+                "渠道账号已登记（系统没有保存密码或密钥）。",
+                "Channel account registered. No password or key was stored.",
+            )
         elif action == "environment":
             create_runtime_environment(actor=request.user, **data)
-            message = "运行环境已登记（只保存空间名称）。"
+            message = _ui_text(
+                request.LANGUAGE_CODE,
+                "使用场景已登记（只保存空间名称）。",
+                "Usage context registered. Only namespace names were stored.",
+            )
         elif action == "binding":
-            create_binding_version(actor=request.user, **data)
-            message = "新的账号环境绑定版本已追加，旧快照未修改。"
+            data.pop("confirm_replace", None)
+            change = set_current_account_environment(actor=request.user, **data)
+            post_change = inspect_manual_publish_context(change.binding.channel_account)
+            if change.created_target_version:
+                message = _ui_text(
+                    request.LANGUAGE_CODE,
+                    "当前使用场景已切换，其他连接已追加为撤销记录。请继续第 4 步重新确认人工发布状态。",
+                    "Current usage context switched and other connections received Revoked records. "
+                    "Continue to Step 4 to confirm manual-publishing availability again.",
+                )
+            elif change.revoked_count and post_change.ready:
+                message = _ui_text(
+                    request.LANGUAGE_CODE,
+                    "已保留所选使用场景，并安全结束其他当前连接；原有可用状态继续有效。",
+                    "The selected usage context was kept and other current connections were safely ended; "
+                    "its existing availability remains valid.",
+                )
+            elif change.revoked_count:
+                message = _ui_text(
+                    request.LANGUAGE_CODE,
+                    "已保留所选使用场景并安全结束其他连接；请继续第 4 步确认人工发布是否可用。",
+                    "The selected usage context was kept and other connections were safely ended. "
+                    "Continue to Step 4 to confirm manual-publishing availability.",
+                )
+            elif post_change.ready:
+                message = _ui_text(
+                    request.LANGUAGE_CODE,
+                    "所选使用场景已经是当前连接，没有创建重复记录。",
+                    "The selected usage context is already current; no duplicate record was created.",
+                )
+            else:
+                message = _ui_text(
+                    request.LANGUAGE_CODE,
+                    "所选使用场景已经是当前连接；请继续第 4 步确认人工发布是否可用。",
+                    "The selected usage context is already current. Continue to Step 4 to confirm "
+                    "manual-publishing availability.",
+                )
         else:
             create_capability_version(actor=request.user, **data)
-            message = "新的能力状态版本已追加，旧快照未修改。"
+            message = _ui_text(
+                request.LANGUAGE_CODE,
+                "新的可用状态版本已追加，旧快照未修改。",
+                "A new availability version was appended; the earlier snapshot was not changed.",
+            )
     except (PermissionDenied, ValidationError) as error:
         form.add_error(None, error)
         return render(
             request,
-            "dashboard/runtime_configuration.html",
-            _runtime_context(bound_form=form, bound_action=action),
+            "dashboard/runtime_configuration_advanced.html",
+            _runtime_advanced_context(
+                language_code=request.LANGUAGE_CODE,
+                bound_form=form,
+                bound_action=action,
+                initial_account_id=request.POST.get("channel_account", "") if action == "binding" else "",
+                initial_binding_id=request.POST.get("binding", "") if action == "capability" else "",
+            ),
             status=400,
         )
     messages.success(request, message)
-    return redirect("dashboard:runtime-configuration")
+    if action == "binding":
+        if change.created_target_version or not post_change.ready:
+            query = urlencode(
+                {
+                    "account": str(change.binding.channel_account_id),
+                    "binding": str(change.binding.pk),
+                    "step": "capability",
+                }
+            )
+            return redirect(
+                f'{reverse("dashboard:runtime-configuration-advanced")}?{query}#advanced-capability'
+            )
+        platform = Platform(change.binding.channel_account.platform_code)
+        query = urlencode({"platform": platform.value})
+        return redirect(
+            f'{reverse("dashboard:runtime-configuration")}?{query}#{platform_anchor(platform)}'
+        )
+    return redirect("dashboard:runtime-configuration-advanced")

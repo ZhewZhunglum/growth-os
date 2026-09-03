@@ -60,7 +60,7 @@
             <div><p class="task-meta">{{ review.submission.task.product.name }}</p><h3>{{ review.submission.task.title }}</h3></div>
             <span class="task-state">{% ui_review_decision review.decision %}</span>
         </header>
-        <div class="task-section"><span class="task-label">{% ui '审核说明' 'Review notes' %}</span><p>{% if review.rationale %}{{ review.rationale }}{% else %}{% ui '未填写审核说明' 'No review notes' %}{% endif %}</p></div>
+        <div class="task-section"><span class="task-label">{% ui '审核说明' 'Review notes' %}</span><p>{{ review.rationale|audit_note_text }}</p>{% with source_label=review.rationale|audit_note_source_label %}{% if source_label %}<small class="muted">{{ source_label }}</small>{% endif %}{% endwith %}</div>
         <footer class="task-card-footer"><span>{% ui '审核时间' 'Reviewed at' %}: {{ review.decided_at }}</span><a class="button button-secondary" href="{% url 'dashboard:review-history-detail' review.id %}">{% ui '查看只读记录' 'View read-only record' %}</a></footer>
     </article>
     {% empty %}

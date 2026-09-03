@@ -4,9 +4,12 @@ import uuid
 import tempfile
 from datetime import timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 from django.core.exceptions import ImproperlyConfigured, PermissionDenied, ValidationError
-from django.test import TestCase
+from django.db import connection
+from django.test import TestCase, TransactionTestCase
+from django.urls import reverse
 from django.utils import timezone
 
 from accounts.models import PermissionGrant, Principal, SecretReference
@@ -14,8 +17,11 @@ from dailyops.deployment import (
     build_deployment_daily_operations_runtime,
     build_web_daily_operations_runtime,
 )
+from dailyops.disposition import dispose_daily_batch
 from dailyops.runtime import ConnectorBatchResult, DailyOperationsRuntime, build_daily_operations_runtime
 from dailyops.services import (
+    accept_daily_analysis,
+    correct_manual_evidence,
     ingest_csv_text,
     ingest_manual_link,
     propose_daily_analysis,
@@ -29,8 +35,10 @@ from integrations.connectors.types import (
     ConnectorRunStatus,
     Platform,
 )
+from intelligence.exceptions import CommandReplayConflict
 from intelligence.models import (
     CollectionRun,
+    EvidenceInvalidationEvent,
     EvidenceArtifactLink,
     ExternalEvidenceItem,
     RawArtifact,
@@ -157,6 +165,43 @@ class DailyCollectionServiceTests(TestCase):
             action=PermissionGrant.Action.COLLECT_READ_ONLY,
             effect=PermissionGrant.Effect.DENY,
             risk_level=PermissionGrant.RiskLevel.LOW,
+            valid_from=now - timedelta(minutes=1),
+            valid_until=now + timedelta(days=1),
+            granted_by_principal=self.owner,
+        )
+
+    def test_offline_proposal_title_uses_the_batch_question(self):
+        batch_key = self._batch()
+        ingest_manual_link(
+            batch_key=batch_key,
+            product=self.product,
+            platform=Platform.TIKTOK,
+            operation_key=uuid.uuid4(),
+            external_url="https://www.tiktok.com/@puko/video/query-title",
+            external_content_id="query-title",
+            title="An evidence title that must not replace the question",
+            content_text="A provenance-linked offline test item.",
+            collected_at=timezone.now(),
+            principal=self.owner,
+            acting_role=self.owner.role,
+        )
+
+        proposal = propose_daily_analysis(
+            batch_key=batch_key,
+            product=self.product,
+            principal=self.owner,
+            acting_role=self.owner.role,
+        )
+
+        self.assertEqual(proposal.value["topic_label"], "afternoon focus")
+
+    def _grant_batch_cancellation(self) -> PermissionGrant:
+        now = timezone.now()
+        return PermissionGrant.objects.create(
+            principal=self.owner,
+            scope_kind=PermissionGrant.ScopeKind.PRODUCT,
+            product=self.product,
+            action=PermissionGrant.Action.CANCEL_TASK,
             valid_from=now - timedelta(minutes=1),
             valid_until=now + timedelta(days=1),
             granted_by_principal=self.owner,
@@ -304,6 +349,285 @@ class DailyCollectionServiceTests(TestCase):
             {"THIRD_PARTY_API", "BROWSER"},
         )
 
+    def test_human_accepted_batch_never_invokes_any_connector(self):
+        batch_key = self._batch()
+        ingest_manual_link(
+            batch_key=batch_key,
+            product=self.product,
+            platform=Platform.TIKTOK,
+            operation_key=uuid.uuid4(),
+            external_url="https://www.tiktok.com/@puko/video/frozen-batch",
+            external_content_id="frozen-batch",
+            title="Accepted evidence",
+            content_text="This exact evidence has already received a human decision.",
+            collected_at=timezone.now(),
+            principal=self.owner,
+            acting_role=self.owner.role,
+        )
+        proposal = propose_daily_analysis(
+            batch_key=batch_key,
+            product=self.product,
+            principal=self.owner,
+            acting_role=self.owner.role,
+        )
+        accept_daily_analysis(
+            proposal=proposal,
+            product=self.product,
+            principal=self.owner,
+            acting_role=self.owner.role,
+        )
+        original_run_count = CollectionRun.objects.filter(batch_key=batch_key).count()
+        runner = StaticSevenPlatformRunner()
+        base_runtime = build_daily_operations_runtime()
+        runtime = DailyOperationsRuntime(
+            ai_provider=base_runtime.ai_provider,
+            connectors=runner,
+            live_ai_enabled=False,
+            ai_model=base_runtime.ai_model,
+        )
+
+        with self.assertRaisesMessage(ValidationError, "这次建议已经由人工采用"):
+            run_automatic_collection(
+                batch_key=batch_key,
+                product=self.product,
+                command_id=uuid.uuid4(),
+                principal=self.owner,
+                acting_role=self.owner.role,
+                runtime=runtime,
+            )
+        with self.assertRaisesMessage(ValidationError, "这次建议已经由人工采用"):
+            run_platform_collection(
+                batch_key=batch_key,
+                product=self.product,
+                command_id=uuid.uuid4(),
+                platform=Platform.PINTEREST,
+                principal=self.owner,
+                acting_role=self.owner.role,
+                runtime=runtime,
+            )
+
+        self.assertEqual(runner.calls, 0)
+        self.assertEqual(
+            CollectionRun.objects.filter(batch_key=batch_key).count(),
+            original_run_count,
+        )
+
+    def test_manual_fallback_replay_binds_full_normalized_payload(self):
+        batch_key = self._batch()
+        operation_key = uuid.uuid4()
+        collected_at = timezone.now()
+        call = {
+            "batch_key": batch_key,
+            "product": self.product,
+            "platform": Platform.TIKTOK,
+            "operation_key": operation_key,
+            "external_url": "https://www.tiktok.com/@puko/video/exact-payload",
+            "external_content_id": "exact-payload",
+            "title": "Original title",
+            "content_text": "Original notes bound to this command.",
+            "collected_at": collected_at,
+            "principal": self.owner,
+            "acting_role": self.owner.role,
+        }
+
+        first = ingest_manual_link(**call)
+        replay = ingest_manual_link(**call)
+
+        self.assertEqual(first.run.pk, replay.run.pk)
+        self.assertEqual(replay.created_count, 0)
+        self.assertEqual(
+            len(first.run.query_spec["fallback_payload_bindings"]),
+            1,
+        )
+        changed = dict(call, title="Changed title with the same natural key")
+        with self.assertRaisesMessage(CommandReplayConflict, "different fallback evidence content"):
+            ingest_manual_link(**changed)
+        changed = dict(call, content_text="Changed notes with the same URL and timestamp.")
+        with self.assertRaisesMessage(CommandReplayConflict, "different fallback evidence content"):
+            ingest_manual_link(**changed)
+
+        self.assertEqual(CollectionRun.objects.filter(operation_key=operation_key).count(), 1)
+        self.assertEqual(
+            ExternalEvidenceItem.objects.filter(collection_run=first.run).count(),
+            1,
+        )
+
+    def test_csv_fallback_replay_binds_custom_attributes(self):
+        batch_key = self._batch()
+        operation_key = uuid.uuid4()
+        collected_at = timezone.now().isoformat()
+        original_csv = (
+            "url,title,collected_at,trend_score\n"
+            f"https://example.com/pin/exact,Exact pin,{collected_at},42"
+        )
+        call = {
+            "batch_key": batch_key,
+            "product": self.product,
+            "platform": Platform.PINTEREST,
+            "operation_key": operation_key,
+            "csv_text": original_csv,
+            "principal": self.owner,
+            "acting_role": self.owner.role,
+        }
+
+        first = ingest_csv_text(**call)
+        replay = ingest_csv_text(**call)
+        self.assertEqual(first.run.pk, replay.run.pk)
+        self.assertEqual(replay.created_count, 0)
+
+        changed_csv = original_csv.rsplit(",42", 1)[0] + ",99"
+        with self.assertRaisesMessage(CommandReplayConflict, "different fallback evidence content"):
+            ingest_csv_text(**dict(call, csv_text=changed_csv))
+
+        self.assertEqual(CollectionRun.objects.filter(operation_key=operation_key).count(), 1)
+        self.assertEqual(
+            ExternalEvidenceItem.objects.filter(collection_run=first.run).count(),
+            1,
+        )
+
+    def test_correction_command_replay_binds_replacement_content(self):
+        batch_key = self._batch()
+        original = ingest_manual_link(
+            batch_key=batch_key,
+            product=self.product,
+            platform=Platform.TIKTOK,
+            operation_key=uuid.uuid4(),
+            external_url="https://www.tiktok.com/@puko/video/original-entry",
+            external_content_id="original-entry",
+            title="Original entry",
+            content_text="This is the immutable original entry.",
+            collected_at=timezone.now(),
+            principal=self.owner,
+            acting_role=self.owner.role,
+        ).evidence[0]
+        command_id = uuid.uuid4()
+        replacement_time = timezone.now() + timedelta(seconds=1)
+        call = {
+            "evidence_id": original.pk,
+            "batch_key": batch_key,
+            "product": self.product,
+            "command_id": command_id,
+            "platform": Platform.TIKTOK,
+            "external_url": "https://www.tiktok.com/@puko/video/corrected-entry",
+            "external_content_id": "corrected-entry",
+            "title": "Corrected entry",
+            "content_text": "This is the exact corrected content.",
+            "collected_at": replacement_time,
+            "reason": "The original entry contained a transcription error.",
+            "principal": self.owner,
+            "acting_role": self.owner.role,
+        }
+
+        first = correct_manual_evidence(**call)
+        replay = correct_manual_evidence(**call)
+
+        self.assertTrue(first.invalidation.created)
+        self.assertFalse(replay.invalidation.created)
+        self.assertEqual(first.replacement.run.pk, replay.replacement.run.pk)
+        self.assertEqual(replay.replacement.created_count, 0)
+        with self.assertRaisesMessage(CommandReplayConflict, "different fallback evidence content"):
+            correct_manual_evidence(
+                **dict(call, content_text="Changed correction under the same command."),
+            )
+
+        self.assertEqual(
+            EvidenceInvalidationEvent.objects.filter(evidence_item=original).count(),
+            1,
+        )
+        self.assertEqual(
+            ExternalEvidenceItem.objects.filter(collection_run__batch_key=batch_key).count(),
+            2,
+        )
+
+    def test_disposed_batch_never_invokes_any_connector(self):
+        batch_key = self._batch()
+        self._grant_batch_cancellation()
+        dispose_daily_batch(
+            batch_key=batch_key,
+            product=self.product,
+            command_id=uuid.uuid4(),
+            reason="This draft is no longer active.",
+            principal=self.owner,
+            acting_role=self.owner.role,
+        )
+        original_run_count = CollectionRun.objects.filter(batch_key=batch_key).count()
+        runner = StaticSevenPlatformRunner()
+        base_runtime = build_daily_operations_runtime()
+        runtime = DailyOperationsRuntime(
+            ai_provider=base_runtime.ai_provider,
+            connectors=runner,
+            live_ai_enabled=False,
+            ai_model=base_runtime.ai_model,
+        )
+
+        with self.assertRaisesMessage(ValidationError, "已经删除草稿或归档"):
+            run_automatic_collection(
+                batch_key=batch_key,
+                product=self.product,
+                command_id=uuid.uuid4(),
+                principal=self.owner,
+                acting_role=self.owner.role,
+                runtime=runtime,
+            )
+        with self.assertRaisesMessage(ValidationError, "已经删除草稿或归档"):
+            run_platform_collection(
+                batch_key=batch_key,
+                product=self.product,
+                command_id=uuid.uuid4(),
+                platform=Platform.PINTEREST,
+                principal=self.owner,
+                acting_role=self.owner.role,
+                runtime=runtime,
+            )
+
+        self.assertEqual(runner.calls, 0)
+        self.assertEqual(
+            CollectionRun.objects.filter(batch_key=batch_key).count(),
+            original_run_count,
+        )
+
+    def test_disposition_while_connector_runs_prevents_any_persistence(self):
+        batch_key = self._batch()
+        self._grant_batch_cancellation()
+        original_run_count = CollectionRun.objects.filter(batch_key=batch_key).count()
+
+        class DisposingRunner(StaticSevenPlatformRunner):
+            def run(inner_self, requests):
+                dispose_daily_batch(
+                    batch_key=batch_key,
+                    product=self.product,
+                    command_id=uuid.uuid4(),
+                    reason="The batch was abandoned while the connector was running.",
+                    principal=self.owner,
+                    acting_role=self.owner.role,
+                )
+                return super().run(requests)
+
+        runner = DisposingRunner()
+        base_runtime = build_daily_operations_runtime()
+        runtime = DailyOperationsRuntime(
+            ai_provider=base_runtime.ai_provider,
+            connectors=runner,
+            live_ai_enabled=False,
+            ai_model=base_runtime.ai_model,
+        )
+
+        with self.assertRaisesMessage(ValidationError, "已经删除草稿或归档"):
+            run_automatic_collection(
+                batch_key=batch_key,
+                product=self.product,
+                command_id=uuid.uuid4(),
+                principal=self.owner,
+                acting_role=self.owner.role,
+                runtime=runtime,
+            )
+
+        self.assertEqual(runner.calls, 1)
+        self.assertEqual(
+            CollectionRun.objects.filter(batch_key=batch_key).count(),
+            original_run_count,
+        )
+
     def test_evidence_set_change_creates_new_ai_proposal_version(self):
         batch_key = self._batch()
         first_time = timezone.now()
@@ -388,6 +712,107 @@ class DailyCollectionServiceTests(TestCase):
                 acting_role=self.owner.role,
             )
         self.assertFalse(SignalAssessment.objects.exists())
+
+
+class ConnectorViewTransactionBoundaryTests(TransactionTestCase):
+    """The HTTP layer must not keep a transaction open across a connector."""
+
+    def setUp(self):
+        self.owner = Principal.objects.create_user(
+            username="connector-view-owner",
+            password="safe-local-password-123",
+            role=Principal.Role.OWNER,
+        )
+        self.product = Product.objects.create(
+            product_code="PUKO-CONNECTOR-VIEW",
+            name="PUKO Connector View",
+            market_code="US",
+            language_code="en",
+            created_by_principal=self.owner,
+            updated_by_principal=self.owner,
+        )
+        now = timezone.now()
+        for action in (
+            PermissionGrant.Action.VIEW,
+            PermissionGrant.Action.EDIT,
+            PermissionGrant.Action.MANAGE_ACCOUNT,
+            PermissionGrant.Action.COLLECT_READ_ONLY,
+        ):
+            product_scoped = action in {
+                PermissionGrant.Action.VIEW,
+                PermissionGrant.Action.EDIT,
+            }
+            PermissionGrant.objects.create(
+                principal=self.owner,
+                scope_kind=(
+                    PermissionGrant.ScopeKind.PRODUCT
+                    if product_scoped
+                    else PermissionGrant.ScopeKind.GLOBAL
+                ),
+                product=self.product if product_scoped else None,
+                action=action,
+                risk_level=(
+                    PermissionGrant.RiskLevel.HIGH
+                    if action == PermissionGrant.Action.MANAGE_ACCOUNT
+                    else PermissionGrant.RiskLevel.LOW
+                ),
+                valid_from=now - timedelta(minutes=1),
+                valid_until=now + timedelta(days=1),
+                granted_by_principal=self.owner,
+            )
+        from dailyops.services import ensure_default_sources
+
+        ensure_default_sources(principal=self.owner, acting_role=self.owner.role)
+        self.client.force_login(self.owner)
+
+    def _batch(self):
+        now = timezone.now()
+        batch_key = uuid.uuid4()
+        start_daily_batch(
+            batch_key=batch_key,
+            product=self.product,
+            query="transaction boundary",
+            window_start=now - timedelta(days=7),
+            window_end=now,
+            principal=self.owner,
+            acting_role=self.owner.role,
+        )
+        return batch_key
+
+    def test_web_connector_calls_run_outside_database_transaction(self):
+        batch_key = self._batch()
+
+        class TransactionBoundaryRunner(StaticSevenPlatformRunner):
+            def run(self, requests):
+                if connection.in_atomic_block:
+                    raise AssertionError("connector was invoked inside a database transaction")
+                return super().run(requests)
+
+        runner = TransactionBoundaryRunner()
+        base_runtime = build_daily_operations_runtime()
+        runtime = DailyOperationsRuntime(
+            ai_provider=base_runtime.ai_provider,
+            connectors=runner,
+            live_ai_enabled=False,
+            ai_model=base_runtime.ai_model,
+        )
+        with patch("dailyops.views.build_web_daily_operations_runtime", return_value=runtime):
+            automatic = self.client.post(
+                reverse("dailyops:automatic-collect", args=[self.product.pk, batch_key]),
+                {"command_id": str(uuid.uuid4())},
+            )
+            platform = self.client.post(
+                reverse(
+                    "dailyops:platform-collect",
+                    args=[self.product.pk, batch_key, Platform.PINTEREST.value],
+                ),
+                {"command_id": str(uuid.uuid4())},
+            )
+
+        self.assertEqual(automatic.status_code, 302)
+        self.assertEqual(platform.status_code, 200)
+        self.assertTrue(platform.json()["ok"])
+        self.assertEqual(runner.calls, 2)
 
 
 class DeploymentCompositionTests(TestCase):

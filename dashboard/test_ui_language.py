@@ -78,8 +78,24 @@ class PresentationLanguageTests(TestCase):
         self.assertContains(response, "View and manage access")
 
         response = self.client.get(reverse("dashboard:configuration-home"))
-        self.assertContains(response, "Prepare real products, rules, and accounts")
-        self.assertContains(response, "Products I can configure")
+        self.assertContains(response, "Choose what you want to manage")
+        self.assertContains(response, "Channels and data connections")
+        self.assertContains(response, "Products I can manage")
+        self.assertContains(response, "Execution channels ready: ")
+        self.assertNotContains(response, "Execution channels ready：")
+
+        response = self.client.get(reverse("dashboard:runtime-configuration"))
+        self.assertContains(response, "Which channels are ready now?")
+        self.assertContains(response, "Execution channels")
+        self.assertContains(response, "Analysis sources")
+        self.assertContains(response, "Usage contexts")
+
+        response = self.client.get(reverse("dashboard:runtime-configuration-advanced"))
+        self.assertContains(response, "Advanced settings and audit")
+        self.assertContains(response, "Add a platform account")
+        self.assertContains(response, "Usage-context name")
+        self.assertContains(response, "Shopify store")
+        self.assertNotContains(response, "Shopify / 独立站")
 
     def test_language_switch_requires_csrf(self):
         csrf_client = Client(enforce_csrf_checks=True)
@@ -100,6 +116,28 @@ class PresentationLanguageTests(TestCase):
             },
         )
         self.assertEqual(response.status_code, 302)
+
+    def test_runtime_configuration_success_message_uses_selected_english_language(self):
+        self.client.force_login(self.user)
+        self.client.post(
+            reverse("set_language"),
+            {"language": "en", "next": reverse("dashboard:runtime-configuration-advanced")},
+        )
+
+        response = self.client.post(
+            reverse("dashboard:runtime-configuration-action", args=["account"]),
+            {
+                "platform_code": "TIKTOK",
+                "account_code": "language-test-tiktok",
+                "external_account_ref": "language-test-external",
+                "display_name": "Language Test TikTok",
+                "status": "ACTIVE",
+            },
+            follow=True,
+        )
+
+        self.assertContains(response, "Channel account registered. No password or key was stored.")
+        self.assertNotContains(response, "渠道账号已登记")
 
     def test_external_next_url_is_not_used(self):
         response = self.client.post(

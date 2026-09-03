@@ -42,11 +42,15 @@ GEO_PANEL_MANAGER_ROLES = {
 LOCAL_TEST_GEO_PANEL_KEY = "local-test-puko-geo"
 
 
-def _is_local_test_geo_item(item: GEOProbePanelItem) -> bool:
+def is_local_test_geo_item(item: GEOProbePanelItem) -> bool:
     return bool(
         item.panel.panel_key == LOCAL_TEST_GEO_PANEL_KEY
         or (item.intent or "").upper().startswith("LOCAL_")
     )
+
+
+# Backward-compatible private name for the existing internal callers.
+_is_local_test_geo_item = is_local_test_geo_item
 
 
 def _sha256(payload) -> str:
@@ -349,6 +353,7 @@ def record_geo_result(
     operation_key: str,
 ):
     product = panel_item.panel.product
+    is_test_seed = is_local_test_geo_item(panel_item)
     grant = _product_grant(
         actor=actor,
         product=product,
@@ -384,6 +389,10 @@ def record_geo_result(
                 "payload_sha256": payload_hash,
                 "permission_grant_id": str(grant.pk),
                 "interface": "feedback-ui",
+                "is_local_test_seed": is_test_seed,
+                "question_source": (
+                    "LOCAL_SYSTEM_PRESET" if is_test_seed else "FORMAL_PANEL"
+                ),
             },
             status=(
                 GEOProbeRun.Status.COMPLETED
@@ -412,6 +421,14 @@ def record_geo_result(
                 cited_domain=host,
             )
 
+        # A local system preset is a UI practice run, not business evidence.
+        # Keep the clearly tagged question/answer fact so the person can learn
+        # the workflow, but do not create a formal metric run or observation.
+        # This makes it structurally impossible for the practice result to
+        # enter Demand, Performance, formal GEO, or Learning evidence chains.
+        if is_test_seed:
+            return result
+
         metric = _metric(
             key="geo-brand-mentioned",
             name="GEO 回答提及品牌",
@@ -428,6 +445,10 @@ def record_geo_result(
                 "payload_sha256": payload_hash,
                 "permission_grant_id": str(grant.pk),
                 "interface": "feedback-ui",
+                "is_local_test_seed": is_test_seed,
+                "question_source": (
+                    "LOCAL_SYSTEM_PRESET" if is_test_seed else "FORMAL_PANEL"
+                ),
             },
             window_start=now,
             window_end=now + timedelta(microseconds=1),

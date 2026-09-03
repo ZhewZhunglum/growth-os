@@ -3,6 +3,7 @@ from __future__ import annotations
 from django.contrib import messages
 from django.contrib.auth.decorators import login_required
 from django.core.exceptions import PermissionDenied, ValidationError
+from django.db.models import Q
 from django.shortcuts import redirect, render
 from django.views.decorators.http import require_http_methods, require_POST
 
@@ -30,6 +31,7 @@ from .services import (
     propose_learning,
     record_geo_result,
     record_performance_rows,
+    is_local_test_geo_item,
 )
 
 
@@ -122,6 +124,19 @@ def _forms_for(
     geo_results = GEOProbeResult.objects.filter(
         probe_run__created_by_principal=request.user
     )
+    local_test_filter = (
+        Q(panel_item__panel__panel_key=LOCAL_TEST_GEO_PANEL_KEY)
+        | Q(panel_item__intent__istartswith="LOCAL_")
+    )
+    formal_geo_results = geo_results.exclude(local_test_filter)
+    geo_question_details = [
+        {
+            "id": str(item.pk),
+            "question": item.question,
+            "is_test_seed": is_local_test_geo_item(item),
+        }
+        for item in geo_form.fields["panel_item"].queryset.select_related("panel")
+    ]
     return {
         "manual_form": manual or PerformanceManualForm(actor=request.user, language_code=language_code),
         "csv_form": csv_form or PerformanceCsvForm(actor=request.user, language_code=language_code),
@@ -134,6 +149,7 @@ def _forms_for(
         "has_local_test_geo": geo_form.fields["panel_item"].queryset.filter(
             panel__panel_key=LOCAL_TEST_GEO_PANEL_KEY
         ).exists(),
+        "geo_question_details": geo_question_details,
         "learning_form": learning or LearningProposalForm(
             actor=request.user,
             evidence_choices=choices,
@@ -148,7 +164,7 @@ def _forms_for(
             "publication__current_gate__channel_account",
             "metric_definition",
         ).order_by("-created_at")[:12],
-        "recent_geo": geo_results.select_related(
+        "recent_geo": formal_geo_results.select_related(
             "panel_item__panel__product", "probe_run"
         ).prefetch_related("citations").order_by("-recorded_at")[:12],
         "recent_learning": LearningVersion.objects.filter(
@@ -158,10 +174,15 @@ def _forms_for(
             ChannelPerformanceObservation.objects.filter(recorded_by_principal=request.user).count()
             + PublicationPerformanceObservation.objects.filter(recorded_by_principal=request.user).count()
         ),
-        "geo_count": GEOMetricObservation.objects.filter(recorded_by_principal=request.user).count(),
-        "geo_result_count": geo_results.count(),
-        "geo_mention_count": geo_results.filter(brand_mentioned=True).count(),
-        "geo_citation_count": geo_results.filter(citations__isnull=False).distinct().count(),
+        "geo_count": GEOMetricObservation.objects.filter(
+            recorded_by_principal=request.user
+        ).exclude(
+            Q(probe_result__panel_item__panel__panel_key=LOCAL_TEST_GEO_PANEL_KEY)
+            | Q(probe_result__panel_item__intent__istartswith="LOCAL_")
+        ).count(),
+        "geo_result_count": formal_geo_results.count(),
+        "geo_mention_count": formal_geo_results.filter(brand_mentioned=True).count(),
+        "geo_citation_count": formal_geo_results.filter(citations__isnull=False).distinct().count(),
         "learning_count": LearningVersion.objects.filter(created_by_principal=request.user).count(),
     }
 

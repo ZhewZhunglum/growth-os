@@ -34,6 +34,7 @@ class FeatureGroup:
 class FeatureCenter:
     groups: tuple[FeatureGroup, ...]
     can_open_geo: bool
+    can_open_settings: bool
 
 
 def _safe_reverse(name: str, *, fragment: str = "") -> str:
@@ -80,7 +81,7 @@ def build_feature_center(
     """
 
     if not getattr(user, "is_authenticated", False) or not user.can_authenticate:
-        return FeatureCenter(groups=(), can_open_geo=False)
+        return FeatureCenter(groups=(), can_open_geo=False, can_open_settings=False)
 
     action_center = action_center or build_action_center(user)
     can_view_product = _can_use_any_product(user, PermissionGrant.Action.VIEW)
@@ -91,6 +92,7 @@ def build_feature_center(
         and _can_use_global(user, PermissionGrant.Action.MANAGE_ACCOUNT)
     )
     can_open_governance = _can_use_global(user, PermissionGrant.Action.VIEW)
+    can_open_settings = can_edit_product or can_manage_team
 
     groups: list[FeatureGroup] = []
 
@@ -222,10 +224,10 @@ def build_feature_center(
         management_links.append(
             FeatureLink(
                 key="configuration",
-                label_zh="产品、账号与运行设置",
-                label_en="Product, account, and runtime setup",
-                hint_zh="维护封存产品资料、平台账号和运行环境。",
-                hint_en="Maintain sealed product profiles, platform accounts, and runtime environments.",
+                label_zh="设置",
+                label_en="Settings",
+                hint_zh="管理产品资料、渠道账号和使用环境。",
+                hint_en="Manage product profiles, channel accounts, and usage contexts.",
                 url=_safe_reverse("dashboard:configuration-home"),
             )
         )
@@ -250,4 +252,8 @@ def build_feature_center(
         )
     )
 
-    return FeatureCenter(groups=tuple(groups), can_open_geo=can_open_geo)
+    return FeatureCenter(
+        groups=tuple(groups),
+        can_open_geo=can_open_geo,
+        can_open_settings=can_open_settings,
+    )

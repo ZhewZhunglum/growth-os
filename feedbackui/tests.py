@@ -20,6 +20,8 @@ from insights.models import (
     GEOProbePanelItem,
     LearningEvidenceLink,
     LearningVersion,
+    MetricCollectionRun,
+    MetricCollectionRunMetric,
     MetricDefinition,
 )
 from intelligence.models import Initiative
@@ -339,6 +341,7 @@ class FeedbackUiTests(TestCase):
             question="[LOCAL TEST ONLY] Does an AI answer mention PUKO?",
             intent="LOCAL_DOGFOOD_GEO_VISIBILITY",
         )
+        operation_key = str(uuid.uuid4())
         result = record_geo_result(
             actor=self.operator,
             panel_item=local_item,
@@ -349,26 +352,23 @@ class FeedbackUiTests(TestCase):
             brand_mentioned=True,
             rank_position=1,
             citation_urls=[],
-            operation_key=str(uuid.uuid4()),
+            operation_key=operation_key,
         )
-        evidence = GEOMetricObservation.objects.get(probe_result=result)
+        self.assertFalse(GEOMetricObservation.objects.filter(probe_result=result).exists())
+        self.assertFalse(
+            MetricCollectionRun.objects.filter(
+                run_key=f"feedback-geo-metric-{operation_key}"
+            ).exists()
+        )
 
-        self.assertNotIn(
-            f"geo:{evidence.pk}",
-            {value for value, _label in evidence_choices(actor=self.operator)},
+        self.assertTrue(result.probe_run.parameters["is_local_test_seed"])
+        self.assertEqual(
+            result.probe_run.parameters["question_source"],
+            "LOCAL_SYSTEM_PRESET",
         )
-        with self.assertRaises(ValidationError):
-            propose_learning(
-                actor=self.operator,
-                product=self.product,
-                learning_key="must-not-use-local-fixture",
-                title="Must not be saved",
-                conclusion="Local fixture data is not formal evidence.",
-                recommended_action="None",
-                confidence=Decimal("0.5000"),
-                evidence_ref=f"geo:{evidence.pk}",
-                evidence_note="",
-            )
+        self.assertFalse(
+            any("Local fixture answer" in label for _value, label in evidence_choices(actor=self.operator))
+        )
         self.assertFalse(
             LearningVersion.objects.filter(
                 learning_key="manual-puko-feedback-must-not-use-local-fixture"
@@ -379,6 +379,114 @@ class FeedbackUiTests(TestCase):
         response = self.client.get(reverse("feedback:home"))
         self.assertContains(response, "本地测试说明")
         self.assertContains(response, "不会进入正式学习或需求")
+        self.assertContains(response, "本地测试题 · 系统预设")
+        self.assertContains(response, local_item.question)
+        self.assertContains(response, "复制完整问题")
+        self.assertContains(response, "不是数据推荐")
+        self.assertEqual(response.context["geo_result_count"], 0)
+        self.assertEqual(response.context["geo_count"], 0)
+        self.assertEqual(list(response.context["recent_geo"]), [])
+
+    def test_formal_geo_result_is_not_tagged_as_local_seed(self):
+        result = self.create_geo(brand_mentioned=True)
+        evidence = GEOMetricObservation.objects.get(probe_result=result)
+
+        self.assertFalse(result.probe_run.parameters["is_local_test_seed"])
+        self.assertEqual(result.probe_run.parameters["question_source"], "FORMAL_PANEL")
+        self.assertFalse(evidence.collection_run.parameters["is_local_test_seed"])
+
+    def test_legacy_local_seed_metric_is_still_rejected_as_learning_evidence(self):
+        """Old rows created before hard isolation must remain unusable."""
+
+        local_panel = GEOProbePanel.objects.create(
+            panel_key="local-test-puko-geo",
+            version_number=1,
+            product=self.product,
+            market_code="US",
+            language_code="en",
+            created_by_principal=self.owner,
+        )
+        local_item = GEOProbePanelItem.objects.create(
+            panel=local_panel,
+            item_number=1,
+            question="Legacy local practice question",
+            intent="LOCAL_DOGFOOD_GEO_VISIBILITY",
+        )
+        result = record_geo_result(
+            actor=self.operator,
+            panel_item=local_item,
+            provider="DeepSeek",
+            model_reference="legacy-local-test",
+            availability_state=AvailabilityState.PRESENT,
+            response_text="Legacy practice answer.",
+            brand_mentioned=True,
+            rank_position=1,
+            citation_urls=[],
+            operation_key=str(uuid.uuid4()),
+        )
+        metric = MetricDefinition.objects.create(
+            metric_key="legacy-local-geo-brand-mentioned",
+            version_number=1,
+            name="Legacy local GEO brand mention",
+            data_domain=DataDomain.GEO,
+            value_kind=MetricDefinition.ValueKind.COUNT,
+            unit="boolean",
+            created_by_principal=self.owner,
+        )
+        now = timezone.now()
+        metric_run = MetricCollectionRun.objects.create(
+            run_key=f"legacy-local-geo-{uuid.uuid4()}",
+            data_domain=DataDomain.GEO,
+            source_kind=MetricCollectionRun.SourceKind.MANUAL,
+            source_reference=f"geo-probe:{result.pk}",
+            parameters={"legacy_fixture": True},
+            window_start=now,
+            window_end=now + timedelta(microseconds=1),
+            status=MetricCollectionRun.Status.COMPLETED,
+            started_at=now,
+            completed_at=now,
+            created_by_principal=self.operator,
+        )
+        MetricCollectionRunMetric.objects.create(
+            collection_run=metric_run,
+            metric_definition=metric,
+            data_domain=DataDomain.GEO,
+        )
+        legacy_evidence = GEOMetricObservation.objects.create(
+            probe_result=result,
+            metric_definition=metric,
+            collection_run=metric_run,
+            data_domain=DataDomain.GEO,
+            availability_state=AvailabilityState.PRESENT,
+            numeric_value=Decimal("1"),
+            unit="boolean",
+            dimensions={},
+            observed_at=now,
+            source_reference=f"geo-probe:{result.pk}",
+            recorded_by_principal=self.operator,
+        )
+
+        self.assertNotIn(
+            f"geo:{legacy_evidence.pk}",
+            {value for value, _label in evidence_choices(actor=self.operator)},
+        )
+        with self.assertRaises(ValidationError):
+            propose_learning(
+                actor=self.operator,
+                product=self.product,
+                learning_key="legacy-local-must-stay-blocked",
+                title="Must not save",
+                conclusion="Legacy practice data is not evidence.",
+                recommended_action="None",
+                confidence=Decimal("0.5000"),
+                evidence_ref=f"geo:{legacy_evidence.pk}",
+                evidence_note="",
+            )
+        self.assertFalse(
+            LearningVersion.objects.filter(
+                learning_key="manual-puko-feedback-legacy-local-must-stay-blocked"
+            ).exists()
+        )
 
     def test_feedback_page_switches_all_visible_ui_and_form_copy_to_english(self):
         self.client.force_login(self.operator)

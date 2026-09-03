@@ -40,7 +40,7 @@ FORM_TEXT = {
     "delivery_mode": ("这次送审哪份内容", "Content to submit"),
     "content_version": ("系统内完整内容", "Complete content in Growth OS"),
     "inline_content": ("完整发布内容", "Complete publishable content"),
-    "submission_note": ("交付说明", "Delivery note"),
+    "submission_note": ("交付说明（选填）", "Delivery note (optional)"),
 }
 
 
@@ -84,11 +84,11 @@ FORM_HELP = {
 
 CLASS_FORM_TEXT = {
     "CancelTaskForm": {
-        "reason": ("取消原因", "Reason for cancellation"),
+        "reason": ("取消原因（选填）", "Reason for cancellation (optional)"),
         "confirm": ("确认取消这份草稿", "I confirm that this draft should be cancelled"),
     },
     "WithdrawSubmissionForm": {
-        "reason": ("撤回原因", "Reason for withdrawal"),
+        "reason": ("撤回原因（选填）", "Reason for withdrawal (optional)"),
         "confirm": ("确认撤回并重新修改", "I confirm that I want to withdraw and revise this submission"),
     },
 }
@@ -331,6 +331,7 @@ class ResumeDraftForm(CommandForm):
 class CancelTaskForm(CommandForm):
     reason = forms.CharField(
         label="取消原因",
+        required=False,
         max_length=500,
         widget=forms.Textarea(attrs={"rows": 2}),
         help_text="任务不会被删除；系统会保留审计记录，并从 Today 主列表隐藏。",
@@ -340,19 +341,19 @@ class CancelTaskForm(CommandForm):
     def __init__(self, *args, state_version: int, task_state: str = Task.State.DRAFT, **kwargs):
         super().__init__(*args, state_version=state_version, **kwargs)
         if task_state == Task.State.DRAFT:
-            zh_reason = "删除草稿原因"
+            zh_reason = "删除草稿原因（选填）"
             zh_confirm = "我确认删除这份草稿（历史仍保留）"
-            en_reason = "Reason for removing the draft"
+            en_reason = "Reason for removing the draft (optional)"
             en_confirm = "I confirm removing this draft (history remains)"
         elif task_state == Task.State.UNDER_REVIEW:
-            zh_reason = "撤回并放弃原因"
+            zh_reason = "撤回并放弃原因（选填）"
             zh_confirm = "我确认撤回送审并放弃这项任务"
-            en_reason = "Reason for withdrawing and abandoning"
+            en_reason = "Reason for withdrawing and abandoning (optional)"
             en_confirm = "I confirm withdrawing the submission and abandoning this task"
         else:
-            zh_reason = "放弃任务原因"
+            zh_reason = "放弃任务原因（选填）"
             zh_confirm = "我确认放弃这项任务（历史仍保留）"
-            en_reason = "Reason for abandoning the task"
+            en_reason = "Reason for abandoning the task (optional)"
             en_confirm = "I confirm abandoning this task (history remains)"
         self.fields["reason"].label = en_reason if _is_english() else zh_reason
         self.fields["confirm"].label = en_confirm if _is_english() else zh_confirm
@@ -366,6 +367,7 @@ class CancelTaskForm(CommandForm):
 class WithdrawSubmissionForm(CommandForm):
     reason = forms.CharField(
         label="撤回原因",
+        required=False,
         max_length=500,
         widget=forms.Textarea(attrs={"rows": 2}),
         help_text="仅在审核人尚未作出结论时可撤回；旧版本仍会保留。",
@@ -411,10 +413,12 @@ class DeliveryDoDForm(CriteriaCommandForm):
         *args,
         content_versions=None,
         require_inline_primary: bool = False,
+        task: Task | None = None,
         state_version: int,
         **kwargs,
     ):
         self.require_inline_primary = require_inline_primary
+        self.task = task
         if args and args[0] is not None and "delivery_mode" not in args[0]:
             # Backward-compatible server-side inference for existing clients.
             # The current UI always posts the explicit radio choice.
@@ -442,6 +446,19 @@ class DeliveryDoDForm(CriteriaCommandForm):
         if not has_system_content:
             self.fields["content_version"].disabled = True
             self.fields["content_version"].empty_label = "请先生成完整内容"
+        elif not self.is_bound:
+            # The UI is intentionally one-way for beginners: once a valid
+            # immutable version exists, choose the newest one for them.  The
+            # service still revalidates it under the Task lock on submit.
+            self.fields["content_version"].initial = queryset.first()
+        self.fields["submission_note"].label = (
+            "Delivery note (optional)" if _is_english() else "交付说明（选填）"
+        )
+        self.fields["submission_note"].help_text = (
+            "You may continue without a note; the system records that explicitly."
+            if _is_english()
+            else "不填写也可以继续；系统会明确记录为未填写。"
+        )
         if _is_english():
             self.fields["delivery_mode"].choices = (
                 ((self.DeliveryMode.SYSTEM_CONTENT, "Submit complete content saved in Growth OS"),)
@@ -468,6 +485,16 @@ class DeliveryDoDForm(CriteriaCommandForm):
         if mode == self.DeliveryMode.SYSTEM_CONTENT:
             if content_version is None:
                 self.add_error("content_version", "请先生成或保存一份系统内完整内容。")
+            elif self.task is not None:
+                if content_version.content_asset.task_id != self.task.pk:
+                    self.add_error("content_version", "所选内容不属于这项任务。")
+                elif (
+                    content_version.representation_kind
+                    != ContentAssetVersion.RepresentationKind.INLINE_TEXT
+                ):
+                    self.add_error("content_version", "主要交付必须是系统内完整正文。")
+                elif not content_version.inline_content.strip():
+                    self.add_error("content_version", "完整正文不能为空。")
             if external_url:
                 self.add_error("external_url", "送审系统内内容时不要同时填写外部链接。")
         elif mode == self.DeliveryMode.EXTERNAL_URL:

@@ -41,6 +41,11 @@ urlpatterns = [
         name="evidence-invalidate",
     ),
     path(
+        "<uuid:product_id>/<uuid:batch_key>/evidence/<uuid:evidence_id>/correct/",
+        views.evidence_correct,
+        name="evidence-correct",
+    ),
+    path(
         "<uuid:product_id>/<uuid:batch_key>/<str:platform_code>/manual/",
         views.evidence_manual,
         name="evidence-manual",

@@ -32,6 +32,15 @@
     {% csrf_token %}{{ geo_form.non_field_errors }}
     {% for hidden in geo_form.hidden_fields %}{{ hidden }}{% endfor %}
     <p>{{ geo_form.panel_item.errors }}{{ geo_form.panel_item.label_tag }}{{ geo_form.panel_item }}</p>
+    {{ geo_question_details|json_script:"geo-question-details" }}
+    <section id="geo-question-preview" class="task-section" aria-live="polite" aria-atomic="true" hidden>
+      <p class="eyebrow" id="geo-question-source"></p>
+      <h3>{% ui '复制完整问题，去 AI 模型里提问' 'Copy the full question and ask it in the AI model' %}</h3>
+      <p id="geo-question-full-text" style="white-space: pre-wrap;"></p>
+      <button class="button button-secondary" id="copy-geo-question" type="button" aria-describedby="geo-question-source geo-question-full-text geo-copy-status">{% ui '复制完整问题' 'Copy full question' %}</button>
+      <p class="muted" id="geo-copy-status" role="status" aria-live="polite"></p>
+      <p class="muted">{% ui '操作方法：复制上面的完整问题 → 打开 DeepSeek、ChatGPT 或其他模型粘贴提问 → 把模型的完整回答粘贴回下方“AI 的回答”。本地测试题只是系统预设练习题，不代表数据推荐。' 'How to use it: copy the full question → paste it into DeepSeek, ChatGPT, or another model → paste the complete answer back into “AI answer” below. A local test seed is a system preset for practice, not a data recommendation.' %}</p>
+    </section>
     <p>{{ geo_form.provider.errors }}{{ geo_form.provider.label_tag }}{{ geo_form.provider }}<span class="helptext">{{ geo_form.provider.help_text }}</span></p>
     <p>{{ geo_form.availability_state.errors }}{{ geo_form.availability_state.label_tag }}{{ geo_form.availability_state }}</p>
     <p>{{ geo_form.response_text.errors }}{{ geo_form.response_text.label_tag }}{{ geo_form.response_text }}</p>
@@ -108,4 +117,46 @@
     </section>
   </div>
 </details>
+<script>
+(() => {
+  const select = document.getElementById('id_panel_item');
+  const dataElement = document.getElementById('geo-question-details');
+  const preview = document.getElementById('geo-question-preview');
+  const text = document.getElementById('geo-question-full-text');
+  const source = document.getElementById('geo-question-source');
+  const copy = document.getElementById('copy-geo-question');
+  const copyStatus = document.getElementById('geo-copy-status');
+  if (!select || !dataElement || !preview || !text || !source || !copy || !copyStatus) return;
+  select.setAttribute('aria-controls', 'geo-question-preview');
+  select.setAttribute('aria-describedby', 'geo-question-source geo-question-full-text');
+  const questions = Object.fromEntries(JSON.parse(dataElement.textContent).map(item => [item.id, item]));
+  const isEnglish = document.documentElement.lang.toLowerCase().startsWith('en');
+  const initialCopyLabel = copy.textContent;
+  const render = () => {
+    copy.textContent = initialCopyLabel;
+    copyStatus.textContent = '';
+    const item = questions[select.value];
+    preview.hidden = !item;
+    if (!item) return;
+    text.textContent = item.question;
+    source.textContent = item.is_test_seed
+      ? (isEnglish ? 'Local test seed · system preset · not data-recommended' : '本地测试题 · 系统预设 · 不是数据推荐')
+      : (isEnglish ? 'Formal question set' : '正式问题组');
+  };
+  select.addEventListener('change', render);
+  copy.addEventListener('click', async () => {
+    const item = questions[select.value];
+    if (!item) return;
+    try {
+      await navigator.clipboard.writeText(item.question);
+      copy.textContent = isEnglish ? 'Copied' : '已复制完整问题';
+      copyStatus.textContent = isEnglish ? 'The complete question was copied.' : '完整问题已复制。';
+    } catch (_error) {
+      window.prompt(isEnglish ? 'Copy this full question:' : '复制这个完整问题：', item.question);
+      copyStatus.textContent = isEnglish ? 'Use the copy dialog to copy the complete question.' : '请在弹出的窗口中复制完整问题。';
+    }
+  });
+  render();
+})();
+</script>
 {% endblock %}

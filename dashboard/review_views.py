@@ -565,6 +565,7 @@ def review_action(request: HttpRequest, task_id) -> HttpResponse:
                 acting_role=request.user.role,
                 permission_grant=review_grant,
                 recorded_by_principal=request.user,
+                owner_edit_grant=(edit_grant if owner_self_approval else None),
             )
             Task.transition(
                 task_id=task.pk,

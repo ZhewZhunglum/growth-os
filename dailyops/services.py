@@ -7,7 +7,7 @@ from decimal import Decimal
 from typing import Iterable, Mapping
 
 from django.core.exceptions import PermissionDenied, ValidationError
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.db.models import Q
 from django.utils import timezone
 
@@ -40,6 +40,7 @@ from intelligence.models import (
     DemandAssessment,
     DemandEvidenceLink,
     EvidenceArtifactLink,
+    EvidenceInvalidationEvent,
     ExternalEvidenceItem,
     Initiative,
     InitiativeStateEvent,
@@ -64,9 +65,18 @@ from intelligence.services import (
 )
 from products.models import Product
 from releasegate.models import AccountEnvironmentBinding, CapabilityState
+from releasegate.runtime import resolve_manual_publish_context
 from workflow.models import Task, TaskContractVersion
 
+from dailyops.disposition import lock_daily_batch_runs
+from dailyops.evidence_services import (
+    EvidenceInvalidationResult,
+    ensure_batch_active,
+    ensure_batch_evidence_editable,
+    invalidate_evidence,
+)
 from dailyops.runtime import DailyOperationsRuntime, DailyOperationsRuntimeConfig, build_daily_operations_runtime
+from dailyops.platforms import require_execution_platform
 from dailyops.schemas import DAILY_ANALYSIS_SCHEMA, deterministic_analysis
 
 
@@ -96,6 +106,12 @@ class EvidenceIngestionResult:
     run: CollectionRun
     evidence: tuple[ExternalEvidenceItem, ...]
     created_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class EvidenceCorrectionResult:
+    invalidation: EvidenceInvalidationResult
+    replacement: EvidenceIngestionResult
 
 
 @dataclass(frozen=True, slots=True)
@@ -371,23 +387,82 @@ def _persist_ingested_evidence(*, run: CollectionRun, source: SourceRegistry, it
     return evidence, evidence_created
 
 
+def _fallback_replay(
+    *,
+    batch_key,
+    source,
+    operation_key,
+    requested_dedupe: list[str],
+    requested_payload_bindings: list[dict[str, str]],
+) -> EvidenceIngestionResult | None:
+    replay_run = CollectionRun.objects.filter(operation_key=operation_key).first()
+    if replay_run is None:
+        return None
+    if replay_run.batch_key != batch_key or replay_run.source_id != source.pk:
+        raise CommandReplayConflict(
+            "The operation key was already used for another fallback collection."
+        )
+    if replay_run.query_spec.get("fallback_payload_bindings") != requested_payload_bindings:
+        raise CommandReplayConflict(
+            "The operation key was replayed with different fallback evidence content."
+        )
+    replay_evidence = tuple(
+        ExternalEvidenceItem.objects.filter(
+            collection_run=replay_run,
+            dedupe_key__in=requested_dedupe,
+        ).order_by("dedupe_key")
+    )
+    if [item.dedupe_key for item in replay_evidence] != requested_dedupe:
+        raise CommandReplayConflict("The operation key has an incomplete fallback result.")
+    return EvidenceIngestionResult(replay_run, replay_evidence, 0)
+
+
 def _record_successful_fallback(
     *, batch_key, product, source, operation_key, items, principal, acting_role
 ) -> EvidenceIngestionResult:
     requested_dedupe = sorted(item.dedupe_key for item in items)
-    replay_run = CollectionRun.objects.filter(operation_key=operation_key).first()
-    if replay_run is not None:
-        if replay_run.batch_key != batch_key or replay_run.source_id != source.pk:
-            raise ValidationError("The operation key was already used for another fallback collection.")
-        replay_evidence = tuple(
-            ExternalEvidenceItem.objects.filter(dedupe_key__in=requested_dedupe).order_by("dedupe_key")
-        )
-        if [item.dedupe_key for item in replay_evidence] != requested_dedupe:
-            raise ValidationError("The operation key was replayed with different evidence.")
-        return EvidenceIngestionResult(replay_run, replay_evidence, 0)
-    original_runs = _assert_batch_product(
-        CollectionRun.objects.filter(batch_key=batch_key).order_by("started_at", "id"), product
+    # A natural-key dedupe intentionally ignores descriptive fields such as
+    # title/content/attributes.  It is therefore not sufficient to bind an
+    # idempotency key to the exact fallback command payload.  Persist every
+    # normalized item's full canonical digest as part of CollectionRun's
+    # immutable query_spec (and consequently its operation_payload_hash).
+    requested_payload_bindings = sorted(
+        (
+            {
+                "dedupe_key": item.dedupe_key,
+                "payload_digest": item.provenance.payload_digest,
+            }
+            for item in items
+        ),
+        key=lambda value: (value["dedupe_key"], value["payload_digest"]),
     )
+    replay = _fallback_replay(
+        batch_key=batch_key,
+        source=source,
+        operation_key=operation_key,
+        requested_dedupe=requested_dedupe,
+        requested_payload_bindings=requested_payload_bindings,
+    )
+    if replay is not None:
+        return replay
+    # Every writer uses one deterministic batch mutex/order.  Mixing
+    # started_at and created_at ordering can deadlock on PostgreSQL when a
+    # batch has more than one immutable CollectionRun.
+    original_runs = lock_daily_batch_runs(batch_key=batch_key, product=product)
+    # Another request can win while this transaction is waiting for the
+    # batch mutex.  Re-resolve the operation under that mutex so an exact
+    # concurrent replay returns the durable result and a changed payload is
+    # rejected before any second CollectionRun can be attempted.
+    replay = _fallback_replay(
+        batch_key=batch_key,
+        source=source,
+        operation_key=operation_key,
+        requested_dedupe=requested_dedupe,
+        requested_payload_bindings=requested_payload_bindings,
+    )
+    if replay is not None:
+        return replay
+    ensure_batch_evidence_editable(batch_key=batch_key, product=product)
     attempt = _next_attempt(batch_key=batch_key, source=source)
     collected_at = min(item.provenance.collected_at for item in items)
     completed_at = max(item.provenance.collected_at for item in items)
@@ -397,6 +472,7 @@ def _record_successful_fallback(
             "fallback_mode": items[0].provenance.acquisition_mode.value,
             "item_count": len(items),
             "evidence_dedupe_keys": requested_dedupe,
+            "fallback_payload_bindings": requested_payload_bindings,
         }
     )
     result = record_collection_run(
@@ -466,6 +542,89 @@ def ingest_manual_link(
         items=(item,),
         principal=principal,
         acting_role=acting_role,
+    )
+
+
+@transaction.atomic
+def correct_manual_evidence(
+    *,
+    evidence_id,
+    batch_key: uuid.UUID,
+    product: Product,
+    command_id: uuid.UUID,
+    platform: Platform,
+    external_url: str,
+    external_content_id: str,
+    title: str,
+    content_text: str,
+    collected_at,
+    reason: str,
+    principal: Principal,
+    acting_role: str,
+) -> EvidenceCorrectionResult:
+    """Append a corrected manual item and invalidate its predecessor atomically."""
+
+    candidate = (
+        ExternalEvidenceItem.objects.select_related("source", "collection_run")
+        .get(pk=evidence_id)
+    )
+    if candidate.source.source_kind != SourceRegistry.SourceKind.MANUAL_LINK:
+        raise ValidationError("只有人工补录的线索可以在这里更正。")
+    if str(candidate.collection_run.batch_key) != str(batch_key):
+        raise ValidationError("这条线索不属于本次工作，不能更正。")
+    if str(candidate.collection_run.query_spec.get("product_id", "")) != str(product.pk):
+        raise ValidationError("这条线索不属于当前产品，不能更正。")
+
+    # Match every other evidence writer: Batch first, then Evidence.  This
+    # serializes correction against removal/acceptance without an
+    # Evidence↔Batch lock inversion.
+    lock_daily_batch_runs(batch_key=batch_key, product=product)
+    evidence = (
+        ExternalEvidenceItem.objects.select_for_update()
+        .select_related("source", "collection_run")
+        .get(pk=candidate.pk)
+    )
+
+    invalidation_command = uuid.uuid5(command_id, "invalidate-original-evidence")
+    replacement_command = uuid.uuid5(command_id, "append-corrected-evidence")
+    invalidation_replay = EvidenceInvalidationEvent.objects.filter(
+        command_id=invalidation_command
+    ).exists()
+    replacement_replay = CollectionRun.objects.filter(
+        operation_key=replacement_command
+    ).exists()
+    if invalidation_replay != replacement_replay:
+        raise ValidationError("这次线索更正留下了不完整结果，需要人工检查后再继续。")
+    if not invalidation_replay:
+        if EvidenceInvalidationEvent.objects.filter(evidence_item=evidence).exists():
+            raise ValidationError("这条旧线索已经作废，不能再次更正。请修改当前有效线索。")
+        ensure_batch_evidence_editable(batch_key=batch_key, product=product)
+
+    invalidation = invalidate_evidence(
+        evidence_id=evidence.pk,
+        product=product,
+        batch_key=batch_key,
+        command_id=invalidation_command,
+        reason=reason,
+        principal=principal,
+        acting_role=acting_role,
+    )
+    replacement = ingest_manual_link(
+        batch_key=batch_key,
+        product=product,
+        platform=platform,
+        operation_key=replacement_command,
+        external_url=external_url,
+        external_content_id=external_content_id,
+        title=title,
+        content_text=content_text,
+        collected_at=collected_at,
+        principal=principal,
+        acting_role=acting_role,
+    )
+    return EvidenceCorrectionResult(
+        invalidation=invalidation,
+        replacement=replacement,
     )
 
 
@@ -643,20 +802,27 @@ def run_automatic_collection(
             scope_kind=PermissionGrant.ScopeKind.PLATFORM,
             platform_code=platform.value,
         )
-    initial_runs = batch_runs(batch_key=batch_key, product=product)
-    replay = _automatic_replay(
-        command_id=command_id,
-        batch_key=batch_key,
-        product=product,
-    )
-    if replay is not None:
-        return replay
-    requests = _connector_request_map(
-        command_id=command_id,
-        batch_key=batch_key,
-        product=product,
-        runs=initial_runs,
-    )
+    # Keep the database mutex short: validate and freeze-check the batch, then
+    # release all row locks before waiting on an external API/browser worker.
+    # Persistence repeats the same checks in a second short transaction.
+    with transaction.atomic():
+        lock_daily_batch_runs(batch_key=batch_key, product=product)
+        initial_runs = batch_runs(batch_key=batch_key, product=product)
+        ensure_batch_active(batch_key=batch_key, product=product)
+        replay = _automatic_replay(
+            command_id=command_id,
+            batch_key=batch_key,
+            product=product,
+        )
+        if replay is not None:
+            return replay
+        ensure_batch_evidence_editable(batch_key=batch_key, product=product)
+        requests = _connector_request_map(
+            command_id=command_id,
+            batch_key=batch_key,
+            product=product,
+            runs=initial_runs,
+        )
     runtime = runtime or build_daily_operations_runtime()
     connector_batch = runtime.connectors.run(requests)
     started_at = timezone.now()
@@ -666,9 +832,12 @@ def run_automatic_collection(
     created_count = 0
 
     with transaction.atomic():
-        # PostgreSQL serializes two browser/API button submissions for the same
-        # immutable batch before the second replay check.
-        tuple(CollectionRun.objects.select_for_update().filter(batch_key=batch_key).values_list("pk", flat=True))
+        # PostgreSQL serializes persistence, evidence changes, and the human
+        # decision using one deterministic lock order.  If acceptance happened
+        # while the connector was running, this transaction fails closed and
+        # records none of the returned data.
+        lock_daily_batch_runs(batch_key=batch_key, product=product)
+        ensure_batch_active(batch_key=batch_key, product=product)
         replay = _automatic_replay(
             command_id=command_id,
             batch_key=batch_key,
@@ -676,6 +845,7 @@ def run_automatic_collection(
         )
         if replay is not None:
             return replay
+        ensure_batch_evidence_editable(batch_key=batch_key, product=product)
         for platform in PLATFORMS:
             request = requests[platform]
             result = connector_batch.results[platform]
@@ -806,21 +976,25 @@ def run_platform_collection(
         scope_kind=PermissionGrant.ScopeKind.PLATFORM,
         platform_code=platform.value,
     )
-    initial_runs = batch_runs(batch_key=batch_key, product=product)
-    replay = _platform_collection_replay(
-        command_id=command_id,
-        batch_key=batch_key,
-        product=product,
-        platform=platform,
-    )
-    if replay is not None:
-        return replay
-    requests = _connector_request_map(
-        command_id=command_id,
-        batch_key=batch_key,
-        product=product,
-        runs=initial_runs,
-    )
+    with transaction.atomic():
+        lock_daily_batch_runs(batch_key=batch_key, product=product)
+        initial_runs = batch_runs(batch_key=batch_key, product=product)
+        ensure_batch_active(batch_key=batch_key, product=product)
+        replay = _platform_collection_replay(
+            command_id=command_id,
+            batch_key=batch_key,
+            product=product,
+            platform=platform,
+        )
+        if replay is not None:
+            return replay
+        ensure_batch_evidence_editable(batch_key=batch_key, product=product)
+        requests = _connector_request_map(
+            command_id=command_id,
+            batch_key=batch_key,
+            product=product,
+            runs=initial_runs,
+        )
     runtime = runtime or build_daily_operations_runtime()
     result = runtime.connectors.run_one(requests[platform])
     request = requests[platform]
@@ -830,11 +1004,8 @@ def run_platform_collection(
     completed_at = timezone.now()
 
     with transaction.atomic():
-        tuple(
-            CollectionRun.objects.select_for_update()
-            .filter(batch_key=batch_key)
-            .values_list("pk", flat=True)
-        )
+        lock_daily_batch_runs(batch_key=batch_key, product=product)
+        ensure_batch_active(batch_key=batch_key, product=product)
         replay = _platform_collection_replay(
             command_id=command_id,
             batch_key=batch_key,
@@ -843,6 +1014,7 @@ def run_platform_collection(
         )
         if replay is not None:
             return replay
+        ensure_batch_evidence_editable(batch_key=batch_key, product=product)
         source_mode = (
             result.mode
             if result.mode in {AcquisitionMode.API, AcquisitionMode.BROWSER}
@@ -924,6 +1096,7 @@ def _batch_evidence(*, batch_key: uuid.UUID, product: Product) -> tuple[External
             collection_run_id__in=run_ids,
             invalidation_event__isnull=True,
         )
+        .filter(Q(expires_at__isnull=True) | Q(expires_at__gt=timezone.now()))
         .select_related("source", "collection_run")
         # UUIDv7 creation order keeps the first item a stable version anchor
         # even when a later CSV contains an older observed_at timestamp.
@@ -931,13 +1104,35 @@ def _batch_evidence(*, batch_key: uuid.UUID, product: Product) -> tuple[External
     )
 
 
-def _analysis_request(*, batch_key: uuid.UUID, product: Product, evidence) -> AIRequest:
+def _evidence_manifest(evidence: Iterable[ExternalEvidenceItem]) -> tuple[list[str], str]:
+    evidence_ids = sorted(str(item.pk) for item in evidence)
+    return evidence_ids, canonical_sha256(evidence_ids)
+
+
+def proposal_matches_evidence(
+    *,
+    proposal: SignalAssessment,
+    evidence: Iterable[ExternalEvidenceItem],
+) -> bool:
+    """Compare a proposal with the exact currently valid evidence manifest."""
+
+    evidence_ids, evidence_fingerprint = _evidence_manifest(evidence)
+    proposal_ids = list(proposal.value.get("evidence_ids", []))
+    proposal_fingerprint = proposal.value.get("evidence_fingerprint") or canonical_sha256(
+        proposal_ids
+    )
+    return (
+        proposal_ids == evidence_ids
+        and proposal_fingerprint == evidence_fingerprint
+    )
+
+
+def _analysis_request(*, batch_key: uuid.UUID, product: Product, query: str, evidence) -> AIRequest:
     if len(evidence) > MAX_ANALYSIS_EVIDENCE:
         raise ValidationError(
             f"Daily analysis accepts at most {MAX_ANALYSIS_EVIDENCE} exact evidence items; narrow the batch first."
         )
-    evidence_ids = [str(item.pk) for item in evidence]
-    evidence_fingerprint = canonical_sha256(evidence_ids)
+    evidence_ids, evidence_fingerprint = _evidence_manifest(evidence)
     compact_evidence = [
         {
             "platform": item.platform_code,
@@ -963,6 +1158,7 @@ def _analysis_request(*, batch_key: uuid.UUID, product: Product, evidence) -> AI
                 role="user",
                 content=(
                     f"Product: {product.name} ({product.market_code}/{product.language_code})\n"
+                    f"Research question: {query}\n"
                     f"Batch: {batch_key}\nEvidence: {compact_evidence}"
                 ),
             ),
@@ -1006,8 +1202,7 @@ def propose_daily_analysis(
             f"Daily analysis accepts at most {MAX_ANALYSIS_EVIDENCE} exact evidence items; narrow the batch first."
         )
     assessment_key = f"daily-analysis-{batch_key.hex}"
-    evidence_ids = [str(item.pk) for item in evidence]
-    evidence_fingerprint = canonical_sha256(evidence_ids)
+    evidence_ids, evidence_fingerprint = _evidence_manifest(evidence)
     latest = SignalAssessment.objects.filter(assessment_key=assessment_key).order_by("-version_number").first()
     if latest:
         latest_ids = list(latest.value.get("evidence_ids", []))
@@ -1042,7 +1237,12 @@ def propose_daily_analysis(
             )
         )
     ).ai_provider
-    request = _analysis_request(batch_key=batch_key, product=product, evidence=evidence)
+    request = _analysis_request(
+        batch_key=batch_key,
+        product=product,
+        query=query,
+        evidence=evidence,
+    )
     result = provider.generate(request)
     output = dict(result.output)
     output.update(
@@ -1056,7 +1256,11 @@ def propose_daily_analysis(
         }
     )
     return SignalAssessment.objects.create(
-        evidence_item=evidence[0],
+        # SignalAssessment uses this FK as the immutable version-series
+        # anchor.  The exact current inputs live in value.evidence_ids and its
+        # fingerprint, so invalidating the original anchor must not break a
+        # pending proposal's append-only v2.
+        evidence_item=latest.evidence_item if latest else evidence[0],
         assessment_key=assessment_key,
         version_number=(latest.version_number + 1) if latest else 1,
         signal_type="DAILY_OPERATIONS_ANALYSIS",
@@ -1108,9 +1312,11 @@ def accept_daily_analysis(
     if value.get("product_id") != str(product.pk):
         raise ValidationError("Analysis proposal belongs to another Product.")
     batch_key = uuid.UUID(str(value.get("batch_key")))
+    # Serialize the human decision with every evidence mutation and connector
+    # dispatch, including callers that bypass the web views.
+    lock_daily_batch_runs(batch_key=batch_key, product=product)
     evidence = _batch_evidence(batch_key=batch_key, product=product)
-    exact_ids = [str(item.pk) for item in evidence]
-    if exact_ids != value.get("evidence_ids"):
+    if not proposal_matches_evidence(proposal=proposal, evidence=evidence):
         raise ValidationError("The proposal evidence set changed; generate a new proposal.")
     decision = SignalAssessment.objects.filter(supersedes=proposal).first()
     if decision:
@@ -1275,6 +1481,7 @@ def create_channel_plan(
     acting_role: str,
     channel_account=None,
 ) -> ChannelPlan:
+    platform = require_execution_platform(platform)
     if initiative.current_state not in {Initiative.State.APPROVED, Initiative.State.ACTIVE}:
         raise ValidationError("Channel planning requires an approved Initiative.")
     # Runtime environment and capability are system-owned facts.  Discard the
@@ -1333,20 +1540,49 @@ def create_channel_plan(
         "capability_state_id": str(capability.pk),
         "resolved_capability_code": capability.capability_code,
     }
-    return ChannelPlan.objects.create(
+    plan_key = f"{initiative.initiative_key}-{platform.value.lower()}"
+    if ChannelPlan.objects.filter(
         initiative=initiative,
-        channel_account=channel_account,
-        plan_key=f"{initiative.initiative_key}-{platform.value.lower()}",
         platform_code=platform.value,
-        plan_date=plan_date,
-        goal=goal,
-        content_requirements=resolved_requirements,
-        creation_command_id=command_id,
-        creation_payload_hash=payload_hash,
-        created_by_principal=principal,
-        created_under_grant=grant,
-        updated_by_principal=principal,
-    )
+    ).exists():
+        raise ValidationError(
+            "同一轮工作每个平台只能安排一次（已取消的安排也会保留历史）；"
+            "如需重做，请新开一轮 Daily Operations。"
+        )
+    try:
+        # Keep the insert in its own savepoint.  Concurrent requests may both
+        # pass the friendly pre-check, but the database unique constraints are
+        # authoritative and only one insert may win.
+        with transaction.atomic():
+            return ChannelPlan.objects.create(
+                initiative=initiative,
+                channel_account=channel_account,
+                plan_key=plan_key,
+                platform_code=platform.value,
+                plan_date=plan_date,
+                goal=goal,
+                content_requirements=resolved_requirements,
+                creation_command_id=command_id,
+                creation_payload_hash=payload_hash,
+                created_by_principal=principal,
+                created_under_grant=grant,
+                updated_by_principal=principal,
+            )
+    except IntegrityError as error:
+        replay = ChannelPlan.objects.filter(creation_command_id=command_id).first()
+        if replay is not None:
+            if replay.creation_payload_hash != payload_hash:
+                raise ValidationError("ChannelPlan command was replayed with different input.") from error
+            return replay
+        if ChannelPlan.objects.filter(
+            initiative=initiative,
+            platform_code=platform.value,
+        ).exists():
+            raise ValidationError(
+                "同一轮工作每个平台只能安排一次（已取消的安排也会保留历史）；"
+                "如需重做，请新开一轮 Daily Operations。"
+            ) from error
+        raise
 
 
 def _resolve_current_plan_runtime(
@@ -1360,37 +1596,7 @@ def _resolve_current_plan_runtime(
     incomplete setup and multiple matches are ambiguous, so both fail closed.
     """
 
-    at = at or timezone.now()
-    bindings = (
-        AccountEnvironmentBinding.objects.select_related("runtime_environment")
-        .filter(
-            channel_account_id=channel_account.pk,
-            status=AccountEnvironmentBinding.Status.ACTIVE,
-            valid_from__lte=at,
-            runtime_environment__status="ACTIVE",
-        )
-        .filter(Q(valid_until__isnull=True) | Q(valid_until__gt=at))
-        .order_by("runtime_environment__environment_code", "-binding_version", "id")
-    )
-    current_bindings = [binding for binding in bindings if binding.is_current_at(at)]
-    if not current_bindings:
-        raise ValidationError("这个账号当前没有可用的运行环境，请先完成账号与环境配置。")
-    if len(current_bindings) > 1:
-        raise ValidationError("这个账号同时连接了多个运行环境，系统不能安全猜选；请先只保留一个当前绑定。")
-    binding = current_bindings[0]
-    capability = (
-        CapabilityState.objects.filter(
-            account_environment_binding=binding,
-            capability_code=CapabilityState.MANUAL_PUBLISH,
-        )
-        .order_by("-state_version")
-        .first()
-    )
-    if capability is None:
-        raise ValidationError("这个账号当前没有人工发布能力配置，请先完成运行配置。")
-    if not capability.is_current_open_at(at):
-        raise ValidationError("这个账号当前不能人工发布，请先检查账号能力状态。")
-    return binding, capability
+    return resolve_manual_publish_context(channel_account, at=at)
 
 
 def _current_capability_for_plan(plan: ChannelPlan) -> CapabilityState:
@@ -1444,6 +1650,7 @@ def compile_channel_plan_task(
     plan = ChannelPlan.objects.select_for_update().select_related(
         "initiative__product", "channel_account"
     ).get(pk=channel_plan.pk)
+    require_execution_platform(plan.platform_code)
     if plan.current_state not in {ChannelPlan.State.READY, ChannelPlan.State.ACTIVE}:
         raise ValidationError("ChannelPlan must be READY before Task Compiler can run.")
     product = plan.initiative.product

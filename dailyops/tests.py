@@ -5,6 +5,8 @@ from datetime import timedelta
 from unittest.mock import patch
 
 from django.core.exceptions import ValidationError
+from django.db import IntegrityError, transaction
+from django.db.models.query import QuerySet
 from django.test import Client, TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
@@ -12,8 +14,14 @@ from django.utils import timezone
 from accounts.models import PermissionGrant, Principal
 from accounts.services import revoke_permission_grant
 from contentops.models import ContentAssetVersion
+from core.audit_notes import SYSTEM_DEFAULT_TAG
 from dailyops.models import DailyBatchDispositionEvent
-from dailyops.services import PLATFORMS, ensure_default_sources
+from dailyops.services import (
+    PLATFORMS,
+    correct_manual_evidence,
+    create_channel_plan,
+    ensure_default_sources,
+)
 from integrations.connectors.types import Platform
 from intelligence.models import (
     ChannelPlan,
@@ -28,7 +36,9 @@ from intelligence.models import (
     SignalAssessment,
     SourceRegistry,
     TaskCompilationContext,
+    canonical_sha256,
 )
+from intelligence.services import transition_channel_plan
 from products.models import (
     ClaimMatrixVersion,
     EvidenceLibraryVersion,
@@ -75,7 +85,7 @@ class DailyOperationsUITests(TestCase):
             PermissionGrant.Action.CREATE_TASK,
             PermissionGrant.Action.CANCEL_TASK,
         ):
-            PermissionGrant.objects.create(
+            grant = PermissionGrant.objects.create(
                 principal=self.owner,
                 scope_kind=PermissionGrant.ScopeKind.PRODUCT,
                 product=self.product,
@@ -84,6 +94,8 @@ class DailyOperationsUITests(TestCase):
                 valid_until=now + timedelta(days=1),
                 granted_by_principal=self.owner,
             )
+            if action == PermissionGrant.Action.EDIT:
+                self.edit_grant = grant
         PermissionGrant.objects.create(
             principal=self.owner,
             scope_kind=PermissionGrant.ScopeKind.GLOBAL,
@@ -377,6 +389,196 @@ class DailyOperationsUITests(TestCase):
         self.assertNotIn("environment_code", plan.content_requirements)
         self.assertNotIn("capability_code", plan.content_requirements)
 
+    def test_analytical_platform_cannot_be_used_for_execution_even_via_service(self):
+        _, initiative = self._approved_initiative()
+        for platform in (
+            Platform.GOOGLE_SEARCH,
+            Platform.GOOGLE_SEARCH_CONSOLE,
+            Platform.GOOGLE_ANALYTICS_4,
+        ):
+            with self.subTest(platform=platform.value):
+                analysis_account = ChannelAccount.objects.create(
+                    platform_code=platform.value,
+                    account_code=f"daily-ui-{platform.value.lower()}-analysis-only",
+                    external_account_ref=f"{platform.value.lower()}-analysis-only",
+                    display_name=f"{platform.value} analysis only",
+                    created_by_principal=self.owner,
+                    updated_by_principal=self.owner,
+                )
+
+                with self.assertRaisesMessage(ValidationError, "只用于分析数据"):
+                    create_channel_plan(
+                        initiative=initiative,
+                        platform=platform,
+                        command_id=uuid.uuid4(),
+                        plan_date=timezone.localdate(),
+                        goal={"title": "This must not become execution work"},
+                        content_requirements={"task_description": "Analysis is not a publish target."},
+                        principal=self.owner,
+                        acting_role=self.owner.role,
+                        channel_account=analysis_account,
+                    )
+
+                with self.assertRaises(IntegrityError):
+                    # Import scripts and other low-level writers cannot bypass
+                    # the execution/analysis split by skipping service checks.
+                    with transaction.atomic():
+                        ChannelPlan.objects.bulk_create(
+                            [
+                                ChannelPlan(
+                                    initiative=initiative,
+                                    channel_account=analysis_account,
+                                    plan_key=f"analysis-plan-{platform.value.lower()}",
+                                    platform_code=platform.value,
+                                    plan_date=timezone.localdate(),
+                                    goal={"title": "invalid analysis execution plan"},
+                                    content_requirements={"task_description": "must fail"},
+                                    creation_command_id=uuid.uuid4(),
+                                    creation_payload_hash="a" * 64,
+                                    created_by_principal=self.owner,
+                                    created_under_grant=self.edit_grant,
+                                    updated_by_principal=self.owner,
+                                )
+                            ]
+                        )
+
+        self.assertFalse(ChannelPlan.objects.filter(initiative=initiative).exists())
+
+    def test_existing_platform_is_hidden_and_duplicate_is_friendly_and_db_safe(self):
+        batch_key, initiative = self._approved_initiative()
+        first = self.client.post(
+            reverse("dailyops:plan-create", args=[initiative.pk]),
+            self._plan_data(),
+            follow=True,
+        )
+        self.assertContains(first, "已建立 TIKTOK 平台任务安排")
+
+        detail = self.client.get(
+            reverse("dailyops:batch-detail", args=[self.product.pk, batch_key])
+        )
+        self.assertFalse(detail.context["plan_form"].has_platform_choices)
+        self.assertContains(detail, "本轮所有已配置的执行平台都已经安排过了")
+
+        first_plan = ChannelPlan.objects.get(initiative=initiative)
+        with self.assertRaises(IntegrityError):
+            # A model/import path using a different plan_key must not bypass
+            # the one-platform-per-Initiative invariant.
+            with transaction.atomic():
+                duplicate_import = ChannelPlan(
+                    initiative=initiative,
+                    channel_account=first_plan.channel_account,
+                    plan_key=f"{first_plan.plan_key}-different-import-key",
+                    platform_code=first_plan.platform_code,
+                    plan_date=first_plan.plan_date,
+                    goal={"title": "duplicate import"},
+                    content_requirements=first_plan.content_requirements,
+                    creation_command_id=uuid.uuid4(),
+                    creation_payload_hash="f" * 64,
+                    created_by_principal=self.owner,
+                    created_under_grant=first_plan.created_under_grant,
+                    updated_by_principal=self.owner,
+                )
+                # bulk_create intentionally bypasses Model.save/full_clean so
+                # this assertion proves the database constraint itself.
+                ChannelPlan.objects.bulk_create([duplicate_import])
+
+        duplicate = self.client.post(
+            reverse("dailyops:plan-create", args=[initiative.pk]),
+            self._plan_data(command_id=str(uuid.uuid4())),
+            follow=True,
+        )
+        self.assertContains(duplicate, "本轮已经安排过")
+        self.assertEqual(ChannelPlan.objects.filter(initiative=initiative).count(), 1)
+
+        cancelled = transition_channel_plan(
+            channel_plan_id=first_plan.pk,
+            to_state=ChannelPlan.State.CANCELLED,
+            expected_version=first_plan.state_version,
+            command_id=uuid.uuid4(),
+            reason="Cancel while retaining the exact planning history.",
+            principal=self.owner,
+            acting_role=self.owner.role,
+        ).aggregate
+        self.assertEqual(cancelled.current_state, ChannelPlan.State.CANCELLED)
+        cancelled_detail = self.client.get(
+            reverse("dailyops:batch-detail", args=[self.product.pk, batch_key])
+        )
+        self.assertFalse(cancelled_detail.context["plan_form"].has_platform_choices)
+        self.assertContains(cancelled_detail, "已取消的安排也保留历史")
+
+        after_cancel = self.client.post(
+            reverse("dailyops:plan-create", args=[initiative.pk]),
+            self._plan_data(command_id=str(uuid.uuid4())),
+            follow=True,
+        )
+        self.assertContains(after_cancel, "本轮已经安排过")
+        self.assertEqual(ChannelPlan.objects.filter(initiative=initiative).count(), 1)
+
+    def test_view_only_batch_detail_keeps_history_visible_without_write_controls(self):
+        batch_key, initiative = self._approved_initiative()
+        created = self.client.post(
+            reverse("dailyops:plan-create", args=[initiative.pk]),
+            self._plan_data(),
+        )
+        self.assertEqual(created.status_code, 302)
+        plan = ChannelPlan.objects.get(initiative=initiative)
+        proposal = SignalAssessment.objects.get(
+            assessment_key=f"daily-analysis-{batch_key.hex}",
+            version_number=1,
+        )
+        evidence = ExternalEvidenceItem.objects.get(collection_run__batch_key=batch_key)
+        PermissionGrant.objects.create(
+            principal=self.outsider,
+            scope_kind=PermissionGrant.ScopeKind.PRODUCT,
+            product=self.product,
+            action=PermissionGrant.Action.VIEW,
+            valid_from=timezone.now() - timedelta(minutes=1),
+            valid_until=timezone.now() + timedelta(days=1),
+            granted_by_principal=self.owner,
+        )
+
+        self.client.force_login(self.outsider)
+        detail = self.client.get(
+            reverse("dailyops:batch-detail", args=[self.product.pk, batch_key])
+        )
+
+        self.assertEqual(detail.status_code, 200)
+        self.assertFalse(detail.context["can_edit_batch"])
+        self.assertContains(detail, "当前是只读查看")
+        self.assertContains(detail, evidence.title)
+        self.assertContains(detail, proposal.value["topic_label"])
+        self.assertContains(detail, plan.goal["title"])
+        write_urls = (
+            reverse("dailyops:automatic-collect", args=[self.product.pk, batch_key]),
+            reverse(
+                "dailyops:platform-collect",
+                args=[self.product.pk, batch_key, Platform.TIKTOK.value],
+            ),
+            reverse("dailyops:evidence-manual-unified", args=[self.product.pk, batch_key]),
+            reverse("dailyops:evidence-csv-unified", args=[self.product.pk, batch_key]),
+            reverse(
+                "dailyops:evidence-correct",
+                args=[self.product.pk, batch_key, evidence.pk],
+            ),
+            reverse(
+                "dailyops:evidence-invalidate",
+                args=[self.product.pk, batch_key, evidence.pk],
+            ),
+            reverse("dailyops:analysis-propose", args=[self.product.pk, batch_key]),
+            reverse(
+                "dailyops:analysis-accept-and-start",
+                args=[self.product.pk, batch_key, proposal.pk],
+            ),
+            reverse("dailyops:initiative-transition", args=[initiative.pk]),
+            reverse("dailyops:plan-create", args=[initiative.pk]),
+            reverse("dailyops:plan-confirm-and-compile", args=[plan.pk]),
+            reverse("dailyops:plan-transition", args=[plan.pk]),
+            reverse("dailyops:plan-compile", args=[plan.pk]),
+        )
+        for write_url in write_urls:
+            with self.subTest(write_url=write_url):
+                self.assertNotContains(detail, write_url)
+
     def test_channel_plan_fails_closed_without_current_binding(self):
         batch_key, initiative = self._approved_initiative()
         ChannelAccount.objects.create(
@@ -421,6 +623,11 @@ class DailyOperationsUITests(TestCase):
             follow=True,
         )
         self.assertContains(response, "同时连接了多个运行环境")
+        self.assertContains(response, "还没有可用的执行平台")
+        self.assertContains(
+            response,
+            f'{reverse("dashboard:runtime-configuration")}?platform=TIKTOK#platform-tiktok',
+        )
         self.assertFalse(ChannelPlan.objects.filter(initiative=initiative).exists())
 
     def test_channel_plan_fails_closed_when_current_capability_is_closed(self):
@@ -442,7 +649,59 @@ class DailyOperationsUITests(TestCase):
             follow=True,
         )
         self.assertContains(response, "当前不能人工发布")
+        self.assertContains(response, "还没有可用的执行平台")
+        self.assertContains(
+            response,
+            f'{reverse("dashboard:runtime-configuration")}?platform=TIKTOK#platform-tiktok',
+        )
         self.assertFalse(ChannelPlan.objects.filter(initiative=initiative).exists())
+
+    def test_runtime_setup_recovery_link_is_permission_aware(self):
+        batch_key, _ = self._approved_initiative()
+        CapabilityState.objects.create(
+            account_environment_binding=self.binding,
+            capability_code=CapabilityState.MANUAL_PUBLISH,
+            state_version=2,
+            state=CapabilityState.State.CLOSED,
+            effective_from=timezone.now() - timedelta(minutes=1),
+            reason="Not ready for an operator recovery-link test.",
+            supersedes=self.capability,
+            created_by_principal=self.owner,
+            recorded_by_principal=self.owner,
+        )
+        now = timezone.now()
+        for action in (PermissionGrant.Action.VIEW, PermissionGrant.Action.EDIT):
+            PermissionGrant.objects.create(
+                principal=self.outsider,
+                scope_kind=PermissionGrant.ScopeKind.PRODUCT,
+                product=self.product,
+                action=action,
+                valid_from=now - timedelta(minutes=1),
+                valid_until=now + timedelta(days=1),
+                granted_by_principal=self.owner,
+            )
+        for action in (PermissionGrant.Action.COLLECT_READ_ONLY, PermissionGrant.Action.MANAGE_ACCOUNT):
+            PermissionGrant.objects.create(
+                principal=self.outsider,
+                scope_kind=PermissionGrant.ScopeKind.GLOBAL,
+                action=action,
+                risk_level=(
+                    PermissionGrant.RiskLevel.HIGH
+                    if action == PermissionGrant.Action.MANAGE_ACCOUNT
+                    else PermissionGrant.RiskLevel.LOW
+                ),
+                valid_from=now - timedelta(minutes=1),
+                valid_until=now + timedelta(days=1),
+                granted_by_principal=self.owner,
+            )
+
+        self.client.force_login(self.outsider)
+        response = self.client.get(
+            reverse("dailyops:batch-detail", args=[self.product.pk, batch_key])
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "请联系 Owner 或运营管理员")
+        self.assertNotContains(response, reverse("dashboard:runtime-configuration"))
 
     def test_channel_plan_rejects_cross_platform_account_without_all_label(self):
         _, initiative = self._approved_initiative()
@@ -654,6 +913,47 @@ class DailyOperationsUITests(TestCase):
         self.assertContains(response, "至少先保存一条")
         self.assertFalse(SignalAssessment.objects.exists())
 
+    def test_expired_evidence_is_hidden_and_cannot_generate_a_proposal(self):
+        batch_key, _, _ = self._start()
+        run = (
+            CollectionRun.objects.filter(batch_key=batch_key)
+            .select_related("source")
+            .order_by("id")
+            .first()
+        )
+        self.assertIsNotNone(run)
+        source = run.source
+        now = timezone.now()
+        ExternalEvidenceItem.objects.create(
+            source=source,
+            collection_run=run,
+            platform_code=source.platform_code,
+            market_code=self.product.market_code,
+            language_code=self.product.language_code,
+            external_url="https://www.tiktok.com/@puko/video/expired-input",
+            title="Expired input must stay out",
+            excerpt="This evidence expired before the proposal was generated.",
+            facts={"source": "expired-test"},
+            observed_at=now - timedelta(days=2),
+            expires_at=now - timedelta(days=1),
+            dedupe_key=f"dk1_{uuid.uuid4().hex}",
+            created_by_principal=self.owner,
+        )
+
+        detail = self.client.get(
+            reverse("dailyops:batch-detail", args=[self.product.pk, batch_key])
+        )
+        self.assertEqual(detail.context["current_step"], 2)
+        self.assertNotContains(detail, "Expired input must stay out")
+
+        proposed = self.client.post(
+            reverse("dailyops:analysis-propose", args=[self.product.pk, batch_key]),
+            {"command_id": str(uuid.uuid4())},
+            follow=True,
+        )
+        self.assertContains(proposed, "至少先保存一条")
+        self.assertFalse(SignalAssessment.objects.exists())
+
     def test_automatic_collection_button_defaults_to_fail_closed_and_keeps_fallback(self):
         batch_key, _, _ = self._start()
         command_id = uuid.uuid4()
@@ -736,6 +1036,413 @@ class DailyOperationsUITests(TestCase):
         self.assertTrue(EvidenceInvalidationEvent.objects.filter(evidence_item=evidence).exists())
         detail = self.client.get(reverse("dailyops:batch-detail", args=[self.product.pk, batch_key]))
         self.assertNotContains(detail, "https://www.tiktok.com/@puko/video/999")
+
+    def test_manual_evidence_correction_prefills_and_appends_without_rewriting_history(self):
+        batch_key, _, _ = self._start()
+        self.client.post(
+            reverse("dailyops:evidence-manual-unified", args=[self.product.pk, batch_key]),
+            {
+                "command_id": str(uuid.uuid4()),
+                "collected_at": timezone.now().isoformat(),
+                "reference": "https://www.tiktok.com/@puko/video/wrong-version",
+                "platform": "",
+                "title": "Wrong title",
+                "content_text": "Wrong notes",
+            },
+        )
+        original = ExternalEvidenceItem.objects.get(collection_run__batch_key=batch_key)
+        original_snapshot = {
+            "external_url": original.external_url,
+            "title": original.title,
+            "excerpt": original.excerpt,
+        }
+        correction_url = reverse(
+            "dailyops:evidence-correct",
+            args=[self.product.pk, batch_key, original.pk],
+        )
+
+        correction_page = self.client.get(correction_url)
+        self.assertContains(correction_page, "修改这条补录内容")
+        self.assertContains(correction_page, "wrong-version")
+        self.assertContains(correction_page, "Wrong title")
+
+        response = self.client.post(
+            correction_url,
+            {
+                "command_id": str(uuid.uuid4()),
+                "collected_at": (timezone.now() + timedelta(seconds=1)).isoformat(),
+                "reference": "https://www.tiktok.com/@puko/video/correct-version",
+                "platform": Platform.TIKTOK.value,
+                "title": "Correct title",
+                "content_text": "Correct notes",
+                "reason": "The original link was the wrong version.",
+            },
+            follow=True,
+        )
+
+        self.assertContains(response, "线索已更正")
+        original.refresh_from_db()
+        self.assertEqual(
+            {
+                "external_url": original.external_url,
+                "title": original.title,
+                "excerpt": original.excerpt,
+            },
+            original_snapshot,
+        )
+        invalidation = EvidenceInvalidationEvent.objects.get(evidence_item=original)
+        self.assertEqual(
+            invalidation.reason,
+            "[USER_PROVIDED] The original link was the wrong version.",
+        )
+        replacement = ExternalEvidenceItem.objects.get(
+            collection_run__batch_key=batch_key,
+            invalidation_event__isnull=True,
+        )
+        self.assertNotEqual(replacement.pk, original.pk)
+        self.assertEqual(replacement.title, "Correct title")
+        self.assertEqual(replacement.excerpt, "Correct notes")
+        self.assertEqual(ExternalEvidenceItem.objects.filter(collection_run__batch_key=batch_key).count(), 2)
+
+    def test_evidence_correction_requires_edit_permission_and_manual_source(self):
+        batch_key, _, _ = self._start()
+        self.client.post(
+            reverse("dailyops:evidence-manual-unified", args=[self.product.pk, batch_key]),
+            {
+                "command_id": str(uuid.uuid4()),
+                "collected_at": timezone.now().isoformat(),
+                "reference": "https://www.tiktok.com/@puko/video/protected-entry",
+                "platform": "",
+            },
+        )
+        evidence = ExternalEvidenceItem.objects.get(collection_run__batch_key=batch_key)
+        PermissionGrant.objects.create(
+            principal=self.outsider,
+            scope_kind=PermissionGrant.ScopeKind.PRODUCT,
+            product=self.product,
+            action=PermissionGrant.Action.VIEW,
+            valid_from=timezone.now() - timedelta(minutes=1),
+            valid_until=timezone.now() + timedelta(days=1),
+            granted_by_principal=self.owner,
+        )
+        self.client.force_login(self.outsider)
+        denied = self.client.get(
+            reverse(
+                "dailyops:evidence-correct",
+                args=[self.product.pk, batch_key, evidence.pk],
+            )
+        )
+        self.assertEqual(denied.status_code, 403)
+        self.assertFalse(EvidenceInvalidationEvent.objects.filter(evidence_item=evidence).exists())
+
+        self.client.force_login(self.owner)
+        automatic_source = SourceRegistry.objects.filter(
+            platform_code=Platform.TIKTOK.value,
+            source_kind=SourceRegistry.SourceKind.THIRD_PARTY_API,
+        ).first()
+        automatic_run = CollectionRun.objects.get(
+            batch_key=batch_key,
+            source=automatic_source,
+            attempt_number=1,
+        )
+        automatic_evidence = ExternalEvidenceItem.objects.create(
+            source=automatic_source,
+            collection_run=automatic_run,
+            platform_code=Platform.TIKTOK.value,
+            market_code=self.product.market_code,
+            language_code=self.product.language_code,
+            external_url="https://www.tiktok.com/@puko/video/api-result",
+            title="API result",
+            facts={"source_kind": "automatic-test"},
+            observed_at=timezone.now(),
+            dedupe_key=f"test-api-{uuid.uuid4()}",
+            created_by_principal=self.owner,
+        )
+        not_manual = self.client.get(
+            reverse(
+                "dailyops:evidence-correct",
+                args=[self.product.pk, batch_key, automatic_evidence.pk],
+            )
+        )
+        self.assertEqual(not_manual.status_code, 404)
+
+    def test_evidence_correction_rolls_back_invalidation_when_replacement_fails(self):
+        batch_key, _, _ = self._start()
+        self.client.post(
+            reverse("dailyops:evidence-manual-unified", args=[self.product.pk, batch_key]),
+            {
+                "command_id": str(uuid.uuid4()),
+                "collected_at": timezone.now().isoformat(),
+                "reference": "https://www.tiktok.com/@puko/video/rollback-original",
+                "platform": "",
+                "title": "Original kept on failure",
+            },
+        )
+        evidence = ExternalEvidenceItem.objects.get(collection_run__batch_key=batch_key)
+        correction_url = reverse(
+            "dailyops:evidence-correct",
+            args=[self.product.pk, batch_key, evidence.pk],
+        )
+
+        with patch(
+            "dailyops.services.ingest_manual_link",
+            side_effect=ValidationError("replacement failed"),
+        ):
+            response = self.client.post(
+                correction_url,
+                {
+                    "command_id": str(uuid.uuid4()),
+                    "collected_at": (timezone.now() + timedelta(seconds=1)).isoformat(),
+                    "reference": "https://www.tiktok.com/@puko/video/rollback-replacement",
+                    "platform": Platform.TIKTOK.value,
+                    "title": "Replacement that fails",
+                    "content_text": "Replacement notes",
+                    "reason": "Correcting the original entry.",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "replacement failed")
+        self.assertFalse(
+            EvidenceInvalidationEvent.objects.filter(evidence_item=evidence).exists()
+        )
+        self.assertEqual(
+            ExternalEvidenceItem.objects.filter(collection_run__batch_key=batch_key).count(),
+            1,
+        )
+        evidence.refresh_from_db()
+        self.assertEqual(evidence.title, "Original kept on failure")
+
+    def test_an_already_invalidated_item_cannot_be_corrected_again_with_a_new_command(self):
+        batch_key, proposal = self._pending_proposal()
+        original = proposal.evidence_item
+        self.client.post(
+            reverse(
+                "dailyops:evidence-invalidate",
+                args=[self.product.pk, batch_key, original.pk],
+            ),
+            {"command_id": str(uuid.uuid4())},
+        )
+
+        with self.assertRaisesMessage(ValidationError, "已经作废"):
+            correct_manual_evidence(
+                evidence_id=original.pk,
+                batch_key=batch_key,
+                product=self.product,
+                command_id=uuid.uuid4(),
+                platform=Platform.TIKTOK,
+                external_url="https://www.tiktok.com/@puko/video/second-correction",
+                external_content_id="",
+                title="Second correction",
+                content_text="Must not be created.",
+                collected_at=timezone.now(),
+                reason="Trying to correct an inactive historical row.",
+                principal=self.owner,
+                acting_role=self.owner.role,
+            )
+        self.assertEqual(
+            ExternalEvidenceItem.objects.filter(collection_run__batch_key=batch_key).count(),
+            1,
+        )
+
+    def test_changed_evidence_marks_proposal_stale_and_regeneration_preserves_history(self):
+        batch_key, proposal_v1 = self._pending_proposal()
+        original = proposal_v1.evidence_item
+        original_value = dict(proposal_v1.value)
+        self.client.post(
+            reverse(
+                "dailyops:evidence-invalidate",
+                args=[self.product.pk, batch_key, original.pk],
+            ),
+            {"command_id": str(uuid.uuid4())},
+        )
+        self.client.post(
+            reverse("dailyops:evidence-manual-unified", args=[self.product.pk, batch_key]),
+            {
+                "command_id": str(uuid.uuid4()),
+                "collected_at": (timezone.now() + timedelta(seconds=1)).isoformat(),
+                "reference": "https://www.tiktok.com/@puko/video/replacement-signal",
+                "platform": "",
+                "title": "Replacement signal",
+            },
+        )
+        replacement = ExternalEvidenceItem.objects.get(
+            collection_run__batch_key=batch_key,
+            invalidation_event__isnull=True,
+        )
+
+        stale_page = self.client.get(
+            reverse("dailyops:batch-detail", args=[self.product.pk, batch_key])
+        )
+        self.assertTrue(stale_page.context["proposal_is_stale"])
+        self.assertContains(stale_page, "线索已经修改，原建议不能再采用")
+        self.assertContains(stale_page, "根据最新线索重新生成建议")
+        self.assertNotContains(stale_page, "采用建议并建立执行项目")
+
+        stale_accept = self.client.post(
+            reverse(
+                "dailyops:analysis-accept-and-start",
+                args=[self.product.pk, batch_key, proposal_v1.pk],
+            ),
+            {"command_id": str(uuid.uuid4())},
+            follow=True,
+        )
+        self.assertContains(stale_accept, "The proposal evidence set changed")
+        self.assertFalse(ProductOpportunity.objects.filter(product=self.product).exists())
+        self.assertFalse(Initiative.objects.filter(product=self.product).exists())
+
+        regenerated = self.client.post(
+            reverse("dailyops:analysis-propose", args=[self.product.pk, batch_key]),
+            {"command_id": str(uuid.uuid4())},
+            follow=True,
+        )
+        self.assertContains(regenerated, "已生成选题建议")
+        proposal_v2 = SignalAssessment.objects.get(
+            assessment_key=f"daily-analysis-{batch_key.hex}",
+            version_number=2,
+        )
+        proposal_v1.refresh_from_db()
+        self.assertEqual(proposal_v1.value, original_value)
+        self.assertEqual(proposal_v2.supersedes_id, proposal_v1.pk)
+        self.assertEqual(proposal_v2.evidence_item_id, original.pk)
+        self.assertEqual(proposal_v2.value["evidence_ids"], [str(replacement.pk)])
+        self.assertNotEqual(
+            proposal_v2.value["evidence_fingerprint"],
+            proposal_v1.value["evidence_fingerprint"],
+        )
+        current_page = self.client.get(
+            reverse("dailyops:batch-detail", args=[self.product.pk, batch_key])
+        )
+        self.assertFalse(current_page.context["proposal_is_stale"])
+        self.assertContains(current_page, "采用建议并建立执行项目")
+
+        accepted = self.client.post(
+            reverse(
+                "dailyops:analysis-accept-and-start",
+                args=[self.product.pk, batch_key, proposal_v2.pk],
+            ),
+            {"command_id": str(uuid.uuid4())},
+            follow=True,
+        )
+        self.assertContains(accepted, "已采用建议并建立执行项目")
+        opportunity = ProductOpportunity.objects.get(opportunity_key=f"daily-{batch_key.hex}")
+        linked_ids = set(
+            opportunity.demand_assessment.evidence_links.values_list(
+                "evidence_item_id", flat=True
+            )
+        )
+        self.assertEqual(linked_ids, {replacement.pk})
+        self.assertNotIn(original.pk, linked_ids)
+
+    def test_removing_all_evidence_returns_to_collection_and_hides_stale_actions(self):
+        batch_key, proposal = self._pending_proposal()
+        self.client.post(
+            reverse(
+                "dailyops:evidence-invalidate",
+                args=[self.product.pk, batch_key, proposal.evidence_item_id],
+            ),
+            {"command_id": str(uuid.uuid4())},
+        )
+
+        detail = self.client.get(
+            reverse("dailyops:batch-detail", args=[self.product.pk, batch_key])
+        )
+        self.assertEqual(detail.context["current_step"], 2)
+        self.assertContains(detail, "至少先保存一条真实线索")
+        self.assertNotContains(detail, "采用建议并建立执行项目")
+        self.assertNotContains(detail, "根据最新线索重新生成建议")
+
+    def test_human_decision_blocks_remove_and_correction_and_keeps_original_evidence(self):
+        batch_key, proposal = self._pending_proposal()
+        self.client.post(
+            reverse(
+                "dailyops:analysis-accept",
+                args=[self.product.pk, batch_key, proposal.pk],
+            ),
+            {"command_id": str(uuid.uuid4())},
+        )
+        evidence = proposal.evidence_item
+
+        removed = self.client.post(
+            reverse(
+                "dailyops:evidence-invalidate",
+                args=[self.product.pk, batch_key, evidence.pk],
+            ),
+            {"command_id": str(uuid.uuid4())},
+            follow=True,
+        )
+        self.assertContains(removed, "这次建议已经由人工采用")
+        self.assertContains(removed, "新开一轮工作")
+        self.assertFalse(EvidenceInvalidationEvent.objects.filter(evidence_item=evidence).exists())
+
+        correction = self.client.get(
+            reverse(
+                "dailyops:evidence-correct",
+                args=[self.product.pk, batch_key, evidence.pk],
+            ),
+            follow=True,
+        )
+        self.assertContains(correction, "这次建议已经由人工采用")
+        self.assertContains(correction, "新开一轮工作")
+        self.assertEqual(
+            ExternalEvidenceItem.objects.filter(collection_run__batch_key=batch_key).count(),
+            1,
+        )
+
+        original_run_count = CollectionRun.objects.filter(batch_key=batch_key).count()
+        manual = self.client.post(
+            reverse("dailyops:evidence-manual-unified", args=[self.product.pk, batch_key]),
+            {
+                "command_id": str(uuid.uuid4()),
+                "collected_at": timezone.now().isoformat(),
+                "reference": "https://www.tiktok.com/@puko/video/too-late",
+                "platform": "",
+                "title": "Too late",
+                "content_text": "The accepted batch must remain frozen.",
+            },
+            follow=True,
+        )
+        self.assertContains(manual, "不能再采集、补录、更正或移除线索")
+
+        csv = self.client.post(
+            reverse("dailyops:evidence-csv-unified", args=[self.product.pk, batch_key]),
+            {
+                "command_id": str(uuid.uuid4()),
+                "platform": Platform.TIKTOK.value,
+                "csv_text": (
+                    "url,title,content_text,collected_at\n"
+                    f"https://www.tiktok.com/@puko/video/too-late-csv,Too late CSV,"
+                    f"Accepted batches are frozen,{timezone.now().isoformat()}"
+                ),
+            },
+            follow=True,
+        )
+        self.assertContains(csv, "不能再采集、补录、更正或移除线索")
+
+        automatic = self.client.post(
+            reverse("dailyops:automatic-collect", args=[self.product.pk, batch_key]),
+            {"command_id": str(uuid.uuid4())},
+            follow=True,
+        )
+        self.assertContains(automatic, "不能再采集、补录、更正或移除线索")
+
+        progressive = self.client.post(
+            reverse(
+                "dailyops:platform-collect",
+                args=[self.product.pk, batch_key, Platform.PINTEREST.value],
+            ),
+            {"command_id": str(uuid.uuid4())},
+        )
+        self.assertEqual(progressive.status_code, 400)
+        self.assertIn("不能再采集、补录、更正或移除线索", progressive.json()["message"])
+        self.assertEqual(
+            CollectionRun.objects.filter(batch_key=batch_key).count(),
+            original_run_count,
+        )
+        self.assertEqual(
+            ExternalEvidenceItem.objects.filter(collection_run__batch_key=batch_key).count(),
+            1,
+        )
 
     def test_manual_entry_does_not_guess_unknown_or_conflicting_platform(self):
         batch_key, _, _ = self._start()
@@ -1246,6 +1953,68 @@ class DailyOperationsUITests(TestCase):
         self.assertEqual(denied.status_code, 403)
         self.assertFalse(DailyBatchDispositionEvent.objects.filter(batch_key=batch_key).exists())
 
+    def test_blank_ordinary_notes_store_an_explicit_system_default(self):
+        batch_key, initiative = self._approved_initiative()
+
+        transitioned = self.client.post(
+            reverse("dailyops:initiative-transition", args=[initiative.pk]),
+            {
+                "command_id": str(uuid.uuid4()),
+                "expected_version": initiative.state_version,
+                "to_state": Initiative.State.ACTIVE,
+                "reason": "",
+            },
+        )
+        self.assertEqual(transitioned.status_code, 302)
+        transition_event = InitiativeStateEvent.objects.get(
+            initiative=initiative,
+            to_state=Initiative.State.ACTIVE,
+        )
+        self.assertTrue(transition_event.reason.startswith(SYSTEM_DEFAULT_TAG))
+
+        disposed = self.client.post(
+            reverse("dailyops:batch-dispose", args=[self.product.pk, batch_key]),
+            {
+                "command_id": str(uuid.uuid4()),
+                "reason": "",
+                "confirm": "on",
+            },
+        )
+        self.assertEqual(disposed.status_code, 302)
+        disposition = DailyBatchDispositionEvent.objects.get(batch_key=batch_key)
+        self.assertTrue(disposition.reason.startswith(SYSTEM_DEFAULT_TAG))
+        self.assertEqual(disposition.reason_source, "SYSTEM_DEFAULT")
+
+    def test_legacy_untagged_batch_disposition_command_replays_without_conflict(self):
+        batch_key, _, _ = self._start()
+        command_id = uuid.uuid4()
+        url = reverse("dailyops:batch-dispose", args=[self.product.pk, batch_key])
+        legacy_reason = "Legacy untagged reason."
+        payload = {
+            "command_id": str(command_id),
+            "reason": legacy_reason,
+            "confirm": "on",
+        }
+        first = self.client.post(url, payload)
+        self.assertEqual(first.status_code, 302)
+        event = DailyBatchDispositionEvent.objects.get(command_id=command_id)
+        QuerySet(model=DailyBatchDispositionEvent, using="default").filter(pk=event.pk).update(
+            reason=legacy_reason,
+            payload_hash=canonical_sha256(
+                {
+                    "batch_key": str(batch_key),
+                    "product_id": str(self.product.pk),
+                    "disposition": event.disposition,
+                    "reason": legacy_reason,
+                }
+            ),
+        )
+
+        replay = self.client.post(url, payload)
+
+        self.assertEqual(replay.status_code, 302)
+        self.assertEqual(DailyBatchDispositionEvent.objects.filter(command_id=command_id).count(), 1)
+
     def test_view_only_product_has_no_recommendation_or_start_action(self):
         batch_key, proposal = self._pending_proposal()
         self.client.post(
@@ -1280,13 +2049,18 @@ class DailyOperationsUITests(TestCase):
             {"command_id": str(uuid.uuid4())},
         )
         opportunity = ProductOpportunity.objects.get(opportunity_key=f"daily-{batch_key.hex}")
+        # Old immutable facts keep their historical title; the UI uses the
+        # actual collection query so legacy fixed text is not duplicated.
+        self.assertEqual(opportunity.title, "Daily Operations dry run")
         suggested = self.client.get(reverse("dailyops:home"))
-        self.assertContains(suggested, opportunity.title)
-        self.assertContains(suggested, "已确认的外部需求")
-        self.assertContains(suggested, "按这个建议开始研究")
+        # The same batch is already present under Recent work.  It must not be
+        # rendered a second time as a seemingly new recommendation.
+        self.assertEqual(suggested.context["data_recommendations"], ())
+        self.assertContains(suggested, "afternoon focus")
+        self.assertContains(suggested, "afternoon focus", count=1)
 
         evidence = ExternalEvidenceItem.objects.get(collection_run__batch_key=batch_key)
-        self.client.post(
+        blocked = self.client.post(
             reverse(
                 "dailyops:evidence-invalidate",
                 args=[self.product.pk, batch_key, evidence.pk],
@@ -1295,14 +2069,19 @@ class DailyOperationsUITests(TestCase):
                 "command_id": str(uuid.uuid4()),
                 "reason": "这条证据已经失效。",
             },
+            follow=True,
         )
-        invalidated = self.client.get(reverse("dailyops:home"))
-        self.assertNotContains(invalidated, opportunity.title)
-        self.assertContains(invalidated, "目前没有可直接采用的数据建议")
+        self.assertContains(blocked, "这次建议已经由人工采用")
+        self.assertContains(blocked, "新开一轮工作")
+        self.assertFalse(
+            EvidenceInvalidationEvent.objects.filter(evidence_item=evidence).exists()
+        )
+        unchanged = self.client.get(reverse("dailyops:home"))
+        self.assertContains(unchanged, "afternoon focus")
 
         self.client.force_login(self.outsider)
         outsider_home = self.client.get(reverse("dailyops:home"))
-        self.assertNotContains(outsider_home, opportunity.title)
+        self.assertNotContains(outsider_home, "afternoon focus")
 
     def test_post_requires_csrf(self):
         csrf_client = Client(enforce_csrf_checks=True)

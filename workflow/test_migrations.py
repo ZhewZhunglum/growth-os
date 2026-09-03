@@ -19,9 +19,19 @@ class TaskAssignmentSupersessionMigrationTests(TransactionTestCase):
         executor = MigrationExecutor(connection)
         self.latest_targets = executor.loader.graph.leaf_nodes()
         self.addCleanup(self._restore_latest_schema)
+        # contentops.0006 is deliberately installed after workflow.0006
+        # because its database trigger joins workflow_task.  Roll both apps
+        # back to the last graph-consistent state before this workflow upgrade;
+        # otherwise keeping the contentops leaf would pull workflow.0006 back
+        # in and the historical ORM would no longer match the physical table.
         from_targets = [
-            target for target in self.latest_targets if target[0] != "workflow"
-        ] + [self.migrate_from]
+            target
+            for target in self.latest_targets
+            if target[0] not in {"workflow", "contentops"}
+        ] + [
+            ("contentops", "0005_owner_self_approval_policy"),
+            self.migrate_from,
+        ]
         executor.migrate(from_targets)
         old_apps = executor.loader.project_state(from_targets).apps
         self.legacy_ids = self._create_legacy_assignment_history(old_apps)

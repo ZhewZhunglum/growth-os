@@ -47,5 +47,22 @@ class FeedbackFriendlyChoiceLabelTests(SimpleTestCase):
         )
         self.assertEqual(
             geo_item_choice_label(item),
-            "PUKO Focus · 问题 3 · What helps with afternoon focus?",
+            "正式问题 · PUKO Focus · 问题 3 · What helps with afternoon focus?",
         )
+
+    def test_local_seed_choice_is_explicit_even_when_question_is_truncated(self):
+        panel = SimpleNamespace(
+            product=SimpleNamespace(name="PUKO"),
+            panel_key="local-test-puko-geo",
+        )
+        item = SimpleNamespace(
+            panel=panel,
+            item_number=1,
+            intent="LOCAL_DOGFOOD_GEO_VISIBILITY",
+            question="How does a very long system-preset question appear in the compact selector without losing its source label?",
+        )
+
+        label = geo_item_choice_label(item)
+
+        self.assertTrue(label.startswith("本地测试题 · 系统预设 · PUKO · 问题 1"))
+        self.assertTrue(label.endswith("…"))

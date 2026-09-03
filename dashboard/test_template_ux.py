@@ -33,7 +33,31 @@ class DashboardTemplateUXTests(SimpleTestCase):
             ),
             ("dashboard/review_queue.html", {"tasks": [], "completed_reviews": []}, 'href="/"', "返回首页"),
             ("dashboard/release_queue.html", {"tasks": []}, 'href="/"', "返回首页"),
-            ("dashboard/configuration_home.html", {"products": []}, 'href="/features/"', "返回功能中心"),
+            ("dashboard/configuration_home.html", {"products": []}, 'href="/"', "返回首页"),
+            (
+                "dashboard/runtime_configuration.html",
+                {
+                    "execution_platforms": [],
+                    "analytical_platforms": [],
+                    "environment_summaries": [],
+                    "ready_execution_count": 0,
+                    "execution_count": 0,
+                },
+                'href="/configuration/"',
+                "返回设置",
+            ),
+            (
+                "dashboard/runtime_configuration_advanced.html",
+                {
+                    "forms": SimpleNamespace(),
+                    "accounts": [],
+                    "environments": [],
+                    "bindings": [],
+                    "capabilities": [],
+                },
+                'href="/configuration/runtime/"',
+                "返回渠道状态",
+            ),
             ("dashboard/team_members.html", {"staff_rows": []}, 'href="/features/"', "返回功能中心"),
             ("dashboard/guide.html", {}, 'href="/features/"', "返回功能中心"),
             ("dashboard/change_password.html", {}, 'href="/features/"', "返回功能中心"),
@@ -79,6 +103,15 @@ class DashboardTemplateUXTests(SimpleTestCase):
         self.assertIn('input[type="checkbox"]:not(:disabled)', css)
         self.assertIn('[role="button"]:not([aria-disabled="true"]),label[for]{cursor:pointer}', css)
         self.assertIn('[aria-disabled="true"],.is-disabled{cursor:not-allowed}', css)
+
+    def test_mobile_navigation_keeps_primary_links_available(self):
+        css = (Path(settings.BASE_DIR) / "static" / "css" / "app.css").read_text(encoding="utf-8")
+
+        self.assertIn(".sidebar nav{display:flex", css)
+        self.assertIn("overflow-x:auto", css)
+        self.assertIn(".sidebar nav .nav-item.is-active{order:-1}", css)
+        self.assertIn(".connection-account-row p,.connection-empty p", css)
+        self.assertIn(".connection-status,.connection-account-state", css)
 
     def test_login_uses_password_manager_metadata_and_stores_username_only(self):
         html = render_to_string(

@@ -14,6 +14,7 @@ from django.db import models, transaction
 from django.db.models import Q
 from django.utils import timezone
 
+from core.audit_notes import tag_optional_audit_note
 from core.models import UUIDv7Model
 from workflow.services import guard_review, guard_submission
 
@@ -704,6 +705,16 @@ class TaskSubmission(AppendOnlyFact):
         permission_grant,
         recorded_by_principal,
     ) -> TaskSubmission:
+        existing_note = (
+            cls.objects.filter(command_id=command_id)
+            .values_list("submission_note", flat=True)
+            .first()
+        )
+        submission_note = tag_optional_audit_note(
+            submission_note,
+            default="Submission sealed without an additional delivery note.",
+            existing_value=existing_note,
+        )
         if triggering_review is not None:
             if supersedes_submission is None:
                 supersedes_submission = triggering_review.submission
@@ -822,6 +833,7 @@ class ReviewDecision(AppendOnlyFact):
     class PayloadSchemaVersion(models.IntegerChoices):
         V1 = 1, "Legacy review command"
         V2 = 2, "Reviewer-bound review command"
+        V3 = 3, "Reviewer and Owner-edit-bound review command"
 
     class Decision(models.TextChoices):
         APPROVED = "APPROVED", "Approved"
@@ -837,7 +849,7 @@ class ReviewDecision(AppendOnlyFact):
     payload_hash = models.CharField(max_length=64, validators=[validate_sha256], blank=True)
     payload_schema_version = models.PositiveSmallIntegerField(
         choices=PayloadSchemaVersion.choices,
-        default=PayloadSchemaVersion.V2,
+        default=PayloadSchemaVersion.V3,
     )
     expected_task_version = models.PositiveIntegerField()
     reviewer_principal = models.ForeignKey(
@@ -846,6 +858,13 @@ class ReviewDecision(AppendOnlyFact):
     reviewer_acting_role = models.CharField(max_length=24, choices=ActingRole.choices)
     reviewer_grant = models.ForeignKey(
         "accounts.PermissionGrant", on_delete=models.PROTECT, related_name="review_decisions_made"
+    )
+    owner_edit_grant = models.ForeignKey(
+        "accounts.PermissionGrant",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="owner_self_approvals_made",
     )
     recorded_by_principal = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="review_decisions_recorded"
@@ -878,6 +897,46 @@ class ReviewDecision(AppendOnlyFact):
             and decision == ReviewDecision.Decision.APPROVED
         )
 
+    @staticmethod
+    def owner_self_approval_has_product_edit_authorization(
+        *,
+        submission: TaskSubmission,
+        reviewer_principal,
+        acting_role: str,
+        owner_edit_grant,
+        at=None,
+    ) -> bool:
+        """Require a current, exact Product EDIT allow with DENY precedence.
+
+        The review row and its V3 command hash store both the exact REVIEW and
+        EDIT grants.  The Task transition in the same application transaction
+        independently records that same EDIT grant.  This check is mirrored by
+        the database trigger so raw inserts cannot manufacture the Owner
+        exception without both live permissions.
+        """
+
+        from accounts.authorization import resolve_authorization
+        from accounts.models import PermissionGrant
+
+        decision = resolve_authorization(
+            principal=reviewer_principal,
+            acting_role=acting_role,
+            action=PermissionGrant.Action.EDIT,
+            scope_kind=PermissionGrant.ScopeKind.PRODUCT,
+            product=submission.task.product_id,
+            at=at or timezone.now(),
+        )
+        grant = decision.grant
+        return bool(
+            decision.allowed
+            and grant is not None
+            and owner_edit_grant is not None
+            and grant.pk == owner_edit_grant.pk
+            and grant.action == PermissionGrant.Action.EDIT
+            and grant.scope_kind == PermissionGrant.ScopeKind.PRODUCT
+            and grant.product_id == submission.task.product_id
+        )
+
     def command_payload(self, *, schema_version: int | None = None) -> dict[str, Any]:
         """Return the exact payload shape used by the stored hash.
 
@@ -896,14 +955,25 @@ class ReviewDecision(AppendOnlyFact):
         }
         if version == self.PayloadSchemaVersion.V1:
             return legacy_payload
-        if version != self.PayloadSchemaVersion.V2:
+        if version not in {
+            self.PayloadSchemaVersion.V2,
+            self.PayloadSchemaVersion.V3,
+        }:
             raise ValidationError({"payload_schema_version": "Unsupported review payload schema version."})
-        return {
+        reviewer_bound_payload = {
             **legacy_payload,
-            "payload_schema_version": self.PayloadSchemaVersion.V2,
+            "payload_schema_version": version,
             "reviewer_principal_id": str(self.reviewer_principal_id),
             "reviewer_acting_role": self.reviewer_acting_role,
             "reviewer_grant_id": str(self.reviewer_grant_id),
+        }
+        if version == self.PayloadSchemaVersion.V2:
+            return reviewer_bound_payload
+        return {
+            **reviewer_bound_payload,
+            "owner_edit_grant_id": (
+                str(self.owner_edit_grant_id) if self.owner_edit_grant_id else None
+            ),
         }
 
     def clean(self):
@@ -940,6 +1010,67 @@ class ReviewDecision(AppendOnlyFact):
                     )
                 }
             )
+        is_owner_self_approval = bool(
+            self.submission_id
+            and self.reviewer_principal_id
+            and self.owner_self_approval_allowed(
+                submission=self.submission,
+                decision=self.decision,
+                reviewer_principal=self.reviewer_principal,
+                acting_role=self.reviewer_acting_role,
+            )
+        )
+        if is_owner_self_approval:
+            from accounts.models import PermissionGrant
+
+            if self.payload_schema_version != self.PayloadSchemaVersion.V3:
+                raise ValidationError(
+                    {
+                        "payload_schema_version": (
+                            "Owner final approval must use the exact-grant-bound V3 payload."
+                        )
+                    }
+                )
+            if not self.rationale.strip():
+                raise ValidationError(
+                    {"rationale": "Owner final approval requires a non-empty audit reason."}
+                )
+            if (
+                not self.reviewer_grant_id
+                or self.reviewer_grant.action != PermissionGrant.Action.REVIEW
+                or self.reviewer_grant.scope_kind != PermissionGrant.ScopeKind.PRODUCT
+                or self.reviewer_grant.product_id != self.submission.task.product_id
+            ):
+                raise ValidationError(
+                    {
+                        "reviewer_grant": (
+                            "Owner final approval requires the exact REVIEW grant for this Product."
+                        )
+                    }
+                )
+            if not self.owner_self_approval_has_product_edit_authorization(
+                submission=self.submission,
+                reviewer_principal=self.reviewer_principal,
+                acting_role=self.reviewer_acting_role,
+                owner_edit_grant=self.owner_edit_grant,
+                at=self.decided_at or timezone.now(),
+            ):
+                raise ValidationError(
+                    {
+                        "reviewer_principal": (
+                            "Owner final approval also requires the exact current Product EDIT grant."
+                        )
+                    }
+                )
+        elif self.owner_edit_grant_id:
+            raise ValidationError(
+                {
+                    "owner_edit_grant": (
+                        "The Owner EDIT grant may only be recorded for an Owner approving "
+                        "their own submission."
+                    )
+                }
+            )
         if self.reviewer_grant_id and self.reviewer_principal_id and self.submission_id:
             _validate_grant(
                 grant=self.reviewer_grant,
@@ -968,7 +1099,29 @@ class ReviewDecision(AppendOnlyFact):
         acting_role: str,
         permission_grant,
         recorded_by_principal,
+        owner_edit_grant=None,
     ) -> ReviewDecision:
+        is_owner_self_approval = cls.owner_self_approval_allowed(
+            submission=submission,
+            decision=decision,
+            reviewer_principal=reviewer_principal,
+            acting_role=acting_role,
+        )
+        raw_rationale = str(rationale or "").strip()
+        if is_owner_self_approval and not raw_rationale:
+            raise ValidationError(
+                {"rationale": "Owner final approval requires a non-empty audit reason."}
+            )
+        existing_rationale = (
+            cls.objects.filter(command_id=command_id)
+            .values_list("rationale", flat=True)
+            .first()
+        )
+        rationale = tag_optional_audit_note(
+            raw_rationale,
+            default="Review decision recorded without an additional note.",
+            existing_value=existing_rationale,
+        )
         criteria_results = criteria_results or {}
         provisional = cls(
             submission=submission,
@@ -976,24 +1129,18 @@ class ReviewDecision(AppendOnlyFact):
             rationale=rationale,
             criteria_results=criteria_results,
             command_id=command_id,
-            payload_schema_version=cls.PayloadSchemaVersion.V2,
+            payload_schema_version=cls.PayloadSchemaVersion.V3,
             expected_task_version=expected_task_version,
             reviewer_principal=reviewer_principal,
             reviewer_acting_role=acting_role,
             reviewer_grant=permission_grant,
+            owner_edit_grant=owner_edit_grant,
             recorded_by_principal=recorded_by_principal,
             decided_at=timezone.now(),
         )
-        provisional.payload_hash = canonical_sha256(provisional.command_payload())
-        provisional.decision_sha256 = provisional.payload_hash
         if (
             reviewer_principal.pk == submission.submitted_by_principal_id
-            and not cls.owner_self_approval_allowed(
-                submission=submission,
-                decision=decision,
-                reviewer_principal=reviewer_principal,
-                acting_role=acting_role,
-            )
+            and not is_owner_self_approval
         ):
             raise ValidationError(
                 {
@@ -1003,8 +1150,18 @@ class ReviewDecision(AppendOnlyFact):
                     )
                 }
             )
+        if not is_owner_self_approval and owner_edit_grant is not None:
+            raise ValidationError(
+                {
+                    "owner_edit_grant": (
+                        "The Owner EDIT grant may only be recorded for an Owner approving "
+                        "their own submission."
+                    )
+                }
+            )
 
         with transaction.atomic():
+            from accounts.models import PermissionGrant
             from workflow.models import Task, TaskStateEvent
 
             # Withdrawal uses this same Task -> Submission order.  The first
@@ -1013,6 +1170,27 @@ class ReviewDecision(AppendOnlyFact):
             locked_submission = TaskSubmission.objects.select_for_update().get(pk=submission.pk)
             locked_submission.task = locked_task
             provisional.submission = locked_submission
+
+            grant_ids = {permission_grant.pk}
+            if owner_edit_grant is not None:
+                grant_ids.add(owner_edit_grant.pk)
+            locked_grants = {
+                grant.pk: grant
+                for grant in PermissionGrant.objects.select_for_update()
+                .filter(pk__in=sorted(grant_ids, key=str))
+                .order_by("id")
+            }
+            if set(locked_grants) != grant_ids:
+                raise ValidationError("One or more exact review authorization grants no longer exist.")
+            locked_review_grant = locked_grants[permission_grant.pk]
+            locked_owner_edit_grant = (
+                locked_grants[owner_edit_grant.pk] if owner_edit_grant is not None else None
+            )
+            provisional.reviewer_grant = locked_review_grant
+            provisional.owner_edit_grant = locked_owner_edit_grant
+            provisional.decided_at = timezone.now()
+            provisional.payload_hash = canonical_sha256(provisional.command_payload())
+            provisional.decision_sha256 = provisional.payload_hash
 
             existing_command = cls.objects.filter(command_id=command_id).first()
             if existing_command:
@@ -1026,9 +1204,20 @@ class ReviewDecision(AppendOnlyFact):
                     or existing_command.reviewer_principal_id != reviewer_principal.pk
                     or existing_command.reviewer_acting_role != acting_role
                     or existing_command.reviewer_grant_id != permission_grant.pk
+                    or existing_command.owner_edit_grant_id
+                    != (owner_edit_grant.pk if owner_edit_grant is not None else None)
                 ):
                     raise ValidationError("The command_id was already used with a different review command.")
                 return existing_command
+
+            if is_owner_self_approval and locked_owner_edit_grant is None:
+                raise ValidationError(
+                    {
+                        "owner_edit_grant": (
+                            "Owner final approval requires the exact Product EDIT grant."
+                        )
+                    }
+                )
 
             guard_review(locked_task, submission=locked_submission)
             if (
@@ -1060,6 +1249,31 @@ class ReviewDecision(AppendOnlyFact):
                 )
             if cls.objects.filter(submission=locked_submission).exists():
                 raise ValidationError("This submission already has its one final review decision.")
+            # Re-resolve both exact grants only after the Task, Submission and
+            # grant rows are locked.  DENY precedence and expiry therefore
+            # cannot be bypassed with a stale object prepared by the caller.
+            _validate_grant(
+                grant=locked_review_grant,
+                principal=reviewer_principal,
+                acting_role=acting_role,
+                allowed_actions={"REVIEW", "APPROVE"},
+                product_id=locked_task.product_id,
+            )
+            if is_owner_self_approval and not cls.owner_self_approval_has_product_edit_authorization(
+                submission=locked_submission,
+                reviewer_principal=reviewer_principal,
+                acting_role=acting_role,
+                owner_edit_grant=locked_owner_edit_grant,
+                at=provisional.decided_at,
+            ):
+                raise ValidationError(
+                    {
+                        "owner_edit_grant": (
+                            "Owner final approval requires the centrally resolved, exact current "
+                            "Product EDIT grant."
+                        )
+                    }
+                )
             provisional._record_final_authorized = True
             provisional.save()
             return provisional

@@ -985,7 +985,17 @@ class ChannelPlan(EventProjectedAggregate):
     )
 
     class Meta:
-        constraints = [models.CheckConstraint(condition=~Q(creation_payload_hash=""), name="intel_plan_creation_hash_set")]
+        constraints = [
+            models.CheckConstraint(condition=~Q(creation_payload_hash=""), name="intel_plan_creation_hash_set"),
+            models.CheckConstraint(
+                condition=Q(platform_code__in=["TIKTOK", "PINTEREST", "QUORA", "SHOPIFY"]),
+                name="intel_plan_exec_platform_code",
+            ),
+            models.UniqueConstraint(
+                fields=["initiative", "platform_code"],
+                name="intel_plan_init_platform_uniq",
+            ),
+        ]
 
     def clean(self):
         super().clean()
