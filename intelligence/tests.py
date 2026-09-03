@@ -6,6 +6,7 @@ from decimal import Decimal
 
 from django.core.exceptions import PermissionDenied, ValidationError
 from django.db import IntegrityError, transaction
+from django.db.models.query import QuerySet
 from django.test import TestCase
 from django.utils import timezone
 
@@ -27,6 +28,7 @@ from intelligence.models import (
     ProductTopicFitAssessment,
     RawArtifact,
     RiskLevel,
+    SignalAssessment,
     SourceRegistry,
     TaskCompilationContext,
     Topic,
@@ -339,6 +341,200 @@ class IntelligenceFoundationTests(TestCase):
                 acting_role=Principal.Role.OWNER,
             )
 
+    def test_collection_write_guard_preserves_exact_replay_after_human_decision(self):
+        now = timezone.now()
+        batch_key = uuid.uuid4()
+        operation_key = uuid.uuid4()
+        call = {
+            "source": self.source,
+            "batch_key": batch_key,
+            "attempt_number": 1,
+            "operation_key": operation_key,
+            "query_spec": {"product_id": str(self.product.pk), "query": "focus"},
+            "status": CollectionRun.Status.SUCCEEDED,
+            "availability_state": AvailabilityState.PRESENT,
+            "started_at": now - timedelta(seconds=2),
+            "completed_at": now,
+            "result_summary": {"items": 1},
+            "error_code": "",
+            "principal": self.owner,
+            "acting_role": Principal.Role.OWNER,
+        }
+        recorded = record_collection_run(**call)
+        evidence = ExternalEvidenceItem.objects.create(
+            source=self.source,
+            collection_run=recorded.run,
+            platform_code="TIKTOK",
+            market_code="US",
+            language_code="en",
+            external_url="https://www.tiktok.com/@example/video/human-decision",
+            external_content_id="human-decision",
+            title="Human decision evidence",
+            excerpt="Exact evidence used by the human decision.",
+            facts={"query": "focus"},
+            observed_at=now,
+            provenance_sha256="",
+            dedupe_key=f"human-decision-{batch_key.hex}",
+            created_by_principal=self.owner,
+        )
+        SignalAssessment.objects.create(
+            evidence_item=evidence,
+            assessment_key=f"daily-analysis-{batch_key.hex}",
+            version_number=1,
+            signal_type="DAILY_OPERATIONS_ANALYSIS",
+            value={"product_id": str(self.product.pk), "batch_key": str(batch_key)},
+            confidence=Decimal("0.8000"),
+            method=AssessmentMethod.HUMAN,
+            decision_state="APPROVED",
+            rationale="A human accepted this exact evidence set.",
+            assessed_by_principal=self.owner,
+            decided_by_principal=self.owner,
+        )
+
+        replay = record_collection_run(**call)
+        self.assertFalse(replay.created)
+        self.assertEqual(replay.run.pk, recorded.run.pk)
+
+        blocked_call = dict(call)
+        blocked_call.update(operation_key=uuid.uuid4(), attempt_number=2)
+        with self.assertRaisesMessage(ValidationError, "这次建议已经由人工采用"):
+            record_collection_run(**blocked_call)
+        self.assertEqual(CollectionRun.objects.filter(batch_key=batch_key).count(), 1)
+
+    def test_collection_write_guard_rejects_missing_or_forged_batch_product(self):
+        now = timezone.now()
+        batch_key = uuid.uuid4()
+        first_call = {
+            "source": self.source,
+            "batch_key": batch_key,
+            "attempt_number": 1,
+            "operation_key": uuid.uuid4(),
+            "query_spec": {"product_id": str(self.product.pk), "query": "focus"},
+            "status": CollectionRun.Status.SUCCEEDED,
+            "availability_state": AvailabilityState.PRESENT,
+            "started_at": now - timedelta(seconds=2),
+            "completed_at": now,
+            "result_summary": {"items": 1},
+            "error_code": "",
+            "principal": self.owner,
+            "acting_role": Principal.Role.OWNER,
+        }
+        first = record_collection_run(**first_call)
+
+        missing_product_call = dict(first_call)
+        missing_product_call.update(
+            attempt_number=2,
+            operation_key=uuid.uuid4(),
+            query_spec={"query": "focus without product"},
+        )
+        with self.assertRaisesMessage(ValidationError, "exact Product identity"):
+            record_collection_run(**missing_product_call)
+
+        forged_product_call = dict(first_call)
+        forged_product_call.update(
+            attempt_number=2,
+            operation_key=uuid.uuid4(),
+            query_spec={"product_id": str(uuid.uuid4()), "query": "focus for another product"},
+        )
+        with self.assertRaisesMessage(ValidationError, "exact Product identity"):
+            record_collection_run(**forged_product_call)
+
+        self.assertEqual(CollectionRun.objects.filter(batch_key=batch_key).count(), 1)
+        self.assertEqual(first.run.query_spec["product_id"], str(self.product.pk))
+
+    def test_collection_write_guard_keeps_first_generic_batch_generic(self):
+        now = timezone.now()
+        batch_key = uuid.uuid4()
+        first = record_collection_run(
+            source=self.source,
+            batch_key=batch_key,
+            attempt_number=1,
+            operation_key=uuid.uuid4(),
+            query_spec={"query": "generic research"},
+            status=CollectionRun.Status.SUCCEEDED,
+            availability_state=AvailabilityState.PRESENT,
+            started_at=now - timedelta(seconds=2),
+            completed_at=now,
+            result_summary={"items": 1},
+            error_code="",
+            principal=self.owner,
+            acting_role=Principal.Role.OWNER,
+        )
+        second = record_collection_run(
+            source=self.source,
+            batch_key=batch_key,
+            attempt_number=2,
+            operation_key=uuid.uuid4(),
+            query_spec={"query": "generic research retry"},
+            status=CollectionRun.Status.PARTIAL,
+            availability_state=AvailabilityState.PRESENT,
+            started_at=now,
+            completed_at=now,
+            result_summary={"items": 0},
+            error_code="NO_NEW_ITEMS",
+            principal=self.owner,
+            acting_role=Principal.Role.OWNER,
+        )
+
+        self.assertTrue(first.created)
+        self.assertTrue(second.created)
+        self.assertNotIn("product_id", first.run.query_spec)
+        self.assertNotIn("product_id", second.run.query_spec)
+
+    def test_collection_write_guard_rejects_new_write_after_product_opportunity(self):
+        now = timezone.now()
+        batch_key = uuid.uuid4()
+        first = record_collection_run(
+            source=self.source,
+            batch_key=batch_key,
+            attempt_number=1,
+            operation_key=uuid.uuid4(),
+            query_spec={"product_id": str(self.product.pk), "query": "focus"},
+            status=CollectionRun.Status.SUCCEEDED,
+            availability_state=AvailabilityState.PRESENT,
+            started_at=now - timedelta(seconds=2),
+            completed_at=now,
+            result_summary={"items": 1},
+            error_code="",
+            principal=self.owner,
+            acting_role=Principal.Role.OWNER,
+        )
+        ProductOpportunity.objects.create(
+            product=self.product,
+            topic=self.topic,
+            demand_assessment=self.demand,
+            product_topic_fit_assessment=self.fit_assessment,
+            opportunity_key=f"daily-{batch_key.hex}",
+            title="Human-approved daily opportunity",
+            recommendation="Keep the accepted evidence set frozen.",
+            priority_score=Decimal("0.8000"),
+            risk_level=RiskLevel.MEDIUM,
+            creation_command_id=uuid.uuid4(),
+            creation_payload_hash=canonical_sha256({"batch_key": str(batch_key)}),
+            created_by_principal=self.owner,
+            created_under_grant=self.edit_grant,
+            updated_by_principal=self.owner,
+        )
+
+        with self.assertRaisesMessage(ValidationError, "这次建议已经由人工采用"):
+            record_collection_run(
+                source=self.source,
+                batch_key=batch_key,
+                attempt_number=2,
+                operation_key=uuid.uuid4(),
+                query_spec={"product_id": str(self.product.pk), "query": "focus again"},
+                status=CollectionRun.Status.PARTIAL,
+                availability_state=AvailabilityState.PRESENT,
+                started_at=now,
+                completed_at=now,
+                result_summary={"items": 0},
+                error_code="NO_NEW_ITEMS",
+                principal=self.owner,
+                acting_role=Principal.Role.OWNER,
+            )
+        self.assertEqual(CollectionRun.objects.filter(batch_key=batch_key).count(), 1)
+        self.assertEqual(first.run.batch_key, batch_key)
+
     def test_external_demand_rejects_cross_domain_mutation_and_facts_are_immutable(self):
         self.evidence.data_domain = "GEO"
         with self.assertRaises(ValidationError):
@@ -378,6 +574,31 @@ class IntelligenceFoundationTests(TestCase):
         self.assertEqual(first.event.pk, replay.event.pk)
         self.assertEqual(first.event.permission_grant_id, self.edit_grant.pk)
         self.assertEqual(first.aggregate.state_version, 1)
+
+        # Commands stored before audit-source tags existed must remain exact,
+        # conflict-free replays after the convention is introduced.
+        legacy_reason = "Evidence and product fit are ready for human triage."
+        QuerySet(model=first.event.__class__, using="default").filter(pk=first.event.pk).update(
+            reason=legacy_reason,
+            payload_hash=canonical_sha256(
+                {
+                    "aggregate_id": str(self.opportunity.pk),
+                    "to_state": ProductOpportunity.State.TRIAGED,
+                    "expected_version": 0,
+                    "reason": legacy_reason,
+                }
+            ),
+        )
+        legacy_replay = transition_opportunity(
+            opportunity_id=self.opportunity.pk,
+            to_state=ProductOpportunity.State.TRIAGED,
+            expected_version=0,
+            command_id=command_id,
+            reason=legacy_reason,
+            principal=self.owner,
+            acting_role=Principal.Role.OWNER,
+        )
+        self.assertFalse(legacy_replay.created)
 
         with self.assertRaises(CommandReplayConflict):
             transition_opportunity(

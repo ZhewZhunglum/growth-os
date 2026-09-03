@@ -10,7 +10,7 @@ from accounts.models import PermissionGrant, Principal
 from insights.models import GEOProbePanel, GEOProbePanelItem
 from intelligence.models import SourceRegistry
 from products.models import Product
-from releasegate.models import ChannelAccount
+from releasegate.models import AccountEnvironmentBinding, CapabilityState, ChannelAccount
 from workflow.models import Task, TaskContractVersion
 
 
@@ -90,17 +90,28 @@ class BootstrapDailyOperationsTests(TestCase):
             )
 
         product = Product.objects.get(product_code="PUKO")
-        channel = ChannelAccount.objects.get(account_code="puko-us")
+        channels = tuple(ChannelAccount.objects.order_by("platform_code"))
+        self.assertSetEqual(
+            {channel.platform_code for channel in channels},
+            {"TIKTOK", "PINTEREST", "QUORA", "SHOPIFY"},
+        )
+        self.assertTrue(all("[LOCAL TEST ONLY]" in channel.display_name for channel in channels))
+        self.assertEqual(AccountEnvironmentBinding.objects.count(), 4)
+        self.assertEqual(CapabilityState.objects.count(), 4)
+        self.assertTrue(
+            all("[LOCAL TEST ONLY]" in capability.reason for capability in CapabilityState.objects.all())
+        )
         for principal in (owner, admin, operator):
-            publish_grant = PermissionGrant.objects.get(
+            publish_grants = PermissionGrant.objects.filter(
                 principal=principal,
                 action=PermissionGrant.Action.PUBLISH,
                 scope_kind=PermissionGrant.ScopeKind.ACCOUNT,
-                account_ref=channel.account_code,
             )
-            self.assertEqual(publish_grant.effect, PermissionGrant.Effect.ALLOW)
-            self.assertEqual(publish_grant.risk_level, PermissionGrant.RiskLevel.HIGH)
-            self.assertIsNotNone(publish_grant.valid_until)
+            self.assertEqual(publish_grants.count(), 4)
+            for publish_grant in publish_grants:
+                self.assertEqual(publish_grant.effect, PermissionGrant.Effect.ALLOW)
+                self.assertEqual(publish_grant.risk_level, PermissionGrant.RiskLevel.HIGH)
+                self.assertIsNotNone(publish_grant.valid_until)
         profile = product.current_profile_version
         self.assertIsNotNone(profile)
         self.assertTrue(profile.is_sealed)
@@ -130,6 +141,9 @@ class BootstrapDailyOperationsTests(TestCase):
             "contracts": TaskContractVersion.objects.count(),
             "geo_panels": GEOProbePanel.objects.count(),
             "geo_items": GEOProbePanelItem.objects.count(),
+            "channel_accounts": ChannelAccount.objects.count(),
+            "bindings": AccountEnvironmentBinding.objects.count(),
+            "capabilities": CapabilityState.objects.count(),
         }
 
         self._run()
@@ -140,3 +154,6 @@ class BootstrapDailyOperationsTests(TestCase):
         self.assertEqual(TaskContractVersion.objects.count(), counts["contracts"])
         self.assertEqual(GEOProbePanel.objects.count(), counts["geo_panels"])
         self.assertEqual(GEOProbePanelItem.objects.count(), counts["geo_items"])
+        self.assertEqual(ChannelAccount.objects.count(), counts["channel_accounts"])
+        self.assertEqual(AccountEnvironmentBinding.objects.count(), counts["bindings"])
+        self.assertEqual(CapabilityState.objects.count(), counts["capabilities"])

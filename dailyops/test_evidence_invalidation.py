@@ -6,6 +6,7 @@ from datetime import timedelta
 from django.contrib import admin
 from django.core.exceptions import PermissionDenied, ValidationError
 from django.test import RequestFactory, TestCase
+from django.db.models.query import QuerySet
 from django.utils import timezone
 
 from accounts.models import PermissionGrant, Principal
@@ -17,7 +18,7 @@ from dailyops.services import (
     start_daily_batch,
 )
 from integrations.connectors.types import Platform
-from intelligence.models import EvidenceInvalidationEvent, ExternalEvidenceItem
+from intelligence.models import EvidenceInvalidationEvent, ExternalEvidenceItem, canonical_sha256
 from intelligence.admin import ImmutableAuditAdmin
 from products.models import Product
 
@@ -116,6 +117,42 @@ class EvidenceInvalidationTests(TestCase):
                 principal=self.owner,
                 acting_role=self.owner.role,
             )
+
+    def test_legacy_untagged_invalidation_command_replays_without_conflict(self):
+        command_id = uuid.uuid4()
+        legacy_reason = "Legacy untagged evidence reason."
+        first = invalidate_evidence(
+            evidence_id=self.evidence.pk,
+            product=self.product,
+            batch_key=self.batch_key,
+            command_id=command_id,
+            reason=legacy_reason,
+            principal=self.owner,
+            acting_role=self.owner.role,
+        )
+        QuerySet(model=EvidenceInvalidationEvent, using="default").filter(pk=first.event.pk).update(
+            reason=legacy_reason,
+            payload_hash=canonical_sha256(
+                {
+                    "evidence_item_id": str(self.evidence.pk),
+                    "product_id": str(self.product.pk),
+                    "reason": legacy_reason,
+                }
+            ),
+        )
+
+        replay = invalidate_evidence(
+            evidence_id=self.evidence.pk,
+            product=self.product,
+            batch_key=self.batch_key,
+            command_id=command_id,
+            reason=legacy_reason,
+            principal=self.owner,
+            acting_role=self.owner.role,
+        )
+
+        self.assertFalse(replay.created)
+        self.assertEqual(replay.event.pk, first.event.pk)
 
     def test_event_rejects_wrong_product(self):
         other = Product.objects.create(

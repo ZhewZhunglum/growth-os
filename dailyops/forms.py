@@ -7,6 +7,7 @@ from django import forms
 from django.utils import timezone
 
 from dailyops.platform_detection import detect_platform
+from dailyops.platforms import EXECUTION_PLATFORMS, EXECUTION_PLATFORM_VALUES
 from integrations.connectors.types import Platform
 from products.models import Product
 from releasegate.models import ChannelAccount
@@ -58,7 +59,8 @@ class CommandForm(forms.Form):
 
 class BatchDispositionForm(CommandForm):
     reason = forms.CharField(
-        label="原因",
+        label="说明（可不填）",
+        required=False,
         max_length=2_000,
         widget=forms.Textarea(
             attrs={"rows": 2, "placeholder": "例如：选错了研究问题，重新开始一轮"}
@@ -68,6 +70,9 @@ class BatchDispositionForm(CommandForm):
         label="我确认从最近工作隐藏；历史记录仍会保留",
         required=True,
     )
+
+    def clean_reason(self):
+        return str(self.cleaned_data.get("reason") or "").strip()
 
 
 class DailyBatchForm(CommandForm):
@@ -226,6 +231,28 @@ class ManualEvidenceForm(CommandForm):
         return cleaned
 
 
+class EvidenceCorrectionForm(ManualEvidenceForm):
+    reason = forms.CharField(
+        label="更正说明（可不填）",
+        required=False,
+        max_length=2_000,
+        widget=forms.Textarea(
+            attrs={"rows": 2, "placeholder": "例如：原链接粘贴错误，改为正确版本"}
+        ),
+    )
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.is_english:
+            self.fields["reason"].label = "Reason for correction"
+            self.fields["reason"].widget.attrs["placeholder"] = (
+                "For example: replace the incorrect link with the correct version"
+            )
+
+    def clean_reason(self):
+        return str(self.cleaned_data.get("reason") or "").strip()
+
+
 class CSVTextForm(CommandForm):
     platform = forms.ChoiceField(
         label="平台",
@@ -286,10 +313,14 @@ class TransitionForm(CommandForm):
     expected_version = forms.IntegerField(widget=forms.HiddenInput, min_value=0)
     to_state = forms.CharField(widget=forms.HiddenInput)
     reason = forms.CharField(
-        label="决定理由",
+        label="决定说明（可不填）",
+        required=False,
         max_length=2_000,
         widget=forms.Textarea(attrs={"rows": 2, "placeholder": "用一句大白话说明为什么这样决定"}),
     )
+
+    def clean_reason(self):
+        return str(self.cleaned_data.get("reason") or "").strip()
 
 
 class ChannelPlanForm(CommandForm):
@@ -314,11 +345,31 @@ class ChannelPlanForm(CommandForm):
         label="要做什么", max_length=5_000, widget=forms.Textarea(attrs={"rows": 3})
     )
 
-    def __init__(self, *args, accounts=None, language_code: str | None = None, **kwargs):
+    def __init__(
+        self,
+        *args,
+        accounts=None,
+        excluded_platforms=(),
+        language_code: str | None = None,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self.is_english = _is_english(language_code)
         account_queryset = accounts if accounts is not None else ChannelAccount.objects.none()
-        account_list = list(account_queryset)
+        excluded_platform_values = {
+            platform.value if isinstance(platform, Platform) else str(platform)
+            for platform in excluded_platforms
+        }
+        configured_execution_accounts = [
+            account
+            for account in account_queryset
+            if account.platform_code in EXECUTION_PLATFORM_VALUES
+        ]
+        account_list = [
+            account
+            for account in configured_execution_accounts
+            if account.platform_code not in excluded_platform_values
+        ]
         self.fields["channel_account"].queryset = ChannelAccount.objects.filter(
             pk__in=[account.pk for account in account_list]
         ).order_by("platform_code", "display_name", "account_code")
@@ -332,6 +383,14 @@ class ChannelPlanForm(CommandForm):
             self.fields["plan_date"].label = "Work date"
             self.fields["task_title"].label = "Task title"
             self.fields["task_description"].label = "What should be done?"
+            self.fields["platform"].error_messages["invalid_choice"] = (
+                "That platform is already planned or is analysis-only; continue the existing work."
+            )
+        else:
+            self.fields["platform"].error_messages["invalid_choice"] = (
+                "这个平台在本轮已经安排过（已取消的安排也保留历史），"
+                "或它只用于数据分析；如需重做，请新开一轮 Daily Operations。"
+            )
 
         self._accounts_by_platform: dict[str, list[ChannelAccount]] = {}
         for account in account_list:
@@ -339,9 +398,19 @@ class ChannelPlanForm(CommandForm):
 
         self.fields["platform"].choices = [
             (platform.value, platform_label(platform, english=self.is_english))
-            for platform in Platform
+            for platform in EXECUTION_PLATFORMS
             if platform.value in self._accounts_by_platform
         ]
+        self.has_platform_choices = bool(self.fields["platform"].choices)
+        if self.has_platform_choices:
+            self.no_platform_reason = ""
+        elif configured_execution_accounts:
+            self.no_platform_reason = "EXHAUSTED"
+        else:
+            # The queryset is already permission-filtered by the server.  Do
+            # not pretend platforms are exhausted when this principal simply
+            # has no configured/authorized execution account.
+            self.no_platform_reason = "UNAVAILABLE"
 
         # The normal V1 case is one configured account per platform.  In that
         # case the server derives the exact account after the platform is

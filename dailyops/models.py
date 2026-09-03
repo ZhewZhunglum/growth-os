@@ -6,6 +6,7 @@ from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import models
 
+from core.audit_notes import audit_note_source, audit_note_text
 from intelligence.models import ActingRole, ImmutableFact, canonical_sha256
 
 
@@ -63,6 +64,14 @@ class DailyBatchDispositionEvent(ImmutableFact):
             "disposition": self.disposition,
             "reason": self.reason,
         }
+
+    @property
+    def reason_display(self) -> str:
+        return audit_note_text(self.reason)
+
+    @property
+    def reason_source(self) -> str:
+        return audit_note_source(self.reason)
 
     def clean(self):
         super().clean()

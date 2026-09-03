@@ -11,6 +11,7 @@ from django.db import IntegrityError, models, transaction
 from django.db.models import Q
 from django.utils import timezone
 
+from core.audit_notes import tag_optional_audit_note
 from core.models import TimeStampedModel, UUIDv7Model
 from workflow.exceptions import (
     CheckGateRejected,
@@ -727,6 +728,17 @@ class Task(TimeStampedModel):
 
         from contentops.models import ReviewDecision, TaskSubmission
 
+        existing_reason = (
+            TaskStateEvent.objects.filter(command_id=command_id)
+            .values_list("reason", flat=True)
+            .first()
+        )
+        normalized_reason = tag_optional_audit_note(
+            reason,
+            default="Submission withdrawn without an additional explanation.",
+            existing_value=existing_reason,
+        )
+
         with transaction.atomic():
             task = cls.objects.select_for_update().get(pk=task_id)
             submission = TaskSubmission.objects.select_for_update().get(pk=submission_id)
@@ -737,7 +749,7 @@ class Task(TimeStampedModel):
                 "actor_principal_id": str(actor_principal.pk),
                 "acting_role": acting_role,
                 "permission_grant_id": str(permission_grant.pk),
-                "reason": reason,
+                "reason": normalized_reason,
             }
             digest = payload_sha256(payload)
             existing = TaskStateEvent.objects.filter(command_id=command_id).first()
@@ -790,7 +802,7 @@ class Task(TimeStampedModel):
                 resulting_state_version=next_version,
                 event_sequence=next_version,
                 previous_event=previous,
-                reason=reason,
+                reason=normalized_reason,
                 actor_principal=actor_principal,
                 acting_role=acting_role,
                 permission_grant=permission_grant,
@@ -834,9 +846,16 @@ class Task(TimeStampedModel):
 
         from contentops.models import ReviewDecision, TaskSubmission
 
-        normalized_reason = reason.strip()
-        if not normalized_reason:
-            raise ValidationError("Cancelling a task requires a reason.")
+        existing_reason = (
+            TaskStateEvent.objects.filter(command_id=command_id)
+            .values_list("reason", flat=True)
+            .first()
+        )
+        normalized_reason = tag_optional_audit_note(
+            reason,
+            default="Task cancelled without an additional explanation.",
+            existing_value=existing_reason,
+        )
 
         with transaction.atomic():
             task = cls.objects.select_for_update().get(pk=task_id)

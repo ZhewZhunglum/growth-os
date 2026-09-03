@@ -16,7 +16,7 @@ def _is_english() -> bool:
 
 REVIEW_FORM_TEXT = {
     "decision": ("审核结论", "Review decision"),
-    "rationale": ("审核说明", "Review notes"),
+    "rationale": ("审核说明（选填）", "Review notes (optional)"),
     "channel_account": ("发布账号", "Publishing account"),
     "runtime_environment": ("运行环境", "Runtime environment"),
     "mode": ("执行方式", "Publishing method"),
@@ -30,8 +30,8 @@ REVIEW_FORM_TEXT = {
 
 REVIEW_FORM_HELP = {
     "rationale": (
-        "请用自然语言说明为什么通过，或具体需要修改什么。",
-        "Explain in plain language why this passes or exactly what needs to change.",
+        "普通审核可不填写；系统会明确记录为未填写。",
+        "A normal review may omit this note; the system records that explicitly.",
     ),
     "external_url": (
         "选择人工发布时，网址或平台内容 ID 至少填写一项。",
@@ -71,22 +71,24 @@ class ReviewDecisionForm(CommandVersionForm):
         ),
     )
     rationale = forms.CharField(
-        label="审核说明",
+        label="审核说明（选填）",
+        required=False,
         max_length=4000,
         widget=forms.Textarea(attrs={"rows": 5}),
-        help_text="请用自然语言说明为什么通过，或具体需要修改什么。",
+        help_text="不填写也可以继续；系统会保存清晰的默认审计说明。",
     )
 
     def __init__(self, *args, **kwargs):
         owner_self_approval = kwargs.pop("owner_self_approval", False)
         super().__init__(*args, **kwargs)
         if owner_self_approval:
+            self.fields["rationale"].required = True
             self.fields["decision"].choices = (
                 (ReviewDecision.Decision.APPROVED, "Owner 最终批准（已审计）"),
             )
             self.fields["decision"].help_text = "Owner 可批准自己提交的内容；本次批准会保留独立审计记录。"
-            self.fields["rationale"].label = "批准说明"
-            self.fields["rationale"].help_text = "请简要记录为什么批准进入发布检查。"
+            self.fields["rationale"].label = "Owner 自批原因（必填）"
+            self.fields["rationale"].help_text = "Owner 自批属于高风险例外，请填写本次批准理由。"
         if _is_english():
             if owner_self_approval:
                 self.fields["decision"].choices = (
@@ -95,8 +97,8 @@ class ReviewDecisionForm(CommandVersionForm):
                 self.fields["decision"].help_text = (
                     "An Owner may approve their own submission; this approval is recorded separately."
                 )
-                self.fields["rationale"].label = "Approval note"
-                self.fields["rationale"].help_text = "Briefly record why this may continue to release checks."
+                self.fields["rationale"].label = "Owner self-approval reason (required)"
+                self.fields["rationale"].help_text = "Owner self-approval is a high-risk exception, so a reason is required."
             else:
                 self.fields["decision"].choices = (
                     (ReviewDecision.Decision.APPROVED, "Approve and continue to release checks"),

@@ -8,6 +8,7 @@ from django.db import transaction
 
 from accounts.authorization import require_authorization
 from accounts.models import PermissionGrant, Principal
+from core.audit_notes import tag_optional_audit_note
 from dailyops.models import DailyBatchDispositionEvent
 from intelligence.exceptions import CommandReplayConflict
 from intelligence.models import CollectionRun, Initiative, ProductOpportunity, canonical_sha256
@@ -62,9 +63,12 @@ def dispose_daily_batch(
 ) -> DailyBatchDispositionResult:
     """Hide a run from active work without deleting or rewriting history."""
 
-    normalized_reason = reason.strip()
-    if not normalized_reason:
-        raise ValidationError("请简单说明为什么从最近工作隐藏这次记录。")
+    replay = DailyBatchDispositionEvent.objects.filter(command_id=command_id).first()
+    normalized_reason = tag_optional_audit_note(
+        reason,
+        default="未填写额外说明；由系统记录本次隐藏操作。",
+        existing_value=replay.reason if replay is not None else None,
+    )
 
     if principal.role not in {Principal.Role.OWNER, Principal.Role.OPERATIONS_ADMIN}:
         raise PermissionDenied("ONLY_OWNER_OR_ADMIN_CAN_HIDE_DAILY_WORK")
@@ -110,7 +114,6 @@ def dispose_daily_batch(
         }
     )
 
-    replay = DailyBatchDispositionEvent.objects.filter(command_id=command_id).first()
     if replay is not None:
         if replay.payload_hash != payload_hash or replay.principal_id != principal.pk:
             raise CommandReplayConflict("The command ID was already used for another Daily batch decision.")

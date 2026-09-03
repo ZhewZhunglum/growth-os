@@ -89,6 +89,7 @@ from intelligence.models import (
     RawArtifact,
     SignalAssessment,
     TaskCompilationContext,
+    canonical_sha256,
 )
 from intelligence.services import (
     transition_channel_plan,
@@ -817,71 +818,23 @@ class FullDailyOperationsVerticalFlowTests(TestCase):
         self.assertFalse(revision_replay.created)
         self.assertEqual(revision_replay.asset_version.pk, asset_version.pk)
 
-        # Invalidate only one item after v1/v2 were created. Both immutable
-        # versions stay in history, but neither may be revised or submitted.
-        invalidate_evidence(
-            evidence_id=evidence_to_invalidate.pk,
-            product=self.product,
-            batch_key=batch_key,
-            command_id=uuid.uuid4(),
-            reason="The secondary fixture was linked to the wrong source.",
-            principal=self.owner,
-            acting_role=self.owner.role,
-        )
-        stale_version_count = ContentAssetVersion.objects.count()
-        with self.assertRaisesMessage(ValidationError, "外部需求证据已经作废"):
-            revise_task_content_draft(
-                task=task,
-                source_version=asset_version,
-                inline_content=asset_version.inline_content + "\n\nThis stale edit must not persist.",
+        # Once the proposal has a durable human decision and Opportunity,
+        # evidence correction/removal must fail closed.  A new Daily batch is
+        # required instead of silently changing the accepted planning basis.
+        with self.assertRaisesMessage(ValidationError, "新开一轮工作"):
+            invalidate_evidence(
+                evidence_id=evidence_to_invalidate.pk,
+                product=self.product,
+                batch_key=batch_key,
                 command_id=uuid.uuid4(),
-                principal=self.operator,
-                acting_role=self.operator.role,
-                permission_grant=self.operator_edit,
+                reason="The secondary fixture was linked to the wrong source.",
+                principal=self.owner,
+                acting_role=self.owner.role,
             )
-        self.assertEqual(ContentAssetVersion.objects.count(), stale_version_count)
-
-        # A fresh offline generation is allowed because the latest immutable
-        # version is stale. It reuses the asset but writes a new version whose
-        # exact manifest excludes the invalidated evidence. A subsequent human
-        # revision inherits that current manifest, never the stale one.
-        regenerated = generate_task_content_draft(
-            task=task,
-            command_id=uuid.uuid4(),
-            principal=self.operator,
-            acting_role=self.operator.role,
-            permission_grant=self.operator_edit,
-        )
-        self.assertEqual(
-            regenerated.asset_version.metadata["evidence_manifest"],
-            [
-                {
-                    "id": str(evidence_item.pk),
-                    "provenance_sha256": evidence_item.provenance_sha256,
-                    "source_id": str(evidence_item.source_id),
-                }
-            ],
-        )
-        fresh_revision = revise_task_content_draft(
-            task=task,
-            source_version=regenerated.asset_version,
-            inline_content=(
-                regenerated.asset_version.inline_content
-                + "\n\nHuman edit after refreshing the current evidence manifest."
-            ),
-            command_id=uuid.uuid4(),
-            principal=self.operator,
-            acting_role=self.operator.role,
-            permission_grant=self.operator_edit,
-        )
-        asset_version = fresh_revision.asset_version
-        self.assertEqual(
-            asset_version.metadata["evidence_manifest"],
-            regenerated.asset_version.metadata["evidence_manifest"],
-        )
-        self.assertNotIn(
-            str(evidence_to_invalidate.pk),
-            {item["id"] for item in asset_version.metadata["evidence_manifest"]},
+        self.assertFalse(
+            EvidenceInvalidationEvent.objects.filter(
+                evidence_item=evidence_to_invalidate
+            ).exists()
         )
         dod = TaskCheckRun.record_completed(
             task=task,
@@ -1036,16 +989,24 @@ class FullDailyOperationsVerticalFlowTests(TestCase):
         ).count()
         try:
             with transaction.atomic():
-                invalidation = invalidate_evidence(
-                    evidence_id=evidence_item.pk,
+                invalidation_reason = "Rollback-scoped final dispatch freshness probe."
+                invalidation = EvidenceInvalidationEvent.objects.create(
+                    evidence_item=evidence_item,
                     product=self.product,
-                    batch_key=batch_key,
                     command_id=uuid.uuid4(),
-                    reason="Rollback-scoped final dispatch freshness probe.",
-                    principal=self.owner,
+                    payload_hash=canonical_sha256(
+                        {
+                            "evidence_item_id": str(evidence_item.pk),
+                            "product_id": str(self.product.pk),
+                            "reason": invalidation_reason,
+                        }
+                    ),
+                    reason=invalidation_reason,
+                    invalidated_by_principal=self.owner,
                     acting_role=self.owner.role,
+                    permission_grant=self.owner_grants[PermissionGrant.Action.EDIT],
                 )
-                self.assertTrue(invalidation.created)
+                self.assertIsNotNone(invalidation.pk)
                 self.assertTrue(
                     EvidenceInvalidationEvent.objects.filter(
                         evidence_item=evidence_item

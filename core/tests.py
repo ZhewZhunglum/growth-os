@@ -9,6 +9,7 @@ from django.test import SimpleTestCase, override_settings
 from django.test import TestCase
 from django.urls import reverse
 
+from core.audit_notes import SYSTEM_DEFAULT_TAG, USER_PROVIDED_TAG, tag_optional_audit_note
 from core.ids import uuid7
 
 
@@ -18,6 +19,31 @@ class UUIDv7Tests(TestCase):
         self.assertIsInstance(value, uuid.UUID)
         self.assertEqual(value.version, 7)
         self.assertEqual(value.variant, uuid.RFC_4122)
+
+
+class AuditNoteTests(SimpleTestCase):
+    def test_new_external_input_cannot_impersonate_a_system_default(self):
+        forged = f"{SYSTEM_DEFAULT_TAG} I was not written by the user"
+
+        stored = tag_optional_audit_note(forged, default="neutral default")
+
+        self.assertEqual(stored, f"{USER_PROVIDED_TAG} {forged}")
+
+    def test_exact_existing_value_is_preserved_for_command_replay(self):
+        for stored in (
+            "legacy note without a source tag",
+            f"{SYSTEM_DEFAULT_TAG} neutral default",
+            f"{USER_PROVIDED_TAG} user note",
+        ):
+            with self.subTest(stored=stored):
+                self.assertEqual(
+                    tag_optional_audit_note(
+                        stored,
+                        default="a newer default must not change the replay",
+                        existing_value=stored,
+                    ),
+                    stored,
+                )
 
 
 class HealthTests(TestCase):
